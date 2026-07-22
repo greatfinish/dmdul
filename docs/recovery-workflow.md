@@ -216,10 +216,13 @@ DM 的 `CREATE SCHEMA` 会吞掉后续语句直到 `/`，不要手工把它删�
 
 ```bash
 disql SYSDBA/password < HR_TEST_EMP_INFO_ddl.sql
-dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL='HR_TEST_EMP_INFO_data.ctl'
+dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL="'HR_TEST_EMP_INFO_data.ctl'"
 ```
 
-- `CONTROL` 的值**必须加单引号**：dmfldr 拒绝解析含 `.` 的未加引号参数值。
+- **注意那层双引号，不是笔误。** dmfldr 拒绝解析含 `.` 的未加引号参数值（报
+  `parameters parse error[...]`，方括号里是被点号截断后的前半截），而 shell 会把裸单
+  引号吃掉。所以单引号必须用双引号包住才能活着送到 dmfldr。反过来，**不含点号的值不
+  能加引号**——`DIRECT='TRUE'` 本身就是 parse error。
 - 控制文件里的分隔符、NULL 标记、字符集、`BLOB_TYPE` 都已按数据文件写死，通常不用改。
 - 装载完检查 `_data.bad`：文件不存在或为空才算干净。
 - 换目标模式时改 `.ctl` 里的 `INTO TABLE` 一行即可。
@@ -294,7 +297,7 @@ FROM <src_owner>.<table> a, RECOVER_V.<table> b WHERE a.id = b.id;
 | DDL 建表失败：模式不存在 | 多模式用户，`CREATE SCHEMA` 被跳过或漏了 `/` | 用 v0.6.3+ 重新导出 DDL |
 | 超宽行 INSERT 报 input too long | disql stdin 每行 2499 字符上限 | 改走 DMP 通道 |
 | dmfldr 装载后 BLOB 长度翻倍 | 控制文件用了 `BLOB_TYPE='HEX'` | 用 v0.6.4+ 重新导出（应为 `'HEX_CHAR'`） |
-| `dmfldr` 报 `parameters parse error[...]` | 参数值没加引号，含 `.` 被截断 | 写成 `CONTROL='x.ctl'`，注意单引号 |
+| `dmfldr` 报 `parameters parse error[...]` | 含 `.` 的值没带引号到 dmfldr；shell 把裸单引号吃掉了 | 写成 `CONTROL="'x.ctl'"`；不含点号的值反而不能加引号 |
 | 比对大表时实例被 OOM 杀掉 | 千万行双向 MINUS 撑爆内存 | 按主键分块比对，见第 9 步 |
 | `dimp` 报 data abnormal，只导进一部分 | 数据段 phase 边界切在行中间 | 用 v0.6.5+ 重新导出 DMP |
 | `rows exported` 比预期多 | 命中了 TRUNCATE 前的旧存储（历史行） | 用 `describe` 看 `assist_ids`，按主键去重 |

@@ -223,10 +223,13 @@ output/HR_TEST_EMP_INFO_data.ctl
 NULL 标记、字符集和 BLOB 编码都已按数据文件写死，通常不需要改动：
 
 ```bash
-dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL='HR_TEST_EMP_INFO_data.ctl'
+dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL="'HR_TEST_EMP_INFO_data.ctl'"
 ```
 
-`CONTROL` 的值必须加单引号：dmfldr 拒绝解析含 `.` 的未加引号参数值。
+那层双引号不是笔误：dmfldr 拒绝解析含 `.` 的未加引号参数值（报
+`parameters parse error[...]`，方括号里是被点号截断后的前半截），而 shell 会把裸单引号
+吃掉，单引号必须用双引号包住才能活着送到 dmfldr。不含点号的值反而不能加引号——
+`DIRECT='TRUE'` 本身就是 parse error。
 
 分隔符由表的列类型决定，控制文件与数据文件永远一致：
 

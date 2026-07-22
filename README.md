@@ -260,12 +260,16 @@ output/
 └── HR_TEST_ORDER_data.ctl
 ```
 
-回灌步骤：先用 `_ddl.sql` 建表，再逐表调用官方 dmfldr（`CONTROL` 的值必须加单引号，
-dmfldr 拒绝解析含 `.` 的未加引号参数值）：
+回灌步骤：先用 `_ddl.sql` 建表，再逐表调用官方 dmfldr：
 
 ```bash
-dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL='HR_TEST_EMP_INFO_data.ctl'
+dmfldr USERID=SYSDBA/password@127.0.0.1:5236 CONTROL="'HR_TEST_EMP_INFO_data.ctl'"
 ```
+
+那层双引号不是笔误。dmfldr 拒绝解析含 `.` 的未加引号参数值（报
+`parameters parse error[...]`，方括号里是被点号截断后的前半截），而 shell 会把裸单引号
+吃掉，所以单引号必须用双引号包住才能活着送到 dmfldr。反过来，不含点号的值不能加引号
+——`DIRECT='TRUE'` 本身就是 parse error。
 
 控制文件已经把字段/行分隔符、NULL 标记（`NULL_MODE` + `NULL_STR`）、字符集和
 `BLOB_TYPE = 'HEX_CHAR'` 都按数据文件写死，通常不需要改动。分隔符按列类型自动选择：

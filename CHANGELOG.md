@@ -12,6 +12,20 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Fixed
+
+- 生成的 dmfldr 控制文件里给出的装载命令改为 `CONTROL="'x.ctl'"`。此前写的是
+  `CONTROL='x.ctl'`,照抄到 shell 里必然失败:dmfldr 拒绝解析含 `.` 的未加引号参数值
+  (报 `parameters parse error[...]`,方括号里是被点号截断后的前半截),而 POSIX shell
+  会把裸单引号吃掉,dmfldr 根本看不到引号。单引号必须用双引号包住才能送达。
+  实测矩阵还确认:**不含点号的值反而不能加引号**,`DIRECT='TRUE'` 本身就是 parse error;
+  正确加引号后 `DIRECT=TRUE` 可正常工作。README、`docs/usage.md`、
+  `docs/recovery-workflow.md` 同步订正。
+
+------
+
 ## v0.6.5 - Importable Large-Table DMP
 
 ### Fixed
