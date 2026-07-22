@@ -408,12 +408,16 @@ func TestInteractiveListUserShowsObjectCounts(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"schemas", "tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages"} {
+	// Headings are upper-cased and underlined with a rule, disql/sqlplus style.
+	for _, want := range []string{
+		"USER", "SCHEMAS", "TABLES", "VIEWS", "SYNONYMS", "SEQUENCES", "TRIGGERS", "FUNCTIONS", "PROCEDURES", "PACKAGES",
+		"---- -------- -------- -------- ---------- ---------- --------- ---------- ----------- ---------",
+	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("list user output should contain %q, got %q", want, output)
 		}
 	}
-	if !strings.Contains(output, "APP                           1        1        1          1          1         1          1           1         1") {
+	if !strings.Contains(output, "APP         1        1        1          1          1         1          1           1         1") {
 		t.Fatalf("list user should show per-owner object counts, got %q", output)
 	}
 }
@@ -951,13 +955,13 @@ func TestInteractiveBootstrapPersistsStructuredDiagnostics(t *testing.T) {
 		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"[BOOTSTRAP] phase=start", "phase=metadata", "phase=complete", "mode=stream-scan-fallback"} {
+		for _, want := range []string{"[bootstrap] phase=start", "phase=metadata", "phase=complete", "mode=stream-scan-fallback"} {
 			if !strings.Contains(stdout.String(), want) {
 				t.Fatalf("stdout missing %q: %s", want, stdout.String())
 			}
 		}
 		logText := readTestFile(t, filepath.Join(dir, "dul.log"))
-		for _, want := range []string{"[BOOTSTRAP] phase=start", "stage=1 phase=anchor", "phase=complete"} {
+		for _, want := range []string{"[bootstrap] phase=start", "stage=1 phase=anchor", "phase=complete"} {
 			if !strings.Contains(logText, want) {
 				t.Fatalf("dul.log missing %q: %s", want, logText)
 			}

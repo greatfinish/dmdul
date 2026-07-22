@@ -602,7 +602,21 @@ func (s *interactiveSession) printDataFiles(stdout io.Writer) error {
 	if pageSize == 0 {
 		pageSize = dm.DefaultPageSize
 	}
-	fmt.Fprintf(stdout, "%-5s %-5s %-20s %10s %8s  %-6s %s\n", "group", "file", "tablespace", "pages", "size_MB", "status", "path")
+	spaces := make([]string, 0, len(files))
+	paths := make([]string, 0, len(files))
+	for _, f := range files {
+		spaces = append(spaces, defaultIfBlank(f.Tablespace, "?"))
+		paths = append(paths, f.Path)
+	}
+	format := printListHeader(stdout, []listColumn{
+		{title: "group", width: 5, right: true},
+		{title: "file", width: 5, right: true},
+		{title: "tablespace", width: widestValue("tablespace", spaces)},
+		{title: "pages", width: 10, right: true},
+		{title: "size_MB", width: 9, right: true},
+		{title: "status", width: 10},
+		{title: "path", width: widestValue("path", paths)},
+	})
 	okCount := 0
 	for _, f := range files {
 		pages := int64(0)
@@ -622,8 +636,9 @@ func (s *interactiveSession) printDataFiles(stdout io.Writer) error {
 				okCount++
 			}
 		}
-		fmt.Fprintf(stdout, "%-5d %-5d %-20s %10d %8.1f  %-6s %s\n",
-			f.GroupID, f.FileID, defaultIfBlank(f.Tablespace, "?"), pages, sizeMB, status, f.Path)
+		fmt.Fprintf(stdout, format,
+			fmt.Sprint(f.GroupID), fmt.Sprint(f.FileID), defaultIfBlank(f.Tablespace, "?"),
+			fmt.Sprint(pages), fmt.Sprintf("%.1f", sizeMB), status, f.Path)
 	}
 	fmt.Fprintf(stdout, "data files: %d (readable & page-aligned: %d), page_size=%d\n", len(files), okCount, pageSize)
 	return nil
@@ -692,7 +707,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	}
 	dataDir := s.effectiveDataDir()
 	controlDULPath := s.effectiveControlDULPath()
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=start status=RUNNING system=%q data_dir=%q", systemPath, dataDir))
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=start status=RUNNING system=%q data_dir=%q", systemPath, dataDir))
 	dataFiles, err := dm.ScanOfflineDataFiles(ctlPath, "", dataDir)
 	if err != nil {
 		return err
@@ -715,7 +730,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 			caseSensitiveLog = "1"
 		}
 	}
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=metadata status=OK db_name=%q db_source=%q instance_name=%q instance_source=%q page_size=%d page_size_source=%q extent_size=%d extent_size_source=%q page_count=%d page_count_source=%q charset=%q charset_source=%q unicode_flag=%d case_sensitive=%s case_sensitive_source=%q",
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=metadata status=OK db_name=%q db_source=%q instance_name=%q instance_source=%q page_size=%d page_size_source=%q extent_size=%d extent_size_source=%q page_count=%d page_count_source=%q charset=%q charset_source=%q unicode_flag=%d case_sensitive=%s case_sensitive_source=%q",
 		metadata.DatabaseName, metadata.DatabaseNameSrc, metadata.InstanceName, metadata.InstanceNameSrc,
 		metadata.PageSize, metadata.PageSizeSource, metadata.ExtentSize, metadata.ExtentSizeSource,
 		metadata.PageCount, metadata.PageCountSource, metadata.Charset, metadata.CharsetSource,
@@ -760,15 +775,15 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if dict.BootstrapFallback || fileWarnings {
 		status = "SUCCESS_WITH_WARNINGS"
 	}
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=control.dul status=OK files=%d path=%q", len(dataFiles), controlDULPath))
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=output name=control.dul status=OK files=%d path=%q", len(dataFiles), controlDULPath))
 	if dictionaryBackupDir != "" {
-		s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict-backup status=OK path=%q", dictionaryBackupDir))
+		s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=output name=dmdul_dict-backup status=OK path=%q", dictionaryBackupDir))
 	}
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=output name=dmdul_dict status=OK users=%d schemas=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d path=%q",
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=output name=dmdul_dict status=OK users=%d schemas=%d tables=%d columns=%d views=%d sequences=%d routines=%d triggers=%d synonyms=%d tab_privs=%d partitions=%d partition_keys=%d path=%q",
 		dictFiles.UserCount, dictFiles.SchemaCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount,
 		dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount,
 		dictFiles.PartitionCount, dictFiles.PartitionKeyCount, dictFiles.Dir))
-	s.emitBootstrapLine(stdout, fmt.Sprintf("[BOOTSTRAP] phase=complete status=%s mode=%s objects=%d elapsed_ms=%d",
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=complete status=%s mode=%s objects=%d elapsed_ms=%d",
 		status, dict.BootstrapMode, dict.ObjectCount, time.Since(startedAt).Milliseconds()))
 
 	fmt.Fprintln(stdout, "bootstrap completed")
@@ -819,7 +834,7 @@ func (s *interactiveSession) emitBootstrapLine(stdout io.Writer, line string) {
 
 func formatBootstrapDiagnostic(diag dm.BootstrapDiagnostic) string {
 	var out strings.Builder
-	out.WriteString("[BOOTSTRAP]")
+	out.WriteString("[bootstrap]")
 	if diag.Stage > 0 {
 		fmt.Fprintf(&out, " stage=%d", diag.Stage)
 	}
@@ -887,7 +902,7 @@ func formatBootstrapFileDiagnostic(file dm.OfflineDataFile, pageSize uint32) (st
 		}
 		_ = input.Close()
 	}
-	line := fmt.Sprintf("[BOOTSTRAP] phase=file status=%s group=%d file=%d header_group=%d header_file=%d header_page=%d tablespace=%q bytes=%d pages=%d aligned=%t path=%q",
+	line := fmt.Sprintf("[bootstrap] phase=file status=%s group=%d file=%d header_group=%d header_file=%d header_page=%d tablespace=%q bytes=%d pages=%d aligned=%t path=%q",
 		status, file.GroupID, file.FileID, headerGroup, headerFile, headerPage, file.Tablespace, size, pages, aligned, file.Path)
 	return line, status != "OK" && status != "IGNORED_TEMP"
 }
@@ -928,24 +943,98 @@ func (s *interactiveSession) printParameters(stdout io.Writer) {
 	}
 }
 
+// listColumn describes one column of a `list` listing: the heading text and the
+// field width shared by the heading, the rule under it and the rows below.
+type listColumn struct {
+	title string
+	width int
+	right bool
+}
+
+// listRowFormat builds the printf format the header, the rule and every data
+// row share, so the three can never drift apart.
+func listRowFormat(columns []listColumn) string {
+	var format strings.Builder
+	for i, col := range columns {
+		if i > 0 {
+			format.WriteByte(' ')
+		}
+		switch {
+		case col.right:
+			fmt.Fprintf(&format, "%%%ds", col.width)
+		case i == len(columns)-1:
+			// The last left-aligned column is not padded, so no line carries
+			// trailing whitespace. The rule row still spans the full width
+			// because it is passed a dash string of exactly that length.
+			format.WriteString("%s")
+		default:
+			fmt.Fprintf(&format, "%%-%ds", col.width)
+		}
+	}
+	format.WriteByte('\n')
+	return format.String()
+}
+
+// printListHeader writes an upper-cased heading row followed by a rule of
+// dashes spanning each column, the way disql and sqlplus render a result set.
+// Upper case plus the rule makes it unmistakable which line names the columns
+// and which lines are data.
+func printListHeader(stdout io.Writer, columns []listColumn) string {
+	format := listRowFormat(columns)
+	titles := make([]any, 0, len(columns))
+	rules := make([]any, 0, len(columns))
+	for _, col := range columns {
+		titles = append(titles, strings.ToUpper(col.title))
+		rules = append(rules, strings.Repeat("-", col.width))
+	}
+	fmt.Fprintf(stdout, format, titles...)
+	fmt.Fprintf(stdout, format, rules...)
+	return format
+}
+
+// widestValue returns the column width needed to fit heading and every value.
+func widestValue(title string, values []string) int {
+	width := len(title)
+	for _, value := range values {
+		if n := len([]rune(value)); n > width {
+			width = n
+		}
+	}
+	return width
+}
+
 func (s *interactiveSession) printUsers(stdout io.Writer) {
 	s.printDictionarySummary(stdout)
 	counts := dictionaryUserObjectCounts(s.dictionary)
-	fmt.Fprintf(stdout, "%-22s %8s %8s %8s %10s %10s %9s %10s %11s %9s\n",
-		"user", "schemas", "tables", "views", "synonyms", "sequences", "triggers", "functions", "procedures", "packages")
+	names := make([]string, 0, len(s.dictionary.Users))
+	for _, user := range s.dictionary.Users {
+		names = append(names, user.Name)
+	}
+	format := printListHeader(stdout, []listColumn{
+		{title: "user", width: widestValue("user", names)},
+		{title: "schemas", width: 8, right: true},
+		{title: "tables", width: 8, right: true},
+		{title: "views", width: 8, right: true},
+		{title: "synonyms", width: 10, right: true},
+		{title: "sequences", width: 10, right: true},
+		{title: "triggers", width: 9, right: true},
+		{title: "functions", width: 10, right: true},
+		{title: "procedures", width: 11, right: true},
+		{title: "packages", width: 9, right: true},
+	})
 	for _, user := range s.dictionary.Users {
 		count := counts[strings.ToUpper(user.Name)]
-		fmt.Fprintf(stdout, "%-22s %8d %8d %8d %10d %10d %9d %10d %11d %9d\n",
+		fmt.Fprintf(stdout, format,
 			user.Name,
-			count.Schemas,
-			count.Tables,
-			count.Views,
-			count.Synonyms,
-			count.Sequences,
-			count.Triggers,
-			count.Functions,
-			count.Procedures,
-			count.Packages,
+			fmt.Sprint(count.Schemas),
+			fmt.Sprint(count.Tables),
+			fmt.Sprint(count.Views),
+			fmt.Sprint(count.Synonyms),
+			fmt.Sprint(count.Sequences),
+			fmt.Sprint(count.Triggers),
+			fmt.Sprint(count.Functions),
+			fmt.Sprint(count.Procedures),
+			fmt.Sprint(count.Packages),
 		)
 	}
 }
@@ -1055,7 +1144,21 @@ func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
 			rows = append(rows, table)
 		}
 	}
-	fmt.Fprintf(stdout, "%-22s %-34s %-10s %-10s %-12s %-12s %-10s\n", "owner", "table", "table_id", "columns", "tablespace", "storage", "partition")
+	names := make([]string, 0, len(rows))
+	spaces := make([]string, 0, len(rows))
+	for _, table := range rows {
+		names = append(names, truncateForTable(table.Name, 34))
+		spaces = append(spaces, table.Tablespace)
+	}
+	format := printListHeader(stdout, []listColumn{
+		{title: "owner", width: widestValue("owner", []string{owner})},
+		{title: "table", width: widestValue("table", names)},
+		{title: "table_id", width: 10},
+		{title: "columns", width: 10},
+		{title: "tablespace", width: widestValue("tablespace", spaces)},
+		{title: "storage", width: 12},
+		{title: "partition", width: 9},
+	})
 	for _, table := range rows {
 		partitioned := "NO"
 		if table.Partitioned {
@@ -1065,11 +1168,11 @@ func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
 		if tablespace == "" && table.GroupID != 0 {
 			tablespace = fmt.Sprintf("GROUP_%d", table.GroupID)
 		}
-		fmt.Fprintf(stdout, "%-22s %-34s %-10d %-10d %-12s %-12s %-10s\n",
+		fmt.Fprintf(stdout, format,
 			table.Owner,
 			truncateForTable(table.Name, 34),
-			table.ID,
-			table.ColumnCount,
+			fmt.Sprint(table.ID),
+			fmt.Sprint(table.ColumnCount),
 			tablespace,
 			table.Storage,
 			partitioned,
@@ -1080,7 +1183,17 @@ func (s *interactiveSession) printTables(stdout io.Writer, owner string) {
 
 func (s *interactiveSession) printSchemas(stdout io.Writer, owner string) {
 	owner = normalizeIdentifierInput(owner)
-	fmt.Fprintf(stdout, "%-28s %-28s %-10s\n", "schema", "owner", "tables")
+	schemaNames := make([]string, 0, len(s.dictionary.Schemas))
+	ownerNames := make([]string, 0, len(s.dictionary.Schemas))
+	for _, schema := range s.dictionary.Schemas {
+		schemaNames = append(schemaNames, truncateForTable(schema.Name, 28))
+		ownerNames = append(ownerNames, truncateForTable(schema.Owner, 28))
+	}
+	format := printListHeader(stdout, []listColumn{
+		{title: "schema", width: widestValue("schema", schemaNames)},
+		{title: "owner", width: widestValue("owner", ownerNames)},
+		{title: "tables", width: 6, right: true},
+	})
 	count := 0
 	for _, schema := range s.dictionary.Schemas {
 		if owner != "" && !strings.EqualFold(schema.Owner, owner) {
@@ -1092,7 +1205,7 @@ func (s *interactiveSession) printSchemas(stdout io.Writer, owner string) {
 				tables++
 			}
 		}
-		fmt.Fprintf(stdout, "%-28s %-28s %-10d\n", truncateForTable(schema.Name, 28), truncateForTable(schema.Owner, 28), tables)
+		fmt.Fprintf(stdout, format, truncateForTable(schema.Name, 28), truncateForTable(schema.Owner, 28), fmt.Sprint(tables))
 		count++
 	}
 	fmt.Fprintf(stdout, "%d schema(s)\n", count)

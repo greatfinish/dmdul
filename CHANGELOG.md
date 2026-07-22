@@ -12,7 +12,7 @@ v主版本.次版本.修订版本
 
 ------
 
-## 未发布
+## v0.6.6 - CLI Output Polish
 
 ### Fixed
 
@@ -23,6 +23,14 @@ v主版本.次版本.修订版本
   实测矩阵还确认:**不含点号的值反而不能加引号**,`DIRECT='TRUE'` 本身就是 parse error;
   正确加引号后 `DIRECT=TRUE` 可正常工作。README、`docs/usage.md`、
   `docs/recovery-workflow.md` 同步订正。
+
+### Changed
+
+- `list user` / `list table` / `list schema` / `list datafile` 的表头改为**大写列名 +
+  下划线规则行**(对齐 disql / sqlplus 的结果集渲染),一眼能分清哪行是列名、哪行是数据。
+  列宽改为按实际内容自适应(此前是写死的 22/34/28 字符,长用户名和长路径会被挤在一起,
+  短的又留大片空白),最后一列不再补齐,输出不带尾随空格。
+- bootstrap 诊断行的标签由 `[BOOTSTRAP]` 改为小写 `[bootstrap]`,与其余输出的观感一致。
 
 ------
 
