@@ -12,6 +12,15 @@ v主版本.次版本.修订版本
 
 ------
 
+## 未发布
+
+### Documentation
+
+- 重绘 README 能力链，明确区分“离线文件系统 DBF 直读”和“DMASM 成员裸盘 -> 磁盘组元数据
+  -> ASM 逻辑 DBF”两条输入路径，并补全 `disql`、`dmfldr`、`dimp` 三种官方回灌工具。
+
+------
+
 ## v0.7.0 - DMASM Raw Recovery
 
 ### Added

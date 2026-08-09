@@ -35,29 +35,47 @@
 
 ## 项目定位
 
-当前能力链已经覆盖从离线物理文件到官方导入工具的完整路径：
+当前能力链由两条离线输入路径汇合：文件系统中的 DBF 可以直接读取；DMASM 成员裸盘
+必须先恢复磁盘组目录和 AU 映射，映射为只读 ASM 逻辑文件。两条路径随后共用同一套
+Standard Bootstrap、字典恢复和数据导出流程：
 
 ```text
-SYSTEM.DBF / dm.ctl / user tablespace DBF / offline DMASM raw disks
-                    |
-                    v
-            Standard Bootstrap
-                    |
-                    v
-           Dictionary Recovery
-                    |
-          +---------+---------+---------+
-          |         |         |         |
-          v         v         v         v
-         DDL       SQL      dmfldr     DMP
-                             |          |
-                             v          v
-                          dmfldr      dimp
-                             |          |
-                             +----+-----+
-                                        |
-                                        v
-                                Dameng Database
+Offline filesystem                         Offline DMASM member disks
+SYSTEM.DBF / user tablespace DBFs          raw devices / *-flat.vmdk
+(optional dm.ctl cross-reference)                       |
+        |                                               v
+        |                                  DMASM disk-group recovery
+        |                             member catalog / INODE / descriptor
+        |                                  AU copies / striping map
+        |                                               |
+        |                                               v
+        |                                  ASM logical DBF files
+        |                                  +GROUP/.../*.DBF
+        |                                               |
+        +-----------------------+-----------------------+
+                                |
+                                v
+                 Unified read-only logical DBF source
+                    SYSTEM.DBF + user tablespace DBFs
+                                |
+                                v
+                       Standard Bootstrap
+                                |
+                                v
+                      Dictionary Recovery
+                                |
+             +------------------+-------------------+
+             |                  |                   |
+             v                  v                   v
+       DDL / INSERT SQL    FLDR text + CTL      Native DMP
+             |                  |                   |
+             v                  v                   v
+           disql              dmfldr               dimp
+             |                  |                   |
+             +------------------+-------------------+
+                                |
+                                v
+                        Dameng Database
 ```
 
 它更接近“离线字典恢复 + DUL + 原生逻辑 DMP 输出”的组合工具，而不再只是一个
