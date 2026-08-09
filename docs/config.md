@@ -38,6 +38,7 @@ case_sensitive_value=1
 case_sensitive_source=DM default
 ini_path=D:\temp\oldpro\dm.ini
 system=D:\temp\oldpro\SYSTEM.DBF
+asm_disk=
 control=D:\temp\oldpro\dm.ctl
 data_dir=D:\temp\oldpro
 output_dir=
@@ -50,6 +51,7 @@ log=
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `system` | `SYSTEM.DBF` | 达梦系统表空间文件路径。 |
+| `asm_disk` | 空 | 离线 DMASM 裸成员盘或 `*-flat.vmdk`，多成员和多磁盘组路径统一用逗号分隔；`system` 为 `+GROUP/...` 时必须设置。成员盘始终只读打开。 |
 | `control` | 自动查找 `SYSTEM.DBF` 同目录下的 `dm.ctl` | 可选控制文件路径。 |
 | `data_dir` | `SYSTEM.DBF` 所在目录 | 用户表空间 DBF 文件所在目录。 |
 | `output_dir` | `./output` | `unload` / `recover` 生成的 DDL、SQL、dmfldr 和 DMP 目录。默认相对于启动 DMDUL 时的当前目录，不跟随 `data_dir`；显式设置时直接使用指定目录。 |
@@ -125,6 +127,7 @@ DMDUL> show parameter;
 
 ```text
 DMDUL> set system D:\temp\oldpro\SYSTEM.DBF;
+DMDUL> set asm_disk /dev/dmasm/ext4a,/dev/dmasm/ext4b,/dev/dmasm/norm4a,/dev/dmasm/norm4b,/dev/dmasm/ext32a;
 DMDUL> set control D:\temp\oldpro\dm.ctl;
 DMDUL> set data_dir D:\temp\oldpro;
 DMDUL> set output_dir D:\temp\oldpro\out;

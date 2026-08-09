@@ -89,28 +89,12 @@ func looksLikeIdentifierText(value string) bool {
 	return true
 }
 
-func scanDictionaryTexts(data []byte, pageSize uint32, decoder textDecoder) map[uint32]map[uint32]string {
-	result := make(map[uint32]map[uint32]string)
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
-		row, ok := parseDDLTextRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
-		if !ok {
-			return
-		}
-		seqs := result[row.ID]
-		if seqs == nil {
-			seqs = make(map[uint32]string)
-			result[row.ID] = seqs
-		}
-		if existing := seqs[row.SeqNo]; len(row.Text) > len(existing) {
-			seqs[row.SeqNo] = row.Text
-		}
-	})
-	return result
-}
-
 func parseDDLTextRow(page []byte, slotOff int, pageNo uint32, slotNo uint16, rawSlotOff uint16, pageSize uint32, decoder textDecoder) (dictionaryTextDef, bool) {
 	for delta := 0; delta < 4; delta++ {
 		base := slotOff + delta
+		if row, ok := parseStandardDDLTextRow(page, base, pageNo, slotNo, rawSlotOff, pageSize, decoder); ok {
+			return row, true
+		}
 		if base+32 > int(pageSize) || base+32 > len(page) {
 			continue
 		}
@@ -142,6 +126,62 @@ func parseDDLTextRow(page []byte, slotOff int, pageNo uint32, slotNo uint16, raw
 		}, true
 	}
 	return dictionaryTextDef{}, false
+}
+
+func parseStandardDDLTextRow(page []byte, base int, pageNo uint32, slotNo uint16, rawSlotOff uint16, pageSize uint32, decoder textDecoder) (dictionaryTextDef, bool) {
+	const fixedStart = 3 // two-byte row header plus one byte of 2-bit metadata
+	if base < 0 || base+fixedStart+8 > int(pageSize) || base+fixedStart+8 > len(page) {
+		return dictionaryTextDef{}, false
+	}
+	lengthWord := binary.BigEndian.Uint16(page[base:])
+	if lengthWord&dataRowDeletedMask != 0 {
+		return dictionaryTextDef{}, false
+	}
+	rowLen := int(lengthWord &^ dataRowDeletedMask)
+	if rowLen < fixedStart+8+1 || base+rowLen > int(pageSize) || base+rowLen > len(page) {
+		return dictionaryTextDef{}, false
+	}
+	row := page[base : base+rowLen]
+	states := decodeRowColumnStates(row[2:3], 3)
+	if states[0] != 0 || states[1] != 0 || states[2] == 0x02 || states[2] == 0x03 {
+		return dictionaryTextDef{}, false
+	}
+	id := binary.LittleEndian.Uint32(row[fixedStart:])
+	seqNo := binary.LittleEndian.Uint32(row[fixedStart+4:])
+	if id == 0 || seqNo > 1<<20 {
+		return dictionaryTextDef{}, false
+	}
+	raw, _, err := readShortDataBytes(row, fixedStart+8)
+	if err != nil {
+		return dictionaryTextDef{}, false
+	}
+	payload, ok := unwrapDictionaryTextPayload(raw)
+	if !ok {
+		return dictionaryTextDef{}, false
+	}
+	raw = payload
+	text, ok := decoder.decode(raw)
+	if !ok || strings.TrimSpace(text) == "" || containsBadControl(text) {
+		return dictionaryTextDef{}, false
+	}
+	rowAbs := uint64(pageNo)*uint64(pageSize) + uint64(base)
+	return dictionaryTextDef{
+		ID:       id,
+		SeqNo:    seqNo,
+		Text:     text,
+		Location: ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: rawSlotOff, RowOffset: rowAbs},
+	}, true
+}
+
+func unwrapDictionaryTextPayload(raw []byte) ([]byte, bool) {
+	if len(raw) < 13 || raw[0] != 0x01 || (raw[2] != 0x02 && raw[2] != 0x04) {
+		return nil, false
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(raw[9:13]))
+	if payloadLen < 0 || payloadLen != len(raw)-13 {
+		return nil, false
+	}
+	return raw[13:], true
 }
 
 func scanDictionaryViews(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, matcher ownerMatcher) []DictionaryView {
@@ -551,57 +591,6 @@ func scanDictionarySynonyms(objects map[uint32]dictionaryObject, matcher ownerMa
 	}
 	sortDictionarySynonyms(synonyms)
 	return synonyms
-}
-
-func scanDictionaryTabPrivileges(data []byte, pageSize uint32, objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, matcher ownerMatcher, tableMatcher tableNameMatcher) []DictionaryTabPrivilege {
-	granteeNames := make(map[uint32]string)
-	for id, user := range users {
-		granteeNames[id] = user.Name
-	}
-	for id, role := range roles {
-		granteeNames[id] = role.Name
-	}
-	seen := make(map[string]bool)
-	var privileges []DictionaryTabPrivilege
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
-		grant, ok := parseDDLObjectPrivilegeRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize)
-		if !ok {
-			return
-		}
-		target, ok := objects[grant.ObjectID]
-		if !ok || !isTabPrivilegeTarget(target) {
-			return
-		}
-		if isSystemCatalogOwner(target.Owner) {
-			return
-		}
-		grantee := granteeNames[grant.GranteeID]
-		if grantee == "" {
-			return
-		}
-		if !matcher.allowed(target.Owner) && !matcher.allowed(grantee) {
-			return
-		}
-		if !tableMatcher.allowed(target.Owner, target.Name) && !matcher.allowed(grantee) {
-			return
-		}
-		item := DictionaryTabPrivilege{
-			Grantee:    grantee,
-			Owner:      target.Owner,
-			ObjectName: target.Name,
-			ObjectType: dictionaryPrivilegeObjectType(target),
-			Privilege:  grant.Privilege,
-			Grantable:  grant.Grantable,
-		}
-		key := strings.Join([]string{item.Grantee, item.Owner, item.ObjectName, item.Privilege, item.Grantable}, "\x00")
-		if seen[key] {
-			return
-		}
-		seen[key] = true
-		privileges = append(privileges, item)
-	})
-	sortDictionaryTabPrivileges(privileges)
-	return privileges
 }
 
 func dictionaryObjectByOwnerName(objects map[uint32]dictionaryObject, owner string, name string) (dictionaryObject, bool) {
@@ -1133,14 +1122,6 @@ func isRawSQLWordStart(b byte) bool {
 
 func isRawSQLWordPart(b byte) bool {
 	return isRawSQLWordStart(b) || (b >= '0' && b <= '9') || b == '$' || b == '#'
-}
-
-func isSQLWordBoundary(data []byte, index int) bool {
-	if index < 0 || index >= len(data) {
-		return true
-	}
-	b := data[index]
-	return !((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '_' || b == '$' || b == '#')
 }
 
 func isNestedRoutineEndTail(tail string) bool {

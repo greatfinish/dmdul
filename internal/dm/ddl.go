@@ -74,6 +74,7 @@ var reservedIdentifierNames = map[string]bool{
 
 type DDLExportOptions struct {
 	SystemPath      string
+	SystemReader    SizedReaderAt
 	ControlPath     string
 	ControlDULPath  string
 	OutputPath      string
@@ -263,7 +264,13 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		return nil, fmt.Errorf("export-ddl requires output path")
 	}
 
-	stream, err := openSystemPageStream(opts.SystemPath)
+	var stream *systemPageStream
+	var err error
+	if opts.SystemReader != nil {
+		stream, err = openSystemPageStreamReader(opts.SystemPath, opts.SystemReader, opts.SystemReader.Size())
+	} else {
+		stream, err = openSystemPageStream(opts.SystemPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -666,18 +673,6 @@ func (m ownerMatcher) allowed(owner string) bool {
 		}
 	}
 	return m.owners[owner]
-}
-
-func iterDictionaryRows(data []byte, pageSize uint32, visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) {
-	if pageSize == 0 {
-		return
-	}
-	totalPages := len(data) / int(pageSize)
-	for pageNo := 0; pageNo < totalPages; pageNo++ {
-		start := pageNo * int(pageSize)
-		page := data[start : start+int(pageSize)]
-		iterDictionaryRowsInPage(page, pageSize, uint32(pageNo), visit)
-	}
 }
 
 func iterDictionaryRowsInPage(page []byte, pageSize uint32, pageNo uint32, visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16)) {
@@ -1806,6 +1801,9 @@ func renderViews(out *strings.Builder, views []DictionaryView) {
 	out.WriteString("-- Views\n")
 	for _, view := range views {
 		sql := strings.TrimSpace(view.SQL)
+		if sql != "" {
+			sql = qualifyRecoveredViewName(sql, view.Owner, view.Name)
+		}
 		if sql == "" && strings.TrimSpace(view.QuerySQL) != "" {
 			sql = fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\n%s",
 				quoteIdent(view.Owner), quoteIdent(view.Name), strings.TrimSpace(view.QuerySQL))
@@ -1817,6 +1815,17 @@ func renderViews(out *strings.Builder, views []DictionaryView) {
 		out.WriteString(ensureSQLTerminator(sql))
 		out.WriteString("\n\n")
 	}
+}
+
+var recoveredViewHeaderPattern = regexp.MustCompile(`(?is)^(\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:FORCE\s+)?VIEW\s+)(?:"(?:[^"]|"")*"|[^\s(]+)`)
+
+func qualifyRecoveredViewName(sql, owner, name string) string {
+	match := recoveredViewHeaderPattern.FindStringSubmatchIndex(sql)
+	if len(match) < 4 {
+		return sql
+	}
+	qualified := quoteIdent(owner) + "." + quoteIdent(name)
+	return sql[:match[3]] + qualified + sql[match[1]:]
 }
 
 func renderSequences(out *strings.Builder, sequences []DictionarySequence) {
@@ -2335,15 +2344,4 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 		}
 		return dt
 	}
-}
-
-func parseIntDefault(value string, fallback int) int {
-	if value == "" {
-		return fallback
-	}
-	n, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
-	}
-	return n
 }

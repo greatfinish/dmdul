@@ -17,7 +17,8 @@ const (
 // systemPageStream keeps SYSTEM.DBF scans bounded to a page (or a small raw
 // source window) instead of retaining the complete data file in memory.
 type systemPageStream struct {
-	file       *os.File
+	file       io.ReaderAt
+	closeFile  func() error
 	path       string
 	fileSize   int64
 	header     []byte
@@ -28,7 +29,26 @@ type systemPageStream struct {
 }
 
 func openSystemPageStream(path string) (*systemPageStream, error) {
-	header, fileSize, err := readSystemHeader(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open SYSTEM.DBF: %w", err)
+	}
+	stat, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("stat SYSTEM.DBF: %w", err)
+	}
+	stream, err := openSystemPageStreamReader(path, file, stat.Size())
+	if err != nil {
+		file.Close()
+		return nil, err
+	}
+	stream.closeFile = file.Close
+	return stream, nil
+}
+
+func openSystemPageStreamReader(path string, reader io.ReaderAt, fileSize int64) (*systemPageStream, error) {
+	header, err := readSystemHeaderFromReader(reader, fileSize)
 	if err != nil {
 		return nil, fmt.Errorf("read SYSTEM.DBF header: %w", err)
 	}
@@ -38,12 +58,8 @@ func openSystemPageStream(path string) (*systemPageStream, error) {
 	}
 	pageCount, _ := detectSystemPageCount(header, fileSize, pageSize)
 	extentSize, extentSrc := detectSystemExtentSize(header)
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open SYSTEM.DBF: %w", err)
-	}
 	return &systemPageStream{
-		file:       file,
+		file:       reader,
 		path:       path,
 		fileSize:   fileSize,
 		header:     header,
@@ -55,8 +71,9 @@ func openSystemPageStream(path string) (*systemPageStream, error) {
 }
 
 func (s *systemPageStream) close() {
-	if s != nil && s.file != nil {
-		_ = s.file.Close()
+	if s != nil && s.closeFile != nil {
+		_ = s.closeFile()
+		s.closeFile = nil
 	}
 }
 
@@ -108,11 +125,11 @@ func (s *systemPageStream) forEachDictionarySlotRange(visit func(page []byte, pa
 }
 
 func (s *systemPageStream) charset() (systemCharset, bool) {
-	return detectSystemCharsetFromFile(s.path, s.pageSize)
+	return detectSystemCharsetFromReader(s.file, s.pageSize)
 }
 
 func (s *systemPageStream) caseSensitive() (bool, bool) {
-	return detectSystemCaseSensitiveFromFile(s.path, s.pageSize)
+	return detectSystemCaseSensitiveFromReader(s.file, s.pageSize)
 }
 
 func (s *systemPageStream) rawRoutineTexts(decoder textDecoder) (map[string]string, error) {
@@ -172,19 +189,31 @@ func forEachDataFilePage(path string, pageSize uint32, visit func(page []byte, p
 	if err != nil {
 		return 0, err
 	}
-	pageCount := int(info.Size() / int64(pageSize))
+	return forEachReaderPage(file, info.Size(), pageSize, visit)
+}
+
+func forEachSizedReaderPage(reader SizedReaderAt, pageSize uint32, visit func(page []byte, pageNo uint32) error) (int, error) {
+	if reader == nil {
+		return 0, fmt.Errorf("data file reader is nil")
+	}
+	return forEachReaderPage(reader, reader.Size(), pageSize, visit)
+}
+
+func forEachReaderPage(reader io.ReaderAt, size int64, pageSize uint32, visit func(page []byte, pageNo uint32) error) (int, error) {
+	if pageSize == 0 {
+		return 0, fmt.Errorf("invalid page size 0")
+	}
+	pageCount := int(size / int64(pageSize))
 	page := make([]byte, int(pageSize))
 	for pageNo := 0; pageNo < pageCount; pageNo++ {
-		n, readErr := file.ReadAt(page, int64(pageNo)*int64(pageSize))
+		n, readErr := reader.ReadAt(page, int64(pageNo)*int64(pageSize))
 		if readErr != nil && readErr != io.EOF {
 			return pageNo, readErr
 		}
 		if n != len(page) {
 			return pageNo, fmt.Errorf("short read %d/%d", n, len(page))
 		}
-		// User data pages are read verbatim: protection-byte restoration is
-		// only proven for SYSTEM.DBF dictionary pages, and nearly full data
-		// pages keep slot entries in the tail area a restore would read from.
+		restoreUserDataPageProtectionBytes(page, pageSize)
 		if err := visit(page, uint32(pageNo)); err != nil {
 			return pageNo + 1, err
 		}

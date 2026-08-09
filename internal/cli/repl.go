@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,10 @@ const replPrompt = "DMDUL> "
 
 type interactiveSession struct {
 	systemPath      string
+	asmDisks        []string
+	asmStorage      *dm.RawASMStorage
+	asmSystem       *dm.RawASMFile
+	asmDataSources  []dm.OfflineDataSource
 	controlPath     string
 	controlProvided bool
 	dataDir         string
@@ -52,6 +57,7 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "warning: write init.dul: %v\n", err)
 	}
 	defer session.closeLog()
+	defer session.closeASM()
 
 	fmt.Fprintf(stdout, "dmdul: Release %s - Dameng Database Offline Recovery & Data Unloader\n", version.Version)
 	fmt.Fprintln(stdout, "Copyright (c) 2026 greatfinish. All rights reserved.")
@@ -163,6 +169,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Reload configuration and persisted bootstrap parameters from init.dul.")
 	fmt.Fprintln(stdout, "  list datafile;")
 	fmt.Fprintln(stdout, "      List resolved data files with tablespace, page count and read status (pre-flight check).")
+	fmt.Fprintln(stdout, "  list asmfile;")
+	fmt.Fprintln(stdout, "      List files recovered from offline DMASM INODE metadata.")
 	fmt.Fprintln(stdout, "  describe <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Show one table's recovered definition, physical location and columns (alias: desc).")
 	fmt.Fprintln(stdout, "  list user;")
@@ -187,6 +195,8 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Scan data files for corrupt pages (checksum + header + structure). Read-only.")
 	fmt.Fprintln(stdout, "      Files are located in data_dir; add 'control' to follow dm.ctl absolute paths.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
+	fmt.Fprintln(stdout, "  set asm_disk <raw member>[,<raw member>...];")
+	fmt.Fprintln(stdout, "      Read +GROUP/... files directly from offline DMASM member disks (read-only).")
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
 	fmt.Fprintln(stdout, "  set output_dir <directory>;")
@@ -372,6 +382,7 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 	value := strings.Join(args[1:], " ")
 	switch name {
 	case "system", "file":
+		s.closeASM()
 		s.systemPath = value
 		s.dictionary = nil
 		s.charset = "auto"
@@ -379,6 +390,18 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.resetDatabaseMetadata()
 		fmt.Fprintf(stdout, "%s = %s\n", name, value)
 		s.probeDatabaseIdentity(stdout, true)
+		return nil
+	case "asm_disk", "asm_disks", "asmdisk":
+		s.closeASM()
+		s.asmDisks = splitASMDisks(value)
+		s.dictionary = nil
+		if len(s.asmDisks) == 0 {
+			return fmt.Errorf("asm_disk requires at least one raw member path")
+		}
+		fmt.Fprintf(stdout, "asm_disk = %s\n", strings.Join(s.asmDisks, ","))
+		if dm.IsASMPath(s.systemPath) {
+			s.probeDatabaseIdentity(stdout, true)
+		}
 		return nil
 	case "data_dir", "datadir":
 		s.dataDir = value
@@ -395,7 +418,7 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 	case "data_format", "format":
 		value = strings.ToLower(strings.TrimSpace(value))
 		if value != "sql" && value != "csv" && value != "fldr" && value != "dmp" {
-			return fmt.Errorf("data_format must be sql, fldr, or dmp")
+			return fmt.Errorf("data_format must be sql, fldr (csv alias), or dmp")
 		}
 		if value == "csv" {
 			// The delimited export is now the dmfldr text format; keep "csv"
@@ -470,6 +493,8 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 	switch strings.ToLower(args[0]) {
 	case "datafile", "datafiles", "file", "files":
 		return s.printDataFiles(stdout)
+	case "asmfile", "asmfiles":
+		return s.printASMFiles(stdout)
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
@@ -590,6 +615,12 @@ func formatDescribeType(col dm.DictionaryColumn) string {
 // group/file id, page count and read status — a pre-flight check that all DBFs
 // were identified and are readable, in the spirit of DUL's "show datafiles".
 func (s *interactiveSession) printDataFiles(stdout io.Writer) error {
+	if dm.IsASMPath(s.systemPath) {
+		if err := s.ensureASMOpen(); err != nil {
+			return err
+		}
+		return s.printASMDataFiles(stdout)
+	}
 	files, err := dm.ScanOfflineDataFiles(s.controlPath, s.effectiveControlDULPath(), s.effectiveDataDir())
 	if err != nil {
 		return err
@@ -641,6 +672,78 @@ func (s *interactiveSession) printDataFiles(stdout io.Writer) error {
 			fmt.Sprint(pages), fmt.Sprintf("%.1f", sizeMB), status, f.Path)
 	}
 	fmt.Fprintf(stdout, "data files: %d (readable & page-aligned: %d), page_size=%d\n", len(files), okCount, pageSize)
+	return nil
+}
+
+func (s *interactiveSession) printASMDataFiles(stdout io.Writer) error {
+	pageSize := s.metadata.PageSize
+	if pageSize == 0 && s.asmSystem != nil {
+		meta := dm.InspectDatabaseMetadataFromReader(s.systemPath, s.asmSystem, s.asmSystem.Size(), s.charset)
+		pageSize = meta.PageSize
+	}
+	if pageSize == 0 {
+		pageSize = dm.DefaultPageSize
+	}
+	spaces := make([]string, 0, len(s.asmDataSources))
+	paths := make([]string, 0, len(s.asmDataSources))
+	for _, source := range s.asmDataSources {
+		spaces = append(spaces, defaultIfBlank(source.Tablespace, "?"))
+		paths = append(paths, source.Path)
+	}
+	format := printListHeader(stdout, []listColumn{
+		{title: "group", width: 5, right: true},
+		{title: "file", width: 5, right: true},
+		{title: "tablespace", width: widestValue("tablespace", spaces)},
+		{title: "pages", width: 10, right: true},
+		{title: "size_MB", width: 9, right: true},
+		{title: "status", width: 10},
+		{title: "path", width: widestValue("path", paths)},
+	})
+	okCount := 0
+	for _, source := range s.asmDataSources {
+		size := source.Reader.Size()
+		status := "OK"
+		if size <= 0 || size%int64(pageSize) != 0 {
+			status = "SIZE?"
+		} else {
+			okCount++
+		}
+		fmt.Fprintf(stdout, format,
+			fmt.Sprint(source.GroupID), fmt.Sprint(source.FileID), defaultIfBlank(source.Tablespace, "?"),
+			fmt.Sprint(size/int64(pageSize)), fmt.Sprintf("%.1f", float64(size)/(1024*1024)), status, source.Path)
+	}
+	fmt.Fprintf(stdout, "data files: %d (readable & page-aligned: %d), page_size=%d, source=DMASM raw\n",
+		len(s.asmDataSources), okCount, pageSize)
+	return nil
+}
+
+func (s *interactiveSession) printASMFiles(stdout io.Writer) error {
+	if !dm.IsASMPath(s.systemPath) {
+		return fmt.Errorf("list asmfile requires set asm_disk and an ASM system path such as +DMDATA/.../SYSTEM.DBF")
+	}
+	if err := s.ensureASMOpen(); err != nil {
+		return err
+	}
+	files := s.asmStorage.Files()
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		paths = append(paths, file.Path)
+	}
+	format := printListHeader(stdout, []listColumn{
+		{title: "group", width: 10},
+		{title: "file_id", width: 10, right: true},
+		{title: "size_MB", width: 10, right: true},
+		{title: "extents", width: 8, right: true},
+		{title: "inode", width: 18},
+		{title: "path", width: widestValue("path", paths)},
+	})
+	for _, file := range files {
+		kind := fmt.Sprintf("%d/%d/0x%X", file.InodeDisk, file.InodeAU, file.InodeOff)
+		fmt.Fprintf(stdout, format, defaultIfBlank(file.GroupName, fmt.Sprint(file.GroupID)), fmt.Sprint(file.ID), fmt.Sprintf("%.1f", float64(file.Size)/(1024*1024)),
+			fmt.Sprint(file.Extents), kind, file.Path)
+	}
+	fmt.Fprintf(stdout, "asm files: %d, groups=%d, disks=%d, source=DMASM INODE\n",
+		len(files), s.asmStorage.GroupCount(), s.asmStorage.DiskCount())
 	return nil
 }
 
@@ -702,21 +805,44 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	s.dictionary = nil
 	systemPath := defaultIfBlank(s.systemPath, defaultSystemPath)
 	ctlPath, ctlProvided := optionalControlPathForSystem(systemPath, s.controlPath, s.controlProvided)
-	if err := validateOptionalControlInputFiles("bootstrap", systemPath, ctlPath, ctlProvided); err != nil {
-		return err
+	asmMode := dm.IsASMPath(systemPath)
+	if asmMode {
+		ctlPath, ctlProvided = "", false
+		if err := s.ensureASMOpen(); err != nil {
+			return err
+		}
+	} else {
+		if err := validateOptionalControlInputFiles("bootstrap", systemPath, ctlPath, ctlProvided); err != nil {
+			return err
+		}
 	}
 	dataDir := s.effectiveDataDir()
 	controlDULPath := s.effectiveControlDULPath()
 	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=start status=RUNNING system=%q data_dir=%q", systemPath, dataDir))
-	dataFiles, err := dm.ScanOfflineDataFiles(ctlPath, "", dataDir)
-	if err != nil {
-		return err
+	var dataFiles []dm.OfflineDataFile
+	var err error
+	if asmMode {
+		dataFiles = offlineDataFilesFromSources(s.asmDataSources)
+	} else {
+		dataFiles, err = dm.ScanOfflineDataFiles(ctlPath, "", dataDir)
+		if err != nil {
+			return err
+		}
 	}
 	if err := dm.WriteControlDUL(controlDULPath, dataFiles); err != nil {
 		return fmt.Errorf("write control.dul: %w", err)
 	}
 	configuredCharset := defaultIfBlank(s.charset, "auto")
-	metadata := dm.InspectDatabaseMetadata(systemPath, ctlPath, "", configuredCharset)
+	var metadata dm.DatabaseMetadata
+	if asmMode {
+		metadata = dm.InspectDatabaseMetadataFromReader(systemPath, s.asmSystem, s.asmSystem.Size(), configuredCharset)
+		if name := asmDatabaseName(systemPath); name != "" {
+			metadata.DatabaseName = name
+			metadata.DatabaseNameSrc = "DMASM path"
+		}
+	} else {
+		metadata = dm.InspectDatabaseMetadata(systemPath, ctlPath, "", configuredCharset)
+	}
 	bootstrapCharset := configuredCharset
 	if !s.charsetExplicit && metadata.HasCharsetFlag {
 		if detected, ok := charsetParameterFromDictionary(metadata.Charset); ok {
@@ -736,13 +862,22 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		metadata.PageCount, metadata.PageCountSource, metadata.Charset, metadata.CharsetSource,
 		metadata.CharsetFlag, caseSensitiveLog, metadata.CaseSensitiveSource))
 	fileWarnings := false
-	for _, file := range dataFiles {
-		line, warning := formatBootstrapFileDiagnostic(file, metadata.PageSize)
+	for index, file := range dataFiles {
+		var line string
+		var warning bool
+		if asmMode {
+			line, warning = formatBootstrapASMFileDiagnostic(s.asmDataSources[index], metadata.PageSize)
+		} else {
+			line, warning = formatBootstrapFileDiagnostic(file, metadata.PageSize)
+		}
 		fileWarnings = fileWarnings || warning
 		s.emitBootstrapLine(stdout, line)
 	}
 	dict, err := dm.LoadDictionary(dm.DictionaryOptions{
 		SystemPath:     systemPath,
+		SystemReader:   s.activeSystemReader(),
+		SystemSize:     s.activeSystemSize(),
+		DataSources:    s.activeDataSources(),
 		ControlPath:    ctlPath,
 		ControlDULPath: controlDULPath,
 		OwnerFilter:    "all",
@@ -753,6 +888,12 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	})
 	if err != nil {
 		return err
+	}
+	missingFiles := missingDictionaryDataFiles(dict, dataFiles)
+	if len(missingFiles) > 0 {
+		fileWarnings = true
+		s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=datafile name=required-files status=WARNING missing_files=%q reason=%q",
+			formatMissingDictionaryDataFiles(missingFiles), "dictionary tables reference data files that are absent from the offline input; affected unloads may return zero rows"))
 	}
 	dictDir := s.effectiveDictionaryDir()
 	dict.Source = "SYSTEM.DBF"
@@ -825,6 +966,86 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "partitions loaded: %d\n", dict.PartitionCount)
 	fmt.Fprintf(stdout, "partition keys loaded: %d\n", dict.PartitionKeyCount)
 	return nil
+}
+
+type missingDictionaryDataFile struct {
+	groupID    uint32
+	fileID     int16
+	tablespace string
+	tables     int
+}
+
+func missingDictionaryDataFiles(dictionary *dm.DictionaryInfo, files []dm.OfflineDataFile) []missingDictionaryDataFile {
+	if dictionary == nil {
+		return nil
+	}
+	type fileKey struct {
+		groupID uint32
+		fileID  int16
+	}
+	availableFiles := make(map[fileKey]bool)
+	availableGroups := make(map[uint32]bool)
+	for _, file := range files {
+		if file.GroupID >= 4 {
+			availableFiles[fileKey{groupID: file.GroupID, fileID: file.FileID}] = true
+			availableGroups[file.GroupID] = true
+		}
+	}
+	missing := make(map[fileKey]*missingDictionaryDataFile)
+	seenTables := make(map[uint32]bool)
+	for _, table := range dictionary.Tables {
+		if table.Temporary || table.GroupID < 4 || seenTables[table.ID] {
+			continue
+		}
+		key := fileKey{groupID: table.GroupID, fileID: table.RootFile}
+		if table.RootFile >= 0 {
+			if availableFiles[key] {
+				continue
+			}
+		} else {
+			key.fileID = -1
+			if availableGroups[table.GroupID] {
+				continue
+			}
+		}
+		seenTables[table.ID] = true
+		file := missing[key]
+		if file == nil {
+			file = &missingDictionaryDataFile{groupID: table.GroupID, fileID: key.fileID, tablespace: table.Tablespace}
+			missing[key] = file
+		}
+		if file.tablespace == "" && table.Tablespace != "" {
+			file.tablespace = table.Tablespace
+		}
+		file.tables++
+	}
+	result := make([]missingDictionaryDataFile, 0, len(missing))
+	for _, file := range missing {
+		result = append(result, *file)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].groupID != result[j].groupID {
+			return result[i].groupID < result[j].groupID
+		}
+		return result[i].fileID < result[j].fileID
+	})
+	return result
+}
+
+func formatMissingDictionaryDataFiles(files []missingDictionaryDataFile) string {
+	parts := make([]string, 0, len(files))
+	for _, file := range files {
+		name := strings.TrimSpace(file.tablespace)
+		if name == "" {
+			name = fmt.Sprintf("GROUP_%d", file.groupID)
+		}
+		fileID := "*"
+		if file.fileID >= 0 {
+			fileID = strconv.Itoa(int(file.fileID))
+		}
+		parts = append(parts, fmt.Sprintf("%d/%s(%s,tables=%d)", file.groupID, fileID, name, file.tables))
+	}
+	return strings.Join(parts, ",")
 }
 
 func (s *interactiveSession) emitBootstrapLine(stdout io.Writer, line string) {
@@ -907,8 +1128,60 @@ func formatBootstrapFileDiagnostic(file dm.OfflineDataFile, pageSize uint32) (st
 	return line, status != "OK" && status != "IGNORED_TEMP"
 }
 
+func offlineDataFilesFromSources(sources []dm.OfflineDataSource) []dm.OfflineDataFile {
+	files := make([]dm.OfflineDataFile, 0, len(sources))
+	for _, source := range sources {
+		files = append(files, dm.OfflineDataFile{
+			GroupID: source.GroupID, FileID: source.FileID,
+			Tablespace: source.Tablespace, Path: source.Path,
+		})
+	}
+	return files
+}
+
+func formatBootstrapASMFileDiagnostic(source dm.OfflineDataSource, pageSize uint32) (string, bool) {
+	size := source.Reader.Size()
+	pages := int64(0)
+	aligned := pageSize > 0 && size > 0 && size%int64(pageSize) == 0
+	if pageSize > 0 {
+		pages = size / int64(pageSize)
+	}
+	status := "OK"
+	if !aligned {
+		status = "UNALIGNED"
+	}
+	var header [8]byte
+	headerGroup, headerFile, headerPage := uint16(0), uint16(0), uint32(0)
+	if _, err := source.Reader.ReadAt(header[:], 0); err != nil {
+		status = "UNREADABLE"
+	} else {
+		headerGroup = binary.LittleEndian.Uint16(header[0:2])
+		headerFile = binary.LittleEndian.Uint16(header[2:4])
+		headerPage = binary.LittleEndian.Uint32(header[4:8])
+		if status == "OK" && (uint32(headerGroup) != source.GroupID || int16(headerFile) != source.FileID || headerPage != 0) {
+			if source.GroupID != 0 && source.GroupID != 1 && source.GroupID != 3 && source.GroupID != 4 {
+				status = "HEADER_MISMATCH"
+			}
+		}
+	}
+	line := fmt.Sprintf("[bootstrap] phase=file status=%s source=DMASM group=%d file=%d header_group=%d header_file=%d header_page=%d tablespace=%q bytes=%d pages=%d aligned=%t path=%q",
+		status, source.GroupID, source.FileID, headerGroup, headerFile, headerPage,
+		source.Tablespace, size, pages, aligned, source.Path)
+	return line, status != "OK"
+}
+
+func asmDatabaseName(systemPath string) string {
+	clean := strings.Trim(strings.ReplaceAll(systemPath, "\\", "/"), "/")
+	parts := strings.Split(clean, "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2]
+}
+
 func (s *interactiveSession) printParameters(stdout io.Writer) {
 	fmt.Fprintf(stdout, "system     = %s\n", s.systemPath)
+	fmt.Fprintf(stdout, "asm_disk   = %s\n", defaultIfBlank(strings.Join(s.asmDisks, ","), "(not set)"))
 	fmt.Fprintf(stdout, "control    = %s\n", defaultIfBlank(s.controlPath, "(auto)"))
 	fmt.Fprintf(stdout, "control_dul= %s\n", s.effectiveControlDULPath())
 	fmt.Fprintf(stdout, "init_dul   = %s\n", s.effectiveInitDULPath())
@@ -1234,7 +1507,7 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 	if err := s.ensureOutputDir(); err != nil {
 		return err
 	}
-	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+	ddl, err := s.exportDDL(dm.DDLExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1248,7 +1521,7 @@ func (s *interactiveSession) unloadTable(args []string, stdout io.Writer) error 
 	if err != nil {
 		return err
 	}
-	data, err := dm.ExportData(dm.DataExportOptions{
+	data, err := s.exportData(dm.DataExportOptions{
 		SystemPath:       s.systemPath,
 		ControlPath:      s.controlPath,
 		ControlDULPath:   s.effectiveControlDULPath(),
@@ -1301,7 +1574,7 @@ func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error
 	if err := s.ensureOutputDir(); err != nil {
 		return err
 	}
-	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+	ddl, err := s.exportDDL(dm.DDLExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1315,7 +1588,7 @@ func (s *interactiveSession) recoverTable(args []string, stdout io.Writer) error
 	if err != nil {
 		return err
 	}
-	data, err := dm.ExportData(dm.DataExportOptions{
+	data, err := s.exportData(dm.DataExportOptions{
 		SystemPath:       s.systemPath,
 		ControlPath:      s.controlPath,
 		ControlDULPath:   s.effectiveControlDULPath(),
@@ -1364,7 +1637,7 @@ func (s *interactiveSession) unloadObject(args []string, stdout io.Writer) error
 	if err := s.ensureOutputDir(); err != nil {
 		return err
 	}
-	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+	ddl, err := s.exportDDL(dm.DDLExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1409,7 +1682,7 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	if err := s.ensureOutputDir(); err != nil {
 		return err
 	}
-	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+	ddl, err := s.exportDDL(dm.DDLExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1427,7 +1700,7 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 		return err
 	}
 	dataExt := dataOutputExtension(s.dataFormat)
-	data, err := dm.ExportData(dm.DataExportOptions{
+	data, err := s.exportData(dm.DataExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1496,7 +1769,7 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 	if err := s.ensureOutputDir(); err != nil {
 		return err
 	}
-	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+	ddl, err := s.exportDDL(dm.DDLExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1532,7 +1805,7 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 		return nil
 	}
 	dataPath := s.outputPath(prefix + "_data.sql")
-	data, err := dm.ExportData(dm.DataExportOptions{
+	data, err := s.exportData(dm.DataExportOptions{
 		SystemPath:       s.systemPath,
 		ControlPath:      s.controlPath,
 		ControlDULPath:   s.effectiveControlDULPath(),
@@ -1559,7 +1832,7 @@ func (s *interactiveSession) unloadDatabase(args []string, stdout io.Writer) err
 
 func (s *interactiveSession) unloadDatabaseSplitData(prefix string, format string, stdout io.Writer) (*dm.DataExportResult, error) {
 	extension := dataOutputExtension(format)
-	data, err := dm.ExportData(dm.DataExportOptions{
+	data, err := s.exportData(dm.DataExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1735,7 +2008,7 @@ func (s *interactiveSession) unloadLogicalDMP(request logicalDMPUnloadRequest, s
 	}
 	ddlPath := s.outputPath(request.prefix + "_ddl.sql")
 	dmpPath := s.outputPath(request.prefix + ".dmp")
-	ddl, err := dm.ExportDDL(dm.DDLExportOptions{
+	ddl, err := s.exportDDL(dm.DDLExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -1759,7 +2032,7 @@ func (s *interactiveSession) unloadLogicalDMP(request logicalDMPUnloadRequest, s
 		return fmt.Errorf("create dmp spool directory: %w", err)
 	}
 	defer os.RemoveAll(spoolDir)
-	data, err := dm.ExportData(dm.DataExportOptions{
+	data, err := s.exportData(dm.DataExportOptions{
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
@@ -2060,6 +2333,22 @@ func (s *interactiveSession) validateAutoLoadedDictionary(dict *dm.DictionaryInf
 	if dict == nil || strings.TrimSpace(dict.SystemPath) == "" || strings.TrimSpace(s.systemPath) == "" {
 		return nil
 	}
+	if dm.IsASMPath(s.systemPath) {
+		if !strings.EqualFold(dict.SystemPath, s.systemPath) {
+			return fmt.Errorf("existing dictionary belongs to SYSTEM.DBF %q, current system is %q; run bootstrap", dict.SystemPath, s.systemPath)
+		}
+		if err := s.ensureASMOpen(); err != nil {
+			return err
+		}
+		metadata := dm.InspectDatabaseMetadataFromReader(s.systemPath, s.asmSystem, s.asmSystem.Size(), "auto")
+		if dict.PageSize != 0 && metadata.PageSize != 0 && dict.PageSize != metadata.PageSize {
+			return fmt.Errorf("existing dictionary page size %d does not match current ASM SYSTEM.DBF page size %d; run bootstrap", dict.PageSize, metadata.PageSize)
+		}
+		if dict.PageCount != 0 && metadata.PageCount != 0 && dict.PageCount != metadata.PageCount {
+			return fmt.Errorf("existing dictionary page count %d does not match current ASM SYSTEM.DBF page count %d; run bootstrap", dict.PageCount, metadata.PageCount)
+		}
+		return nil
+	}
 	if info, err := os.Stat(s.systemPath); err != nil || info.IsDir() {
 		return nil
 	}
@@ -2084,6 +2373,98 @@ func (s *interactiveSession) validateAutoLoadedDictionary(dict *dm.DictionaryInf
 	return nil
 }
 
+func splitASMDisks(value string) []string {
+	var result []string
+	seen := make(map[string]bool)
+	for _, item := range strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ';' }) {
+		item = strings.TrimSpace(item)
+		key := strings.ToUpper(item)
+		if item == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		result = append(result, item)
+	}
+	return result
+}
+
+func (s *interactiveSession) closeASM() {
+	if s.asmStorage != nil {
+		_ = s.asmStorage.Close()
+	}
+	s.asmStorage = nil
+	s.asmSystem = nil
+	s.asmDataSources = nil
+}
+
+func (s *interactiveSession) ensureASMOpen() error {
+	if !dm.IsASMPath(s.systemPath) {
+		return nil
+	}
+	if s.asmStorage != nil && s.asmSystem != nil {
+		return nil
+	}
+	if len(s.asmDisks) == 0 {
+		return fmt.Errorf("ASM system path %s requires: set asm_disk <raw member>[,<raw member>...]", s.systemPath)
+	}
+	storage, err := dm.OpenRawASMStorage(s.asmDisks...)
+	if err != nil {
+		return err
+	}
+	system, err := storage.Open(s.systemPath)
+	if err != nil {
+		storage.Close()
+		return err
+	}
+	sources, err := storage.DataFiles(s.systemPath)
+	if err != nil {
+		storage.Close()
+		return err
+	}
+	s.asmStorage = storage
+	s.asmSystem = system
+	s.asmDataSources = sources
+	return nil
+}
+
+func (s *interactiveSession) activeSystemReader() dm.SizedReaderAt {
+	if dm.IsASMPath(s.systemPath) {
+		return s.asmSystem
+	}
+	return nil
+}
+
+func (s *interactiveSession) activeSystemSize() int64 {
+	if reader := s.activeSystemReader(); reader != nil {
+		return reader.Size()
+	}
+	return 0
+}
+
+func (s *interactiveSession) activeDataSources() []dm.OfflineDataSource {
+	if dm.IsASMPath(s.systemPath) {
+		return s.asmDataSources
+	}
+	return nil
+}
+
+func (s *interactiveSession) exportDDL(opts dm.DDLExportOptions) (*dm.DDLExportResult, error) {
+	if err := s.ensureASMOpen(); err != nil {
+		return nil, err
+	}
+	opts.SystemReader = s.activeSystemReader()
+	return dm.ExportDDL(opts)
+}
+
+func (s *interactiveSession) exportData(opts dm.DataExportOptions) (*dm.DataExportResult, error) {
+	if err := s.ensureASMOpen(); err != nil {
+		return nil, err
+	}
+	opts.SystemReader = s.activeSystemReader()
+	opts.DataSources = s.activeDataSources()
+	return dm.ExportData(opts)
+}
+
 func (s *interactiveSession) outputPath(name string) string {
 	if filepath.IsAbs(name) {
 		return name
@@ -2094,6 +2475,9 @@ func (s *interactiveSession) outputPath(name string) string {
 func (s *interactiveSession) effectiveDataDir() string {
 	if s.dataDirSet && strings.TrimSpace(s.dataDir) != "" {
 		return s.dataDir
+	}
+	if dm.IsASMPath(s.systemPath) {
+		return "."
 	}
 	dir := filepath.Dir(defaultIfBlank(s.systemPath, defaultSystemPath))
 	if dir == "" {
@@ -2156,6 +2540,7 @@ func (s *interactiveSession) loadConfigFile(stderr io.Writer) {
 
 func (s *interactiveSession) loadInitDULCommand(stdout io.Writer, commandName string) error {
 	path := s.effectiveInitDULPath()
+	s.closeASM()
 	if err := s.loadInitDUL(path); err != nil {
 		return err
 	}
@@ -2192,6 +2577,8 @@ func (s *interactiveSession) loadInitDUL(path string) error {
 		switch key {
 		case "system", "system_file", "file":
 			s.systemPath = value
+		case "asm_disk", "asm_disks", "asmdisk":
+			s.asmDisks = splitASMDisks(value)
 		case "control", "ctl":
 			s.controlPath = value
 			s.controlProvided = value != ""
@@ -2333,6 +2720,7 @@ func (s *interactiveSession) initDULContent() string {
 	out.WriteString(fmt.Sprintf("case_sensitive_source=%s\n", s.metadata.CaseSensitiveSource))
 	out.WriteString(fmt.Sprintf("ini_path=%s\n", s.metadata.IniPath))
 	out.WriteString(fmt.Sprintf("system=%s\n", s.systemPath))
+	out.WriteString(fmt.Sprintf("asm_disk=%s\n", strings.Join(s.asmDisks, ",")))
 	out.WriteString(fmt.Sprintf("control=%s\n", s.controlPath))
 	if s.dataDirSet {
 		out.WriteString(fmt.Sprintf("data_dir=%s\n", s.dataDir))
@@ -2534,6 +2922,24 @@ func (s *interactiveSession) probeDatabaseIdentity(stdout io.Writer, announce bo
 	if path == "" {
 		return
 	}
+	if dm.IsASMPath(path) {
+		if err := s.ensureASMOpen(); err != nil {
+			if announce {
+				fmt.Fprintf(stdout, "detected: DMASM source unavailable: %v\n", err)
+			}
+			return
+		}
+		meta := dm.InspectDatabaseMetadataFromReader(path, s.asmSystem, s.asmSystem.Size(), s.charset)
+		if name := asmDatabaseName(path); name != "" {
+			meta.DatabaseName, meta.DatabaseNameSrc = name, "DMASM path"
+		}
+		s.metadata = meta
+		parts := []string{"db_name=" + meta.DatabaseName, "instance=" + meta.InstanceName,
+			fmt.Sprintf("page_size=%d", meta.PageSize), fmt.Sprintf("pages=%d", meta.PageCount), "charset=" + meta.Charset}
+		fmt.Fprintf(stdout, "detected: %s (DMASM: %s)\n", strings.Join(parts, " "), path)
+		s.log("[DETECT] " + strings.Join(parts, " ") + " path=" + path + " source=DMASM")
+		return
+	}
 	if info, err := os.Stat(path); err != nil || info.IsDir() {
 		if announce {
 			fmt.Fprintf(stdout, "detected: SYSTEM.DBF not readable at %s\n", path)
@@ -2579,6 +2985,10 @@ func (s *interactiveSession) probeDatabaseIdentity(stdout io.Writer, announce bo
 // is printed, so the user can run bootstrap immediately with no setup. When
 // none is found it prints a one-line hint to set the paths manually.
 func (s *interactiveSession) autoProbeStartupSystem(stdout io.Writer) {
+	if dm.IsASMPath(s.systemPath) && len(s.asmDisks) > 0 {
+		s.probeDatabaseIdentity(stdout, true)
+		return
+	}
 	var exeDir string
 	if exe, err := os.Executable(); err == nil {
 		exeDir = filepath.Dir(exe)

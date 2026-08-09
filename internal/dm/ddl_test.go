@@ -119,6 +119,32 @@ func TestParseDDLTextRow(t *testing.T) {
 	}
 }
 
+func TestParseDDLTextRowFromStandardSYSTEXTSLayout(t *testing.T) {
+	page := make([]byte, 32768)
+	rowOff := 0x180
+	text := []byte(strings.Repeat("CREATE OR REPLACE VIEW DMTEST.V AS SELECT 1;\n", 4))
+	payload := make([]byte, 13+len(text))
+	payload[0] = 0x01
+	payload[2] = 0x02
+	binary.LittleEndian.PutUint32(payload[9:13], uint32(len(text)))
+	copy(payload[13:], text)
+	rowLen := 2 + 1 + 4 + 4 + 2 + len(payload) + 20
+	binary.BigEndian.PutUint16(page[rowOff:], uint16(rowLen))
+	page[rowOff+2] = 0
+	binary.LittleEndian.PutUint32(page[rowOff+3:], 16778487)
+	binary.LittleEndian.PutUint32(page[rowOff+7:], 1)
+	binary.BigEndian.PutUint16(page[rowOff+11:], uint16(len(payload)))
+	copy(page[rowOff+13:], payload)
+
+	row, ok := parseDDLTextRow(page, rowOff, 3810, 18, uint16(rowOff), 32768, textDecoder{preferred: "utf-8"})
+	if !ok {
+		t.Fatal("parseDDLTextRow() returned false")
+	}
+	if row.ID != 16778487 || row.SeqNo != 1 || row.Text != string(text) {
+		t.Fatalf("row = %+v", row)
+	}
+}
+
 func TestRenderCreateUserUsesPlaceholderPasswordAndTablespaces(t *testing.T) {
 	user := dictionaryObject{Name: "HR_TEST", Info3: 4}
 	tablespaces := map[uint32]string{3: "TEMP", 4: "MAIN"}
@@ -414,6 +440,21 @@ func TestRenderTriggersAndRoutinesEmitPLSQLSlashTerminator(t *testing.T) {
 	}
 	if strings.Count(got, "\n/\n") != 2 {
 		t.Fatalf("expected 2 '/' terminators (trigger + procedure), got:\n%s", got)
+	}
+}
+
+func TestRenderViewsQualifiesRecoveredUnqualifiedName(t *testing.T) {
+	var out strings.Builder
+	renderViews(&out, []DictionaryView{{
+		Owner: "DMTEST", Name: "V_EMPLOYEE_ORDER_SUMMARY",
+		SQL: "CREATE OR REPLACE  VIEW V_EMPLOYEE_ORDER_SUMMARY AS\nSELECT 1 AS ID;",
+	}})
+	got := out.String()
+	if !strings.Contains(got, "CREATE OR REPLACE  VIEW DMTEST.V_EMPLOYEE_ORDER_SUMMARY AS") {
+		t.Fatalf("recovered view must be qualified with its dictionary owner, got:\n%s", got)
+	}
+	if strings.Contains(got, "VIEW V_EMPLOYEE_ORDER_SUMMARY AS") {
+		t.Fatalf("unqualified recovered view name remains in output:\n%s", got)
 	}
 }
 

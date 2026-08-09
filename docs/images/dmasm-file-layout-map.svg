@@ -1,0 +1,337 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1260" viewBox="0 0 1800 1260" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Noto Sans CJK SC',sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10Z" fill="#dc2626"/>
+    </marker>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.08"/>
+    </filter>
+    <style>
+      .title{font-size:30px;font-weight:700;fill:#111827}
+      .subtitle{font-size:15px;fill:#475569}
+      .panel-title{font-size:18px;font-weight:700;fill:#fff}
+      .section-title{font-size:16px;font-weight:700;fill:#0f172a}
+      .label{font-size:13px;font-weight:700;fill:#1f2937}
+      .body{font-size:12.5px;fill:#334155}
+      .small{font-size:11.5px;fill:#475569}
+      .tiny{font-size:10.5px;fill:#64748b}
+      .mono{font-family:'Cascadia Mono','Consolas',monospace}
+      .center{text-anchor:middle}
+    </style>
+  </defs>
+
+  <rect width="1800" height="1260" fill="#ffffff"/>
+
+  <text x="24" y="42" class="title">DMASM 磁盘逻辑结构与离线 ASM 文件定位示意图</text>
+  <text x="24" y="70" class="subtitle">区分 DMASM 非镜像环境的 DESC / INODE / DATA 簇模型与镜像环境的描述 / INODE / 数据 AU 模型</text>
+
+  <!-- Common logical hierarchy -->
+  <g filter="url(#shadow)">
+    <rect x="24" y="92" width="1752" height="104" rx="10" fill="#f8fafc" stroke="#94a3b8" stroke-width="1.4"/>
+    <rect x="40" y="104" width="188" height="30" rx="7" fill="#334155"/>
+    <text x="134" y="125" class="panel-title center" font-size="15">共同逻辑层级</text>
+  </g>
+
+  <!-- Disk group icon -->
+  <g>
+    <ellipse cx="286" cy="133" rx="47" ry="12" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <rect x="239" y="133" width="94" height="37" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
+    <ellipse cx="286" cy="170" rx="47" ry="12" fill="#bfdbfe" stroke="#2563eb" stroke-width="1.5"/>
+    <text x="286" y="153" class="label center" fill="#1e3a8a">磁盘组</text>
+    <text x="286" y="185" class="tiny center">DISK GROUP</text>
+  </g>
+  <line x1="342" y1="146" x2="417" y2="146" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <g>
+    <rect x="430" y="116" width="205" height="60" rx="8" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.4"/>
+    <text x="532" y="141" class="label center">一个或多个 ASM 磁盘</text>
+    <text x="532" y="162" class="small center">磁盘头 · group/disk id</text>
+  </g>
+  <line x1="647" y1="146" x2="714" y2="146" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="727" y="116" width="205" height="60" rx="8" fill="#fff7ed" stroke="#f59e0b" stroke-width="1.4"/>
+    <text x="829" y="141" class="label center">簇或 AU 分配</text>
+    <text x="829" y="162" class="small center">取决于 DMASM 代际</text>
+  </g>
+  <line x1="944" y1="146" x2="1011" y2="146" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="1024" y="116" width="205" height="60" rx="8" fill="#fef2f2" stroke="#ef4444" stroke-width="1.4"/>
+    <text x="1126" y="141" class="label center">DESC + INODE 映射</text>
+    <text x="1126" y="162" class="small center">文件目录与物理地址</text>
+  </g>
+  <line x1="1241" y1="146" x2="1308" y2="146" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="1321" y="116" width="205" height="60" rx="8" fill="#f0fdf4" stroke="#22c55e" stroke-width="1.4"/>
+    <text x="1423" y="141" class="label center">ASM 逻辑文件</text>
+    <text x="1423" y="162" class="small center mono">+GROUP/path/file</text>
+  </g>
+  <line x1="1538" y1="146" x2="1605" y2="146" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <g>
+    <rect x="1618" y="116" width="140" height="60" rx="8" fill="#eef2ff" stroke="#6366f1" stroke-width="1.4"/>
+    <text x="1688" y="141" class="label center">DBF / CTL / LOG</text>
+    <text x="1688" y="162" class="small center">文件正文</text>
+  </g>
+
+  <!-- Early layout panel -->
+  <g filter="url(#shadow)">
+    <rect x="24" y="216" width="858" height="490" rx="12" fill="#ffffff" stroke="#f59e0b" stroke-width="1.8"/>
+    <rect x="24" y="216" width="858" height="42" rx="12" fill="#b45309"/>
+    <rect x="24" y="246" width="858" height="12" fill="#b45309"/>
+    <text x="453" y="244" class="panel-title center">DMASM 非镜像环境：DESC / INODE / DATA 簇</text>
+  </g>
+
+  <g>
+    <rect x="44" y="272" width="818" height="54" rx="8" fill="#fffbeb" stroke="#fbbf24"/>
+    <text x="64" y="294" class="label">官方分配模型</text>
+    <text x="64" y="315" class="body">AU 固定 1 MiB · 1 簇 = 4 个连续 AU = 4 MiB · ASM 文件至少分配 1 个簇</text>
+    <text x="840" y="305" class="small" text-anchor="end">DESC item 32 B · INODE item 512 B</text>
+  </g>
+
+  <text x="48" y="352" class="section-title">ASM 磁盘逻辑结构（每条横带代表一个簇）</text>
+  <text x="850" y="352" class="small" text-anchor="end">图示非比例</text>
+
+  <!-- Early cluster rows -->
+  <g>
+    <text x="60" y="389" class="label">DESC 描述簇</text>
+    <rect x="176" y="366" width="650" height="42" rx="6" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+    <rect x="176" y="366" width="162.5" height="42" fill="#fee2e2" stroke="#ef4444"/>
+    <rect x="338.5" y="366" width="162.5" height="42" fill="#fee2e2" stroke="#ef4444"/>
+    <rect x="501" y="366" width="162.5" height="42" fill="#fee2e2" stroke="#ef4444"/>
+    <rect x="663.5" y="366" width="162.5" height="42" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="257" y="391" class="small center">DESC AU</text>
+    <text x="420" y="391" class="small center">元数据 AU</text>
+    <text x="582" y="391" class="small center">元数据 AU</text>
+    <text x="745" y="391" class="small center">元数据 AU</text>
+
+    <text x="60" y="441" class="label">INODE 簇</text>
+    <rect x="176" y="418" width="650" height="42" rx="6" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+    <line x1="338.5" y1="418" x2="338.5" y2="460" stroke="#3b82f6"/><line x1="501" y1="418" x2="501" y2="460" stroke="#3b82f6"/><line x1="663.5" y1="418" x2="663.5" y2="460" stroke="#3b82f6"/>
+    <text x="501" y="443" class="small center">INODE 项：路径 · 大小 · extent 数 · 首个 XDESC 地址</text>
+
+    <text x="60" y="493" class="label">DATA 数据簇</text>
+    <rect x="176" y="470" width="650" height="42" rx="6" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+    <line x1="338.5" y1="470" x2="338.5" y2="512" stroke="#f59e0b"/><line x1="501" y1="470" x2="501" y2="512" stroke="#f59e0b"/><line x1="663.5" y1="470" x2="663.5" y2="512" stroke="#f59e0b"/>
+    <text x="257" y="495" class="small center">DATA AU 0</text><text x="420" y="495" class="small center">DATA AU 1</text><text x="582" y="495" class="small center">DATA AU 2</text><text x="745" y="495" class="small center">DATA AU 3</text>
+  </g>
+
+  <g>
+    <line x1="52" y1="538" x2="852" y2="538" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="6 5"/>
+    <text x="453" y="559" class="small center">一个描述 AU 最多管理 16384 个簇 = 65536 AU = 64 GiB（官方指标）</text>
+    <line x1="52" y1="576" x2="852" y2="576" stroke="#94a3b8" stroke-width="1.3" stroke-dasharray="6 5"/>
+    <text x="60" y="609" class="label">下一个 64 GiB 范围</text>
+    <rect x="245" y="588" width="118" height="38" rx="5" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="304" y="612" class="small center">新 DESC 簇</text>
+    <rect x="378" y="588" width="118" height="38" rx="5" fill="#fffbeb" stroke="#f59e0b"/>
+    <text x="437" y="612" class="small center">DATA 簇</text>
+    <rect x="511" y="588" width="118" height="38" rx="5" fill="#eff6ff" stroke="#3b82f6"/>
+    <text x="570" y="612" class="small center">INODE 簇</text>
+    <rect x="644" y="588" width="118" height="38" rx="5" fill="#fffbeb" stroke="#f59e0b"/>
+    <text x="703" y="612" class="small center">DATA 簇</text>
+  </g>
+
+  <g>
+    <rect x="44" y="646" width="818" height="42" rx="7" fill="#f8fafc" stroke="#cbd5e1"/>
+    <text x="60" y="671" class="body"><tspan font-weight="700">dmdul：</tspan>INODE → 首个 XDESC 地址 → 32 B 前后链 → 每项还原一个 4-AU 数据簇</text>
+    <text x="840" y="671" class="tiny" text-anchor="end">真实第二 DESC 簇仍待 96 GiB 非镜像样本验证</text>
+  </g>
+
+  <!-- Mirror layout panel -->
+  <g filter="url(#shadow)">
+    <rect x="900" y="216" width="876" height="490" rx="12" fill="#ffffff" stroke="#2563eb" stroke-width="1.8"/>
+    <rect x="900" y="216" width="876" height="42" rx="12" fill="#1d4ed8"/>
+    <rect x="900" y="246" width="876" height="12" fill="#1d4ed8"/>
+    <text x="1338" y="244" class="panel-title center">DMASM 镜像环境：描述 / INODE / 数据 AU</text>
+  </g>
+
+  <g>
+    <rect x="920" y="272" width="836" height="54" rx="8" fill="#eff6ff" stroke="#60a5fa"/>
+    <text x="940" y="294" class="label">官方分配模型</text>
+    <text x="940" y="315" class="body">AU_SIZE = 1 / 2 / 4 / 8 / 16 / 32 / 64 MiB · 文件最小分配单位直接是 AU</text>
+    <text x="1736" y="305" class="small" text-anchor="end">EXTERNAL 1 · NORMAL 2 · HIGH 3 副本</text>
+  </g>
+
+  <text x="924" y="352" class="section-title">单成员盘 AU 布局与描述区</text>
+  <text x="1748" y="352" class="small" text-anchor="end">LAB05：AU=1 MiB，80000 AU</text>
+
+  <!-- Mirror AU strip -->
+  <g>
+    <rect x="924" y="368" width="828" height="56" rx="6" fill="#f8fafc" stroke="#94a3b8"/>
+    <rect x="924" y="368" width="92" height="56" fill="#fee2e2" stroke="#ef4444"/>
+    <rect x="1016" y="368" width="92" height="56" fill="#e2e8f0" stroke="#64748b"/>
+    <rect x="1108" y="368" width="92" height="56" fill="#e2e8f0" stroke="#64748b"/>
+    <rect x="1200" y="368" width="120" height="56" fill="#f8fafc" stroke="#94a3b8"/>
+    <rect x="1320" y="368" width="100" height="56" fill="#dbeafe" stroke="#3b82f6"/>
+    <rect x="1420" y="368" width="130" height="56" fill="#fffbeb" stroke="#f59e0b"/>
+    <rect x="1550" y="368" width="202" height="56" fill="#fffbeb" stroke="#f59e0b"/>
+    <text x="970" y="391" class="small center">AU 0</text><text x="970" y="409" class="tiny center">描述 AU + 盘头</text>
+    <text x="1062" y="391" class="small center">AU 1</text><text x="1062" y="409" class="tiny center">组头 generation</text>
+    <text x="1154" y="391" class="small center">AU 2</text><text x="1154" y="409" class="tiny center">成员表</text>
+    <text x="1260" y="399" class="small center">保留 / 元数据</text>
+    <text x="1370" y="391" class="small center">AU 8</text><text x="1370" y="409" class="tiny center">INODE seq 0</text>
+    <text x="1485" y="399" class="small center">数据 AU</text>
+    <text x="1651" y="399" class="small center">INODE / 数据 AU …</text>
+  </g>
+
+  <!-- Descriptor regions -->
+  <g>
+    <text x="924" y="454" class="label">描述 AU 分段公式</text>
+    <rect x="924" y="465" width="828" height="76" rx="7" fill="#fef2f2" stroke="#fca5a5"/>
+    <text x="944" y="488" class="body mono">capacity = AU_SIZE_BYTES / 32</text>
+    <text x="944" y="511" class="body mono">region_start = floor(physical_AU / capacity) × capacity</text>
+    <text x="944" y="532" class="small">AU=1 MiB 时 capacity=32768；region 起点就是描述 AU</text>
+    <rect x="1370" y="477" width="105" height="42" rx="5" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="1422" y="502" class="small center">描述 AU 0</text>
+    <line x1="1476" y1="498" x2="1510" y2="498" stroke="#dc2626" stroke-width="1.8" marker-end="url(#arrowRed)"/>
+    <rect x="1518" y="477" width="105" height="42" rx="5" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="1570" y="502" class="small center">AU 32768</text>
+    <line x1="1624" y1="498" x2="1658" y2="498" stroke="#dc2626" stroke-width="1.8" marker-end="url(#arrowRed)"/>
+    <rect x="1666" y="477" width="72" height="42" rx="5" fill="#fee2e2" stroke="#ef4444"/>
+    <text x="1702" y="502" class="small center">65536</text>
+  </g>
+
+  <!-- inode chain and copies -->
+  <g>
+    <text x="924" y="571" class="label">LAB05 多 INODE AU</text>
+    <rect x="924" y="583" width="390" height="48" rx="7" fill="#eff6ff" stroke="#60a5fa"/>
+    <rect x="944" y="594" width="82" height="27" rx="4" fill="#dbeafe" stroke="#3b82f6"/><text x="985" y="612" class="tiny center">AU 8 / seq 0</text>
+    <line x1="1027" y1="607" x2="1051" y2="607" stroke="#2563eb" marker-end="url(#arrowBlue)"/>
+    <rect x="1058" y="594" width="100" height="27" rx="4" fill="#dbeafe" stroke="#3b82f6"/><text x="1108" y="612" class="tiny center">AU 2117 / seq 1</text>
+    <line x1="1159" y1="607" x2="1183" y2="607" stroke="#2563eb" marker-end="url(#arrowBlue)"/>
+    <rect x="1190" y="594" width="104" height="27" rx="4" fill="#dbeafe" stroke="#3b82f6"/><text x="1242" y="612" class="tiny center">AU 4166 / seq 2</text>
+
+    <text x="1334" y="571" class="label">副本数组与条带</text>
+    <rect x="1334" y="583" width="418" height="74" rx="7" fill="#f0fdf4" stroke="#86efac"/>
+    <rect x="1350" y="596" width="105" height="45" rx="5" fill="#dcfce7" stroke="#22c55e"/><text x="1402" y="614" class="tiny center">Disk 0 / FG1</text><text x="1402" y="631" class="tiny center">主副本 AU</text>
+    <rect x="1489" y="596" width="105" height="45" rx="5" fill="#dcfce7" stroke="#22c55e"/><text x="1541" y="614" class="tiny center">Disk 1 / FG2</text><text x="1541" y="631" class="tiny center">镜像副本</text>
+    <rect x="1628" y="596" width="105" height="45" rx="5" fill="#dcfce7" stroke="#22c55e"/><text x="1680" y="614" class="tiny center">Disk 2 / FG3</text><text x="1680" y="631" class="tiny center">HIGH 第三份</text>
+    <line x1="1456" y1="618" x2="1480" y2="618" stroke="#16a34a" marker-end="url(#arrow)"/><line x1="1595" y1="618" x2="1619" y2="618" stroke="#16a34a" marker-end="url(#arrow)"/>
+    <text x="1543" y="652" class="tiny center">条带：粗粒度 0；细粒度 32 / 64 / 128 / 256 KiB</text>
+  </g>
+
+  <rect x="920" y="669" width="836" height="22" rx="5" fill="#eef2ff"/>
+  <text x="1338" y="685" class="tiny center">LAB05 实测：5270 条目录记录 · 3 个描述 AU · 3 个 INODE AU · 两个大文件合计 61000 条 logical AU map</text>
+
+  <!-- Metadata roles -->
+  <text x="24" y="742" class="section-title">四类关键内容：职责、落盘信息与 dmdul 当前处理</text>
+
+  <g filter="url(#shadow)">
+    <rect x="24" y="758" width="420" height="176" rx="10" fill="#fef2f2" stroke="#ef4444" stroke-width="1.5"/>
+    <rect x="44" y="772" width="136" height="30" rx="7" fill="#dc2626"/><text x="112" y="793" class="panel-title center" font-size="15">DESC</text>
+    <text x="44" y="828" class="label">描述对象</text>
+    <text x="44" y="850" class="body">早期：一个 INODE / DATA 簇</text>
+    <text x="44" y="871" class="body">镜像：一个 INODE / 数据 AU 及副本</text>
+    <text x="44" y="898" class="label">关键字段</text>
+    <text x="44" y="919" class="small">file id · prev/next · sequence · copy array · health</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="462" y="758" width="420" height="176" rx="10" fill="#eff6ff" stroke="#3b82f6" stroke-width="1.5"/>
+    <rect x="482" y="772" width="136" height="30" rx="7" fill="#2563eb"/><text x="550" y="793" class="panel-title center" font-size="15">INODE</text>
+    <text x="482" y="828" class="label">描述对象</text>
+    <text x="482" y="850" class="body">每个 ASM 文件或目录对应一个 512 B 项</text>
+    <text x="482" y="871" class="body">镜像版一个 1 MiB INODE AU 可容纳 2048 项</text>
+    <text x="482" y="898" class="label">关键字段</text>
+    <text x="482" y="919" class="small">完整路径 · size · extents · copies · striping · type</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="900" y="758" width="420" height="176" rx="10" fill="#fffbeb" stroke="#f59e0b" stroke-width="1.5"/>
+    <rect x="920" y="772" width="136" height="30" rx="7" fill="#d97706"/><text x="988" y="793" class="panel-title center" font-size="15">DATA</text>
+    <text x="920" y="828" class="label">保存内容</text>
+    <text x="920" y="850" class="body">ASM 文件正文：DBF、CTL、日志或普通文件字节</text>
+    <text x="920" y="871" class="body">ASM 层只负责映射、副本选择和条带重组</text>
+    <text x="920" y="898" class="label">dmdul 输出</text>
+    <text x="920" y="919" class="small">逻辑 ReaderAt；DBF 页语义由上层解析器处理</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="1338" y="758" width="438" height="176" rx="10" fill="#faf5ff" stroke="#a855f7" stroke-width="1.5"/>
+    <rect x="1358" y="772" width="136" height="30" rx="7" fill="#7c3aed"/><text x="1426" y="793" class="panel-title center" font-size="15">DMASM REDO</text>
+    <text x="1358" y="828" class="label">保护范围</text>
+    <text x="1358" y="850" class="body">CREATE / EXTEND / TRUNCATE / DROP 的元数据修改</text>
+    <text x="1358" y="871" class="body">DESC 与 INODE 先写 REDO；普通 DATA 写不记录</text>
+    <text x="1358" y="898" class="label">当前边界</text>
+    <text x="1358" y="919" class="small" fill="#7e22ce">尚未解码和重放，只接受完整停写后的稳定快照</text>
+  </g>
+
+  <!-- dmdul path -->
+  <g filter="url(#shadow)">
+    <rect x="24" y="962" width="1752" height="220" rx="12" fill="#f8fafc" stroke="#64748b" stroke-width="1.5"/>
+    <rect x="564" y="948" width="672" height="34" rx="8" fill="#334155"/>
+    <text x="900" y="971" class="panel-title center">dmdul 完全离线定位链：裸成员盘 → ASM 逻辑文件 → 数据库页</text>
+  </g>
+
+  <g>
+    <rect x="46" y="1004" width="190" height="80" rx="8" fill="#eff6ff" stroke="#3b82f6"/>
+    <text x="141" y="1030" class="label center">① 成员盘发现</text>
+    <text x="141" y="1052" class="small center">layout · group/disk id</text>
+    <text x="141" y="1071" class="small center">AU size · generation</text>
+    <line x1="237" y1="1044" x2="276" y2="1044" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="287" y="1004" width="190" height="80" rx="8" fill="#f1f5f9" stroke="#64748b"/>
+    <text x="382" y="1030" class="label center">② 当前成员表</text>
+    <text x="382" y="1052" class="small center">NORMAL 成员筛选</text>
+    <text x="382" y="1071" class="small center">排除旧盘 / 缺盘</text>
+    <line x1="478" y1="1044" x2="517" y2="1044" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="528" y="1004" width="190" height="80" rx="8" fill="#fef2f2" stroke="#ef4444"/>
+    <text x="623" y="1030" class="label center">③ DESC 映射</text>
+    <text x="623" y="1052" class="small center">file / sequence</text>
+    <text x="623" y="1071" class="small center">prev/next / copies</text>
+    <line x1="719" y1="1044" x2="758" y2="1044" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="769" y="1004" width="190" height="80" rx="8" fill="#eff6ff" stroke="#3b82f6"/>
+    <text x="864" y="1030" class="label center">④ INODE 目录</text>
+    <text x="864" y="1052" class="small center">+GROUP/path</text>
+    <text x="864" y="1071" class="small center">size / extents / stripe</text>
+    <line x1="960" y1="1044" x2="999" y2="1044" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="1010" y="1004" width="190" height="80" rx="8" fill="#f0fdf4" stroke="#22c55e"/>
+    <text x="1105" y="1030" class="label center">⑤ 逻辑 ASM ReaderAt</text>
+    <text x="1105" y="1052" class="small center">副本重试 · 条带重组</text>
+    <text x="1105" y="1071" class="small center">随机读取文件偏移</text>
+    <line x1="1201" y1="1044" x2="1240" y2="1044" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="1251" y="1004" width="190" height="80" rx="8" fill="#eef2ff" stroke="#6366f1"/>
+    <text x="1346" y="1030" class="label center">⑥ DBF 身份校验</text>
+    <text x="1346" y="1052" class="small center">page 0 group/file/page</text>
+    <text x="1346" y="1071" class="small center">page size / page count</text>
+    <line x1="1442" y1="1044" x2="1481" y2="1044" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+    <rect x="1492" y="1004" width="250" height="80" rx="8" fill="#fff7ed" stroke="#f59e0b"/>
+    <text x="1617" y="1030" class="label center">⑦ 数据库恢复</text>
+    <text x="1617" y="1052" class="small center">bootstrap · page plan</text>
+    <text x="1617" y="1071" class="small center">DDL / SQL / FLDR / DMP</text>
+  </g>
+
+  <g>
+    <rect x="46" y="1104" width="537" height="54" rx="7" fill="#fefce8" stroke="#fde047"/>
+    <text x="64" y="1126" class="label">已验证</text>
+    <text x="64" y="1147" class="small">非镜像 XDESC 链；镜像 1/4/32 MiB AU、三副本、三描述 AU、多 INODE AU</text>
+
+    <rect x="600" y="1104" width="558" height="54" rx="7" fill="#fff7ed" stroke="#fdba74"/>
+    <text x="618" y="1126" class="label">下一批 P0</text>
+    <text x="618" y="1147" class="small">非镜像跨 64 GiB DESC；镜像单文件 &gt;65535 AU；DMASM REDO 差分与重放</text>
+
+    <rect x="1175" y="1104" width="567" height="54" rx="7" fill="#faf5ff" stroke="#d8b4fe"/>
+    <text x="1193" y="1126" class="label">安全边界</text>
+    <text x="1193" y="1147" class="small">只读完整冷快照；保留原盘；运行中读取与孤立 AU 扫描仅用于研究</text>
+  </g>
+
+  <!-- Legend and footer -->
+  <g>
+    <rect x="24" y="1200" width="1752" height="38" rx="7" fill="#eff6ff" stroke="#bfdbfe"/>
+    <rect x="44" y="1211" width="18" height="14" fill="#fee2e2" stroke="#ef4444"/><text x="70" y="1223" class="tiny">DESC</text>
+    <rect x="132" y="1211" width="18" height="14" fill="#dbeafe" stroke="#3b82f6"/><text x="158" y="1223" class="tiny">INODE</text>
+    <rect x="238" y="1211" width="18" height="14" fill="#fffbeb" stroke="#f59e0b"/><text x="264" y="1223" class="tiny">DATA</text>
+    <rect x="342" y="1211" width="18" height="14" fill="#faf5ff" stroke="#a855f7"/><text x="368" y="1223" class="tiny">REDO</text>
+    <rect x="446" y="1211" width="18" height="14" fill="#e2e8f0" stroke="#64748b"/><text x="472" y="1223" class="tiny">组级元数据 / 保留区</text>
+    <text x="1754" y="1223" class="tiny" text-anchor="end">官方概念 + dmdul 受控实验示意；偏移和布局可能随 DM8 build 变化，不代表公开固定格式</text>
+  </g>
+</svg>

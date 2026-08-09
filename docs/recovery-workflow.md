@@ -313,3 +313,8 @@ DM8 build 2025-01-17、8 KiB 页、UTF-8、4C/4GiB 虚拟机：
 | `T_CUSTOMER_MOCK` dmfldr | 1000 万行 / 1.76 GB | 92 秒 | —— |
 | `T_CUSTOMER_MOCK` DMP | 1000 万行 / 1.66 GB | 120 秒 | `dimp` 30 秒 |
 | DULTEST 全类型 9 张表 dmfldr | 53064 行 | 数秒 | 双向 MINUS 差异 0 |
+
+## 12. 一个完整实例
+
+[实战：用 dmdul 离线恢复 1000 万行表](practice-10m-two-channel.md)按本流程走了一遍完整的
+DMP 与 dmfldr 双通道往返，含每一步的真实命令、真实输出和输出该怎么读。

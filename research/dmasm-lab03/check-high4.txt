@@ -1,0 +1,4 @@
+check +HIGH4/high_stripe0_au4.dat
+check +HIGH4/high_stripe32_au4.dat
+check +HIGH4/data/MIRRORDB/TS_HIGH4_01.DBF
+exit

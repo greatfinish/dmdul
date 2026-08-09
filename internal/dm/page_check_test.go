@@ -1,6 +1,7 @@
 package dm
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -119,5 +120,75 @@ func TestNoCheckPageKeepsStructurallyValidFixedTrailer(t *testing.T) {
 	}
 	if got := pageSlotTrailerLenForPage(page); got != pageSlotTrailerLen {
 		t.Fatalf("PAGE_CHECK=0 fixed trailer was misdetected as hash trailer: %d", got)
+	}
+}
+
+func TestProtected32KDataPageUsesReservedTailAndRestoresSectorBytes(t *testing.T) {
+	const (
+		pageSize = 32768
+		rowCount = 57
+		rowLen   = 560
+		nSlot    = rowCount + 2
+	)
+	page := make([]byte, pageSize)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], nSlot)
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], rowCount)
+	rowOffsets := make([]int, 0, rowCount)
+	pos := dataRowAreaStart
+	for row := 0; row < rowCount; row++ {
+		rowOffsets = append(rowOffsets, pos)
+		putTestRow(page, pos, rowLen, byte('A'+row%26))
+		pos += rowLen
+	}
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], uint16(pos))
+	tailLen := pageTailReservedLen(pageSize)
+	slotStart := pageSize - tailLen - nSlot*2
+	binary.LittleEndian.PutUint16(page[slotStart:], 0x5A)
+	for row, offset := range rowOffsets {
+		binary.LittleEndian.PutUint16(page[slotStart+2+row*2:], uint16(offset))
+	}
+	binary.LittleEndian.PutUint16(page[slotStart+(nSlot-1)*2:], 0x52)
+	wantRows := append([]byte(nil), page[:pos]...)
+	tailStart := pageSize - tailLen
+	for sector := 1; sector < pageSize/systemSectorSize; sector++ {
+		target := sector*systemSectorSize - 4
+		copy(page[tailStart+(sector-1)*4:], page[target:target+4])
+		binary.LittleEndian.PutUint32(page[target:], uint32(0xA5000000+sector))
+	}
+
+	if got := pageSlotTrailerLenForPage(page); got != tailLen {
+		t.Fatalf("protected page trailer length=%d, want %d", got, tailLen)
+	}
+	if rows := locateRowsInDataPage(page, pageSize, rowCount); len(rows) != rowCount {
+		t.Fatalf("protected page rows=%d, want %d", len(rows), rowCount)
+	}
+	restoreUserDataPageProtectionBytes(page, pageSize)
+	if !bytes.Equal(page[:pos], wantRows) {
+		t.Fatal("sector-boundary row bytes were not restored from the protected tail")
+	}
+}
+
+func TestInferHashTrailerWhenShiftedSlotsStillScoreWell(t *testing.T) {
+	const (
+		pageSize = 32768
+		nSlot    = 100
+		freeEnd  = 0x6000
+	)
+	page := make([]byte, pageSize)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], nSlot)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], freeEnd)
+	trueStart := pageSize - dmPageCheckTailSize - sha256.Size - nSlot*2
+	for slot := 0; slot < nSlot; slot++ {
+		binary.LittleEndian.PutUint16(page[trueStart+slot*2:], uint16(0x100+slot*8))
+	}
+	// The fixed-tail candidate keeps 84 valid offsets and consumes 16 digest
+	// words. Its old score still exceeded 2*nSlot, which caused the premature
+	// PAGE_CHECK=0 decision seen on a 32 KiB SYSCOLUMNS page.
+	for pos := pageSize - dmPageCheckTailSize - sha256.Size; pos < pageSize-dmPageCheckTailSize; pos += 2 {
+		binary.LittleEndian.PutUint16(page[pos:], 0xF000)
+	}
+	if got := pageSlotTrailerLenForPage(page); got != sha256.Size+dmPageCheckTailSize {
+		t.Fatalf("inferred trailer length=%d, want %d", got, sha256.Size+dmPageCheckTailSize)
 	}
 }

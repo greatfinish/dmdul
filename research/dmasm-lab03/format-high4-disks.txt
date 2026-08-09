@@ -1,0 +1,6 @@
+#asm script file
+# Run once, before create-high4.txt.
+create asmdisk '/dev/dmasm/high4a' 'HIGH4A' 10000
+create asmdisk '/dev/dmasm/high4b' 'HIGH4B' 10000
+create asmdisk '/dev/dmasm/high4c' 'HIGH4C' 10000
+create asmdisk '/dev/dmasm/high4d' 'HIGH4D' 10000

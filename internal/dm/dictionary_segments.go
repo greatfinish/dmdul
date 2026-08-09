@@ -2,6 +2,7 @@ package dm
 
 import (
 	"encoding/binary"
+	"fmt"
 	"sort"
 )
 
@@ -9,9 +10,9 @@ type segmentPageStats struct {
 	files map[dataFileKey]map[uint32]bool
 }
 
-func inferDictionaryTableSegments(controlPath string, controlDULPath string, dataDir string, pageSize uint32, extentSize uint32, tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, tableList []DictionaryTable) map[uint32]tableSegment {
+func inferDictionaryTableSegments(controlPath string, controlDULPath string, dataDir string, sources []OfflineDataSource, pageSize uint32, extentSize uint32, tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, tableList []DictionaryTable) (map[uint32]tableSegment, error) {
 	if pageSize == 0 || len(tableList) == 0 {
-		return nil
+		return nil, nil
 	}
 	tableSet := make(map[uint32]bool, len(tableList))
 	for _, table := range tableList {
@@ -21,17 +22,33 @@ func inferDictionaryTableSegments(controlPath string, controlDULPath string, dat
 		tableSet[table.ID] = true
 	}
 	if len(tableSet) == 0 {
-		return nil
+		return nil, nil
 	}
+
+	var refs []dataFileRef
+	var err error
+	if len(sources) > 0 {
+		refs, err = dataFileRefsFromSources(sources)
+	} else {
+		refs, err = resolveDataFiles(controlPath, controlDULPath, dataDir)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(refs) == 0 {
+		return nil, nil
+	}
+
+	stats, completePlans := inferDictionarySegmentStatsFromPagePlans(refs, pageSize, extentSize, tables, indexObjects, indexes, partitionsByTable, tableList)
+	result := dictionarySegmentsFromStats(stats, pageSize, extentSize)
+	if len(sources) > 0 || len(completePlans) == len(tableSet) {
+		return result, nil
+	}
+
 	assistToTables := dictionaryAssistIDsByTable(tableSet, tables, indexObjects, indexes, partitionsByTable)
 	if len(assistToTables) == 0 {
-		return nil
+		return result, nil
 	}
-	refs, err := resolveDataFiles(controlPath, controlDULPath, dataDir)
-	if err != nil || len(refs) == 0 {
-		return nil
-	}
-	stats := make(map[uint32]*segmentPageStats)
 	for _, ref := range refs {
 		_, err := forEachDataFilePage(ref.path, pageSize, func(page []byte, pageNo uint32) error {
 			if !isProbableSegmentAssistPage(page, pageSize) {
@@ -43,6 +60,9 @@ func inferDictionaryTableSegments(controlPath string, controlDULPath string, dat
 				return nil
 			}
 			for _, tableID := range tableIDs {
+				if completePlans[tableID] {
+					continue
+				}
 				stat := stats[tableID]
 				if stat == nil {
 					stat = &segmentPageStats{files: make(map[dataFileKey]map[uint32]bool)}
@@ -65,10 +85,97 @@ func inferDictionaryTableSegments(controlPath string, controlDULPath string, dat
 			continue
 		}
 	}
+	for tableID, segment := range dictionarySegmentsFromStats(stats, pageSize, extentSize) {
+		result[tableID] = segment
+	}
+	return result, nil
+}
+
+func inferDictionarySegmentStatsFromPagePlans(refs []dataFileRef, pageSize uint32, extentSize uint32, tables map[uint32]dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, tableList []DictionaryTable) (map[uint32]*segmentPageStats, map[uint32]bool) {
+	cache := newDataFilePageCache(refs, pageSize)
+	stats := make(map[uint32]*segmentPageStats)
+	complete := make(map[uint32]bool)
+	for _, table := range tableList {
+		if table.Temporary {
+			continue
+		}
+		var roots []indexDef
+		if table.StorageID != 0 && table.RootFile >= 0 && table.RootPage > 0 && table.GroupID <= uint32(^uint16(0)) {
+			roots = append(roots, indexDef{ID: table.StorageID, GroupID: uint16(table.GroupID), RootFile: table.RootFile, RootPage: int32(table.RootPage), Flag: 1})
+		} else {
+			roots = append(roots, dictionaryPhysicalStorageRoots(table.ID, tables[table.ID], indexObjects, indexes)...)
+		}
+		for _, part := range partitionsByTable[table.ID] {
+			roots = append(roots, dictionaryPhysicalStorageRoots(part.PartTableID, tables[table.ID], indexObjects, indexes)...)
+		}
+		seenRoots := make(map[string]bool)
+		attemptedRoots := 0
+		failedRoot := false
+		for _, root := range roots {
+			key := fmt.Sprintf("%d/%d/%d/%d", root.ID, root.GroupID, root.RootFile, root.RootPage)
+			if root.ID == 0 || root.RootFile < 0 || root.RootPage <= 0 || seenRoots[key] {
+				continue
+			}
+			seenRoots[key] = true
+			attemptedRoots++
+			plan, _ := buildStoragePagePlanDetailed(root, cache)
+			if len(plan) == 0 {
+				failedRoot = true
+				continue
+			}
+			addDictionarySegmentPage(stats, table.ID, dataPageRef{key: dataFileKey{groupID: uint32(root.GroupID), fileID: root.RootFile}, pageNo: uint32(root.RootPage)}, extentSize)
+			for ref := range plan {
+				addDictionarySegmentPage(stats, table.ID, ref, extentSize)
+			}
+		}
+		if attemptedRoots > 0 && !failedRoot {
+			complete[table.ID] = true
+		}
+	}
+	return stats, complete
+}
+
+func dictionaryPhysicalStorageRoots(physicalTableID uint32, table dictionaryObject, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef) []indexDef {
+	var roots []indexDef
+	for indexID, obj := range indexObjects {
+		if uint32(obj.ParentID) != physicalTableID {
+			continue
+		}
+		idx, ok := indexes[indexID]
+		if !ok || idx.RootFile < 0 || idx.RootPage <= 0 {
+			continue
+		}
+		if idx.Flag&1 != 0 && idx.KeyNum == 0 || table.isIOTTable() && idx.Flag&0x4 != 0 {
+			roots = append(roots, idx)
+		}
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].ID < roots[j].ID })
+	return roots
+}
+
+func addDictionarySegmentPage(stats map[uint32]*segmentPageStats, tableID uint32, ref dataPageRef, extentSize uint32) {
+	stat := stats[tableID]
+	if stat == nil {
+		stat = &segmentPageStats{files: make(map[dataFileKey]map[uint32]bool)}
+		stats[tableID] = stat
+	}
+	pages := stat.files[ref.key]
+	if pages == nil {
+		pages = make(map[uint32]bool)
+		stat.files[ref.key] = pages
+	}
+	extentStart := ref.pageNo
+	if extentSize > 0 {
+		extentStart = (ref.pageNo / extentSize) * extentSize
+	}
+	pages[extentStart] = true
+}
+
+func dictionarySegmentsFromStats(stats map[uint32]*segmentPageStats, pageSize uint32, extentSize uint32) map[uint32]tableSegment {
 	result := make(map[uint32]tableSegment)
 	for tableID, stat := range stats {
-		if seg, ok := stat.bestSegment(pageSize, extentSize); ok {
-			result[tableID] = seg
+		if segment, ok := stat.bestSegment(pageSize, extentSize); ok {
+			result[tableID] = segment
 		}
 	}
 	return result

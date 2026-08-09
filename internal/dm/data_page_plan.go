@@ -28,23 +28,39 @@ type dataFilePageCache struct {
 	sizes    map[dataFileKey]int64
 	pages    map[dataPageRef][]byte
 	pageFIFO []dataPageRef
-	// restoreProtection enables sector-boundary protection-byte restoration.
-	// Only the SYSTEM.DBF dictionary bootstrap sets it; user data and LOB
-	// pages keep slot metadata in the page tail and must be read verbatim.
+	// restoreProtection selects the broader SYSTEM dictionary restoration path.
+	// User pages use the stricter structural detector before restoring protected
+	// sector-boundary bytes, so ordinary fixed-tail and HASH pages stay intact.
 	restoreProtection bool
 }
 
 type dataFilePageReader struct {
 	pageSize uint32
 	refs     map[dataFileKey]dataFileRef
-	files    map[dataFileKey]*os.File
+	files    map[dataFileKey]io.ReaderAt
+	closers  map[dataFileKey]io.Closer
+}
+
+type fixedSizeReaderAt struct {
+	io.ReaderAt
+	size int64
+}
+
+func (r fixedSizeReaderAt) Size() int64 { return r.size }
+
+func sizedReaderAt(reader io.ReaderAt, size int64) SizedReaderAt {
+	if source, ok := reader.(SizedReaderAt); ok {
+		return source
+	}
+	return fixedSizeReaderAt{ReaderAt: reader, size: size}
 }
 
 func newDataFilePageReader(files []dataFileRef, pageSize uint32) *dataFilePageReader {
 	reader := &dataFilePageReader{
 		pageSize: pageSize,
 		refs:     make(map[dataFileKey]dataFileRef, len(files)),
-		files:    make(map[dataFileKey]*os.File),
+		files:    make(map[dataFileKey]io.ReaderAt),
+		closers:  make(map[dataFileKey]io.Closer),
 	}
 	for _, file := range files {
 		reader.refs[file.key] = file
@@ -57,15 +73,20 @@ func (r *dataFilePageReader) readPage(ref dataPageRef) ([]byte, error) {
 		return nil, fmt.Errorf("invalid data page reader")
 	}
 	fileRef, ok := r.refs[ref.key]
-	if !ok || fileRef.path == "" {
+	if !ok || (fileRef.path == "" && fileRef.reader == nil) {
 		return nil, fmt.Errorf("data file group=%d file=%d is unavailable", ref.key.groupID, ref.key.fileID)
 	}
 	file := r.files[ref.key]
 	if file == nil {
-		var err error
-		file, err = os.Open(fileRef.path)
-		if err != nil {
-			return nil, fmt.Errorf("open data file %s: %w", fileRef.path, err)
+		if fileRef.reader != nil {
+			file = fileRef.reader
+		} else {
+			opened, err := os.Open(fileRef.path)
+			if err != nil {
+				return nil, fmt.Errorf("open data file %s: %w", fileRef.path, err)
+			}
+			file = opened
+			r.closers[ref.key] = opened
 		}
 		r.files[ref.key] = file
 	}
@@ -77,9 +98,7 @@ func (r *dataFilePageReader) readPage(ref dataPageRef) ([]byte, error) {
 	if n != len(page) {
 		return nil, fmt.Errorf("read data page %d from %s: short read %d/%d", ref.pageNo, fileRef.path, n, len(page))
 	}
-	// Protection-byte restoration is only proven for SYSTEM.DBF dictionary
-	// pages. User data pages keep slot metadata in the page tail, so restoring
-	// here would overwrite live row bytes (see docs/offline-system-scan.md).
+	restoreUserDataPageProtectionBytes(page, r.pageSize)
 	return page, nil
 }
 
@@ -88,12 +107,13 @@ func (r *dataFilePageReader) close() error {
 		return nil
 	}
 	var firstErr error
-	for key, file := range r.files {
+	for key, file := range r.closers {
 		if err := file.Close(); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("close data file group=%d file=%d: %w", key.groupID, key.fileID, err)
 		}
 	}
-	r.files = make(map[dataFileKey]*os.File)
+	r.files = make(map[dataFileKey]io.ReaderAt)
+	r.closers = make(map[dataFileKey]io.Closer)
 	return firstErr
 }
 
@@ -132,21 +152,32 @@ func (c *dataFilePageCache) readPage(ref dataPageRef) ([]byte, bool) {
 		return nil, false
 	}
 	file, ok := c.refs[ref.key]
-	if !ok || file.path == "" {
+	if !ok || (file.path == "" && file.reader == nil) {
 		return nil, false
 	}
-	f, err := os.Open(file.path)
-	if err != nil {
-		return nil, false
+	var reader io.ReaderAt
+	var closer io.Closer
+	if file.reader != nil {
+		reader = file.reader
+	} else {
+		opened, err := os.Open(file.path)
+		if err != nil {
+			return nil, false
+		}
+		reader, closer = opened, opened
 	}
-	defer f.Close()
+	if closer != nil {
+		defer closer.Close()
+	}
 	page := make([]byte, pageSize)
-	n, err := f.ReadAt(page, int64(ref.pageNo)*int64(pageSize))
+	n, err := reader.ReadAt(page, int64(ref.pageNo)*int64(pageSize))
 	if err != nil || n != pageSize {
 		return nil, false
 	}
 	if c.restoreProtection {
 		restorePageProtectionBytes(page, c.pageSize)
+	} else {
+		restoreUserDataPageProtectionBytes(page, c.pageSize)
 	}
 	if len(c.pages) >= maxCachedDataFilePages && len(c.pageFIFO) > 0 {
 		oldest := c.pageFIFO[0]
@@ -167,6 +198,16 @@ func (c *dataFilePageCache) pageCount(key dataFileKey) int {
 	return c.pageCountLocked(key)
 }
 
+func (c *dataFilePageCache) hasFile(key dataFileKey) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	file, ok := c.refs[key]
+	return ok && (file.path != "" || file.reader != nil)
+}
+
 func (c *dataFilePageCache) pageCountLocked(key dataFileKey) int {
 	if c == nil || c.pageSize == 0 {
 		return 0
@@ -174,14 +215,18 @@ func (c *dataFilePageCache) pageCountLocked(key dataFileKey) int {
 	size, ok := c.sizes[key]
 	if !ok {
 		file, ok := c.refs[key]
-		if !ok || file.path == "" {
+		if !ok || (file.path == "" && file.reader == nil) {
 			return 0
 		}
-		info, err := os.Stat(file.path)
-		if err != nil || info.IsDir() {
-			return 0
+		if file.reader != nil {
+			size = file.reader.Size()
+		} else {
+			info, err := os.Stat(file.path)
+			if err != nil || info.IsDir() {
+				return 0
+			}
+			size = info.Size()
 		}
-		size = info.Size()
 		c.sizes[key] = size
 	}
 	if size < int64(c.pageSize) {
@@ -217,6 +262,9 @@ func buildStoragePagePlanDetailed(storage indexDef, cache *dataFilePageCache) (m
 		},
 		pageNo: uint32(storage.RootPage),
 	}
+	if !cache.hasFile(root.key) {
+		return nil, fmt.Sprintf("data file group=%d file=%d is unavailable", root.key.groupID, root.key.fileID)
+	}
 	rootPage, ok := cache.readPage(root)
 	if !ok {
 		return nil, fmt.Sprintf("cannot read root page %d/%d", storage.RootFile, storage.RootPage)
@@ -247,11 +295,6 @@ func buildStoragePagePlanDetailed(storage indexDef, cache *dataFilePageCache) (m
 	default:
 		return nil, fmt.Sprintf("unsupported root page kind 0x%X", dataPageKind(rootPage))
 	}
-}
-
-func descendLeftmostLeaf(cache *dataFilePageCache, start dataPageRef, storageID uint32) (dataPageRef, bool) {
-	ref, _, ok := descendLeftmostLeafDetailed(cache, start, storageID)
-	return ref, ok
 }
 
 func descendLeftmostLeafDetailed(cache *dataFilePageCache, start dataPageRef, storageID uint32) (dataPageRef, string, bool) {
@@ -312,14 +355,6 @@ func btreeNextInternalPage(page []byte, groupID uint32) (dataPageRef, bool) {
 		},
 		pageNo: nextPageNo,
 	}, true
-}
-
-func walkLeafChain(cache *dataFilePageCache, start dataPageRef, storageID uint32) map[dataPageRef]bool {
-	planned, complete, _ := walkLeafChainDetailed(cache, start, storageID)
-	if !complete {
-		return nil
-	}
-	return planned
 }
 
 func walkLeafChainDetailed(cache *dataFilePageCache, start dataPageRef, storageID uint32) (map[dataPageRef]bool, bool, string) {

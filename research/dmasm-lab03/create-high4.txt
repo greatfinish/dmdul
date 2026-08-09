@@ -1,0 +1,7 @@
+create diskgroup 'HIGH4' high redundancy failgroup 'HIGH_FG1' asmdisk '/dev/dmasm/high4a' failgroup 'HIGH_FG2' asmdisk '/dev/dmasm/high4b' failgroup 'HIGH_FG3' asmdisk '/dev/dmasm/high4c' failgroup 'HIGH_FG4' asmdisk '/dev/dmasm/high4d' attribute au_size=4, redo_size=128
+create asmfile '+HIGH4/high_stripe0_au4.dat' size 256 high redundancy striping 0
+create asmfile '+HIGH4/high_stripe32_au4.dat' size 256 high redundancy striping 32
+lsdg
+lsdsk
+lsall
+exit

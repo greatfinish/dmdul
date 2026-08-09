@@ -70,23 +70,29 @@ slot 结构和目标表行格式。
 
 ## Slot 目录
 
-当前普通页的 slot 目录计算方式为：
+普通页至少存在三类已经观察到的尾部布局：
 
 ```text
-normal_crc_slot_start = page_size - 8 - n_slot * 2
+fixed_slot_start      = page_size - 8 - n_slot * 2
 hash_slot_start       = page_size - hash_size - 8 - n_slot * 2
-slot[i]    = little-endian u16 row_offset
+protected_slot_start  = page_size - protection_tail_size - n_slot * 2
+slot[i]                = little-endian u16 row_offset
+
+protection_tail_size  = (page_size / 4096 - 1) * 4 + 12
 ```
 
 重要边界：
 
 - slot 大小为 2 字节；
 - `PAGE_CHECK=2` 的 HASH 摘要位于 slot 之后，不能按固定 8 字节尾部读取；
+- 32 KiB 保护页的 `protection_tail_size=40`，其中包含七组边界原字节、4 字节保护字段和
+  8 字节固定尾；按固定 8 字节计算会让整个 slot 目录错移 32 字节；
 - slot 顺序与行的物理偏移顺序不一定一致；
 - `n_slot` 可能包含空闲、控制或无效条目，不能等同于活动行数；
 - `n_rec` 通常小于等于 `n_slot`；
 - DELETE 提交后，slot 可能暂时仍指向带删除标志的旧行；后续 DML 才重排 slot 并把旧行挂到 `0x2E`；
-- DMDUL 会检查 row offset、两字节行长/状态和 `free_end`，再把 slot 视为可解析行入口；
+- DMDUL 会综合 `n_slot/n_rec/free_end`、row offset、两字节行长/状态和可解码行数给候选
+  布局评分，再把胜出的 slot 视为可解析行入口；
 - “可解析物理行”不等于“事务可见活动行”。
 
 `oldpro` 样本：
@@ -216,7 +222,8 @@ clu_rowid=8            file=0 page=1040   off=106  trx_id=135899
 ## 页保护与页校验
 
 文章只讨论普通行和 slot 还不够。DM 页面可能在 4 KiB 扇区边界使用保护字节，并把原始字节保存
-到页尾。DMDUL 会在解析前执行受限的保护字节恢复。详细规则见
+到页尾。DMDUL 先证明页面采用保护尾布局，再恢复跨边界的活动行字节；固定尾和 HASH 尾页面
+不会进入这条路径。详细规则见
 [SYSTEM.DBF 离线扫描笔记](offline-system-scan.md#page-protection-bytes)。
 
 四个独立实例已确认 `PAGE_CHECK=0/1/2/3` 的字段和算法，详见
@@ -299,7 +306,8 @@ row；除 LOB/Long Row 外，不根据相邻页自动拼接普通行。
 
 - `00 2C`、`00 2E` 按 44/46 字节物理行长解析；
 - `80 69` 按“删除标志 + 105 字节长度”解析；
-- 4K、8K、16K、32K page size 下按页尾公式读取 slot；
+- 4K、8K、16K、32K page size 下按固定尾、HASH 尾或保护尾公式读取 slot；
+- 32K 保护页识别 40 字节保留尾，并恢复跨 4 KiB 边界的行字节；
 - `n_slot > n_rec` 且存在无效 slot 的 heap/row page；
 - 正常模式 slot-only、恢复模式包含删除 slot 和无 slot 物理空洞；
 - 显式 2-bit NULL metadata；

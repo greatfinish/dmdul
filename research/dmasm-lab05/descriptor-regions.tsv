@@ -1,0 +1,4 @@
+region	region_start_au	byte_offset	descriptor_capacity	covered_aus	active_file_descriptors	first_active	last_active
+0	0	0	32768	32768	32760	AU8:file2/seq0	AU32767:file5283/seq27428
+1	32768	34359738368	32768	32768	32767	AU32769:file5283/seq27429	AU65535:file5284/seq27195
+2	65536	68719476736	32768	14464	804	AU65537:file5284/seq27196	AU66340:file5284/seq27999

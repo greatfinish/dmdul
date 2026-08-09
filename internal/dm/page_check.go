@@ -86,10 +86,106 @@ func pageSlotTrailerLenForPage(page []byte) int {
 	if _, digestSize, ok := detectDMPageHash(page); ok {
 		return pageSlotTrailerLen + digestSize
 	}
+	if trailerLen, ok := inferDMPageProtectionTrailerLen(page); ok {
+		return trailerLen
+	}
 	if digestSize, ok := inferDMPageHashSizeFromSlots(page); ok {
 		return pageSlotTrailerLen + digestSize
 	}
 	return pageSlotTrailerLen
+}
+
+type dmPageSlotLayoutEvidence struct {
+	score   int
+	rows    int
+	invalid int
+	clean   bool
+}
+
+// inferDMPageProtectionTrailerLen distinguishes the sector-protection backup
+// area from ordinary row bytes. On protected 32 KiB pages, for example, the
+// slot directory ends 40 bytes before the page end: seven four-byte backups,
+// four protection bytes, and the fixed eight-byte trailer. Treating only the
+// final eight bytes as reserved shifts every slot by 32 bytes.
+func inferDMPageProtectionTrailerLen(page []byte) (int, bool) {
+	if len(page) < dataPageRecordCountOff+2 || len(page)%systemSectorSize != 0 {
+		return 0, false
+	}
+	kind := dataPageKind(page)
+	if kind != dmPageKindRowData && kind != dmPageKindRowOverflow && kind != dmPageKindBTreeRoot {
+		return 0, false
+	}
+	nSlot := binary.LittleEndian.Uint16(page[dataPageSlotCountOff:])
+	nRec := binary.LittleEndian.Uint16(page[dataPageRecordCountOff:])
+	freeEnd := binary.LittleEndian.Uint16(page[dataPageFreeEndOff:])
+	if nSlot == 0 || nSlot >= 2048 || nRec == 0 || nRec > nSlot || freeEnd < dataRowAreaStart || int(freeEnd) > len(page) {
+		return 0, false
+	}
+	protectedLen := pageTailReservedLen(uint32(len(page)))
+	if protectedLen <= pageSlotTrailerLen || protectedLen+int(nSlot)*2 > len(page)-dmMinSlotOffset {
+		return 0, false
+	}
+	base := evaluateDMPageSlotLayout(page, pageSlotTrailerLen, nSlot, nRec, freeEnd)
+	protected := evaluateDMPageSlotLayout(page, protectedLen, nSlot, nRec, freeEnd)
+	if !protected.clean || protected.rows == 0 {
+		return 0, false
+	}
+	baseDelta := absInt(base.rows - int(nRec))
+	protectedDelta := absInt(protected.rows - int(nRec))
+	if protected.rows == int(nRec) && (!base.clean || base.rows != int(nRec)) {
+		return protectedLen, true
+	}
+	if protectedDelta <= baseDelta && protected.score >= base.score+32 {
+		return protectedLen, true
+	}
+	return 0, false
+}
+
+func evaluateDMPageSlotLayout(page []byte, trailerLen int, nSlot, nRec, freeEnd uint16) dmPageSlotLayoutEvidence {
+	start := len(page) - trailerLen - int(nSlot)*2
+	if start < dmMinSlotOffset || start+int(nSlot)*2 > len(page) {
+		return dmPageSlotLayoutEvidence{score: -1 << 20, invalid: int(nSlot)}
+	}
+	evidence := dmPageSlotLayoutEvidence{}
+	seen := make(map[uint16]bool, nSlot)
+	for slot := uint16(0); slot < nSlot; slot++ {
+		off := binary.LittleEndian.Uint16(page[start+int(slot)*2:])
+		switch {
+		case off == 0x52 || off == 0x5A:
+			evidence.score += 12
+		case off == 0 || off == 0xFFFF:
+			evidence.score += 3
+		case off < dmMinSlotOffset || off >= freeEnd:
+			evidence.invalid++
+			evidence.score -= 24
+		case seen[off]:
+			evidence.invalid++
+			evidence.score -= 16
+		default:
+			seen[off] = true
+			if _, ok := decodeDataRowHeader(page, off, uint32(len(page)), freeEnd); ok {
+				evidence.rows++
+				evidence.score += 16
+			} else {
+				evidence.invalid++
+				evidence.score -= 12
+			}
+		}
+	}
+	delta := absInt(evidence.rows - int(nRec))
+	evidence.score -= delta * 8
+	if delta == 0 {
+		evidence.score += 32
+	}
+	evidence.clean = evidence.invalid == 0
+	return evidence
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func inferDMPageHashSizeFromSlots(page []byte) (int, bool) {
@@ -106,7 +202,7 @@ func inferDMPageHashSizeFromSlots(page []byte) (int, bool) {
 	// A structurally sound fixed-tail slot array is authoritative. This guard
 	// prevents PAGE_CHECK=0 pages from being mistaken for corrupt hash pages
 	// merely because bytes before the real slot array happen to resemble offsets.
-	if baseScore >= int(nSlot)*2 {
+	if validDMPageSlotLayout(page, baseStart, nSlot, freeEnd) {
 		return 0, false
 	}
 	bestSize, bestScore := 0, baseScore
@@ -120,6 +216,19 @@ func inferDMPageHashSizeFromSlots(page []byte) (int, bool) {
 		return 0, false
 	}
 	return bestSize, true
+}
+
+func validDMPageSlotLayout(page []byte, start int, nSlot uint16, freeEnd uint16) bool {
+	if start < 0x40 || start+int(nSlot)*2 > len(page) {
+		return false
+	}
+	for slot := uint16(0); slot < nSlot; slot++ {
+		off := binary.LittleEndian.Uint16(page[start+int(slot)*2:])
+		if off != 0 && off != 0xFFFF && off != 0x52 && off != 0x5A && (off < 0x40 || off >= freeEnd) {
+			return false
+		}
+	}
+	return true
 }
 
 func scoreDMPageSlotLayout(page []byte, start int, nSlot uint16, freeEnd uint16) int {

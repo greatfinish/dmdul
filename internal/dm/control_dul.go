@@ -3,6 +3,7 @@ package dm
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -16,6 +17,23 @@ type OfflineDataFile struct {
 	FileID     int16
 	Tablespace string
 	Path       string
+}
+
+// SizedReaderAt is a random-access logical file whose size is known without
+// relying on os.Stat. Raw DMASM files implement this interface.
+type SizedReaderAt interface {
+	io.ReaderAt
+	Size() int64
+}
+
+// OfflineDataSource binds a logical reader to the database group/file identity
+// used by page plans and storage roots.
+type OfflineDataSource struct {
+	GroupID    uint32
+	FileID     int16
+	Tablespace string
+	Path       string
+	Reader     SizedReaderAt
 }
 
 func ScanOfflineDataFiles(controlPath string, controlDULPath string, dataDir string) ([]OfflineDataFile, error) {
@@ -35,9 +53,7 @@ func ScanOfflineDataFiles(controlPath string, controlDULPath string, dataDir str
 		seen[ref.key] = true
 	}
 	tablespaceNames := loadTablespaceNames(controlPath, controlDULPath)
-	for _, file := range scanAllDBFFilesByPageHeader(dataDir, tablespaceNames, seen) {
-		files = append(files, file)
-	}
+	files = append(files, scanAllDBFFilesByPageHeader(dataDir, tablespaceNames, seen)...)
 	sort.Slice(files, func(i, j int) bool {
 		if files[i].GroupID == files[j].GroupID {
 			return files[i].FileID < files[j].FileID
@@ -62,8 +78,10 @@ func WriteControlDUL(path string, files []OfflineDataFile) error {
 			continue
 		}
 		dataPath := file.Path
-		if abs, err := filepath.Abs(dataPath); err == nil {
-			dataPath = abs
+		if !IsASMPath(dataPath) {
+			if abs, err := filepath.Abs(dataPath); err == nil {
+				dataPath = abs
+			}
 		}
 		tablespace := file.Tablespace
 		if tablespace == "" {

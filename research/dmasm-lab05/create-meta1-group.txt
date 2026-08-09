@@ -1,0 +1,2 @@
+create diskgroup 'META1' external redundancy failgroup 'META_FG1' asmdisk '/dev/dmasm/meta1' attribute au_size=1, redo_size=128
+exit

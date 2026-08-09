@@ -1,0 +1,21 @@
+# Execute one stage at a time and capture evidence between commands.
+
+# Adding E as a fifth, independent failure group produced no rebalance plan at
+# 8%, 16%, 25% or 31-33% utilization in the tested build.
+alter diskgroup 'RBLN4' add failgroup 'RBL_FG5' asmdisk '/dev/dmasm/rbln4e'
+alter diskgroup 'RBLN4' rebalance disk 'DMASMRBLN4E' power 8
+
+# The positive ADD/REBALANCE sample put E in the existing RBL_FG1. The planner
+# then moved copies whose partners remained in RBL_FG2/RBL_FG3/RBL_FG4.
+alter diskgroup 'RBLN4' add failgroup 'RBL_FG1' asmdisk '/dev/dmasm/rbln4e'
+alter diskgroup 'RBLN4' rebalance disk 'DMASMRBLN4E' power 8
+
+# Reconnect the unchanged original member while it is still OFFLINE.
+alter diskgroup 'RBLN4' online disk 'DMASMRBLN4D' with '/dev/dmasm/rbln4d' power 8
+
+# Replace an OFFLINE member with a disk that has never joined the group.
+alter diskgroup 'RBLN4' replace disk 'DMASMRBLN4D' with '/dev/dmasm/rbln4r' power 8
+
+# This installed build accepts DISK for a full drop. The current public manual
+# shows ASMDISK, so scripts must be checked against the target DM8 build.
+alter diskgroup 'RBLN4' fully drop disk 'DMASMRBLN4E'

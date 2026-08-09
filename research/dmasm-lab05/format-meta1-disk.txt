@@ -1,0 +1,2 @@
+create asmdisk '/dev/dmasm/meta1' 'META1A' 80000
+exit

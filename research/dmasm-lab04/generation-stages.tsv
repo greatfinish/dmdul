@@ -1,0 +1,9 @@
+stage	a	b	c	d	e	r	authoritative_generation	current_disk_ids	operation
+03-rebalance-same-fg	26	26	26	26	24	0	26	0,1,2,3,8	BALANCE 248/248
+04-offline-c	27	27	missing	27	24	0	27	0,1,2,3,8	C OFFLINE; 64 failed AUs
+05-timeout-recovered-c	30	30	26	30	24	0	30	0,1,3,8	RECOVER 930/930
+05-offline-d	31	31	26	missing	24	0	31	0,1,3,8	D OFFLINE; 64 failed AUs
+05-reconnect-running-d	31	31	26	31	24	0	31	0,1,3,8	RESYNC 7/71
+05-reconnected-d	32	32	26	32	24	0	32	0,1,3,8	RESYNC 71/71
+06-offline-d	33	33	26	missing	24	0	33	0,1,3,8	D OFFLINE; 64 failed AUs
+06-replaced-d-r	38	38	26	32-stale	24	38	38	0,1,8,9	REPLACE 932/932

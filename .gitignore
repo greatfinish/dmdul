@@ -11,6 +11,17 @@ coverage.out
 *.csv
 *.dmp
 *.ps1
+!research/dmasm-lab05/generate-file-batches.ps1
+
+# Local virtual-machine definitions and virtual disks may contain host paths,
+# UUIDs, MAC addresses, and very large sparse disk images.
+*.vmx
+*.vmdk
+*.vmsd
+*.vmsn
+*.vmem
+*.nvram
+*.lck/
 
 # Local database samples can be large and sensitive.
 *.DBF

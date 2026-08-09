@@ -28,7 +28,13 @@ func detectSystemInstanceNameFromFile(path string, pageSize uint32) (string, str
 		return "", "", false
 	}
 	defer stream.close()
+	return detectSystemInstanceNameFromStream(stream)
+}
 
+func detectSystemInstanceNameFromStream(stream *systemPageStream) (string, string, bool) {
+	if stream == nil || stream.pageSize == 0 {
+		return "", "", false
+	}
 	preferredCharset := "utf-8"
 	if charset, ok := stream.charset(); ok && charset.DecoderName != "" {
 		preferredCharset = charset.DecoderName
@@ -37,7 +43,7 @@ func detectSystemInstanceNameFromFile(path string, pageSize uint32) (string, str
 	columns := sysOpenHistoryColumns()
 	var best systemInstanceCandidate
 	found := false
-	err = stream.forEachPage(func(page []byte, pageNo uint32) {
+	err := stream.forEachPage(func(page []byte, pageNo uint32) {
 		if !isProbableDMDataPage(page, stream.pageSize) || len(page) < dataPageAssistIndexOff+4 {
 			return
 		}

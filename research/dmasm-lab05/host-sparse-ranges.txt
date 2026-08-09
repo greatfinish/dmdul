@@ -1,0 +1,26 @@
+LAB05 host sparse allocation evidence
+Captured: 2026-08-09
+
+VMDK flat extent:
+<snapshot-dir>\lab05_meta1_80g-flat.vmdk
+
+Logical size: 85899345920 bytes (80 GiB)
+
+fsutil sparse queryflag:
+This file is set as sparse
+
+fsutil sparse queryrange:
+Allocated range[1]: Offset 0x0000000000 Length 0x00400000
+Allocated range[2]: Offset 0x0000800000 Length 0x08100000
+Allocated range[3]: Offset 0x0084500000 Length 0x00100000
+Allocated range[4]: Offset 0x0104600000 Length 0x00100000
+Allocated range[5]: Offset 0x0800000000 Length 0x00100000
+Allocated range[6]: Offset 0x1000000000 Length 0x00100000
+Allocated range[7]: Offset 0x1387ff0000 Length 0x00010000
+
+Allocated total: 143720448 bytes (137.0625 MiB)
+Allocated/logical ratio: 0.167312622070313 percent
+
+At capture time DMASM contained 5200 one-AU files plus two files with
+33000 and 28000 logical AUs. The low host allocation is a property of the
+sparse VMDK and does not mean that the ASM allocation map was synthesized.

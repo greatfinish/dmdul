@@ -25,7 +25,12 @@ func TestRunHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "dmdul") {
 		t.Fatalf("help output should mention dmdul, got %q", stdout.String())
 	}
-	for _, want := range []string{"bootstrap;", "unload object <owner|all>;", "unload database;", "recover table"} {
+	for _, want := range []string{
+		"bootstrap;", "list datafile;", "list asmfile;", "list schema [owner];",
+		"describe <owner.table_name>;", "unload object <owner|all>;",
+		"unload schema <schema>[,<schema>...];", "unload database;",
+		"recover table", "check pages", "set asm_disk",
+	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("help output should contain %q, got %q", want, stdout.String())
 		}
@@ -64,10 +69,33 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"dmdul: Release " + version.Version, "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
+	for _, want := range []string{"dmdul: Release " + version.Version, "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list asmfile;", "set asm_disk", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("interactive output should contain %q, got %q", want, output)
 		}
+	}
+}
+
+func TestASMDisksPersistInInitDUL(t *testing.T) {
+	session := newInteractiveSession()
+	session.asmDisks = splitASMDisks("/dev/asmdisk/data01, /dev/asmdisk/data02,/dev/asmdisk/data01")
+	if len(session.asmDisks) != 2 {
+		t.Fatalf("asm disks = %#v", session.asmDisks)
+	}
+	content := session.initDULContent()
+	if !strings.Contains(content, "asm_disk=/dev/asmdisk/data01,/dev/asmdisk/data02") {
+		t.Fatalf("init.dul does not persist ASM disks:\n%s", content)
+	}
+	path := filepath.Join(t.TempDir(), "init.dul")
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loaded := newInteractiveSession()
+	if err := loaded.loadInitDUL(path); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(loaded.asmDisks, ","); got != "/dev/asmdisk/data01,/dev/asmdisk/data02" {
+		t.Fatalf("reloaded asm_disk = %q", got)
 	}
 }
 
@@ -998,6 +1026,21 @@ func TestBootstrapFileDiagnosticIgnoresRecreatedTempHeader(t *testing.T) {
 	}, 8192)
 	if !warning || !strings.Contains(line, "status=HEADER_MISMATCH") {
 		t.Fatalf("line=%q warning=%v", line, warning)
+	}
+}
+
+func TestMissingDictionaryDataFiles(t *testing.T) {
+	dictionary := &dm.DictionaryInfo{Tables: []dm.DictionaryTable{
+		{ID: 1001, Owner: "APP", Name: "T_MAIN", GroupID: 4, RootFile: 0, Tablespace: "MAIN"},
+		{ID: 1002, Owner: "APP", Name: "T_DATA", GroupID: 5, RootFile: 0, Tablespace: "TBS_DATA"},
+		{ID: 1003, Owner: "APP", Name: "T_DATA_2", GroupID: 5, RootFile: 0, Tablespace: "TBS_DATA"},
+		{ID: 1004, Owner: "APP", Name: "T_HIGH", GroupID: 9, RootFile: 1, Tablespace: "TBS_HIGH"},
+		{ID: 1006, Owner: "APP", Name: "T_MAIN_SECOND", GroupID: 4, RootFile: 1, Tablespace: "MAIN"},
+		{ID: 1005, Owner: "APP", Name: "T_TEMP", GroupID: 3, Temporary: true},
+	}}
+	missing := missingDictionaryDataFiles(dictionary, []dm.OfflineDataFile{{GroupID: 4, FileID: 0, Tablespace: "MAIN"}})
+	if got := formatMissingDictionaryDataFiles(missing); got != "4/1(MAIN,tables=1),5/0(TBS_DATA,tables=2),9/1(TBS_HIGH,tables=1)" {
+		t.Fatalf("unexpected missing group summary %q", got)
 	}
 }
 

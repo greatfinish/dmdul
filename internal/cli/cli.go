@@ -22,13 +22,20 @@ Run dmdul without arguments to enter the interactive shell.
 Main interactive commands:
   bootstrap;
   load dictionary;
+  list datafile;
+  list asmfile;
   list user;
+  list schema [owner];
   list table <owner>;
+  describe <owner.table_name>;
   unload table <owner.table_name>;
   unload object <owner|all>;
   unload user <owner>;
+  unload schema <schema>[,<schema>...];
   unload database;
   recover table <owner.table_name>;
+  check pages [<dbf-name>[,<dbf-name>...]] [control];
+  set asm_disk <raw member>[,<raw member>...];
   show parameter;
   help;
   exit;

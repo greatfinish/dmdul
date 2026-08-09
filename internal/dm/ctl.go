@@ -140,10 +140,7 @@ func controlPathEntries(stringsInFile []printableString) []ControlPath {
 		if !strings.ContainsAny(item.Value, `/\`) {
 			continue
 		}
-		result = append(result, ControlPath{
-			Offset: item.Offset,
-			Value:  item.Value,
-		})
+		result = append(result, ControlPath(item))
 	}
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Offset < result[j].Offset

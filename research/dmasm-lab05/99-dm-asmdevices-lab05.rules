@@ -1,0 +1,1 @@
+KERNEL=="sd*|vd*", SUBSYSTEM=="block", PROGRAM=="/usr/lib/udev/scsi_id -g -u -d /dev/$name", RESULT=="378fd9149fa9b659d152261cd2f107ad9", SYMLINK+="dmasm/meta1", OWNER="dmdba", GROUP="dinstall", MODE="0660"

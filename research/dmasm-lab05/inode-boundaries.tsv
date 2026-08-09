@@ -1,0 +1,4 @@
+logical_sequence	physical_au	records_used	first_file_id	first_path	last_file_id	last_path
+0	8	2048	0x85000001	+META1	0x8500080E	+META1/catalog/d059/f001980.dat
+1	2117	2048	0x8500080F	+META1/catalog/d060/f001981.dat	0x8500100E	+META1/catalog/d059/f004028.dat
+2	4166	1174	0x8500100F	+META1/catalog/d060/f004029.dat	0x850014A4	+META1/descriptor_span_au2.dat

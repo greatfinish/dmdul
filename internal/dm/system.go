@@ -199,17 +199,6 @@ func validPageSize(value uint32) bool {
 	}
 }
 
-func restoreSystemPages(data []byte, pageSize uint32) {
-	if pageSize == 0 {
-		return
-	}
-	totalPages := len(data) / int(pageSize)
-	for pageNo := 0; pageNo < totalPages; pageNo++ {
-		start := pageNo * int(pageSize)
-		restorePageProtectionBytes(data[start:start+int(pageSize)], pageSize)
-	}
-}
-
 func restorePageProtectionBytes(page []byte, pageSize uint32) {
 	if len(page) < int(pageSize) {
 		return
@@ -244,6 +233,33 @@ func restorePageProtectionBytes(page []byte, pageSize uint32) {
 		if shouldRestoreProtectionBytes(page[dst:dst+4], page[src:src+4]) {
 			copy(page[dst:dst+4], page[src:src+4])
 		}
+	}
+}
+
+// restoreUserDataPageProtectionBytes restores only pages whose slot layout
+// proves that a sector-protection backup area is present. This keeps ordinary
+// fixed-trailer pages byte-for-byte unchanged while repairing row bytes that
+// cross a 4 KiB sector boundary.
+func restoreUserDataPageProtectionBytes(page []byte, pageSize uint32) {
+	if len(page) < int(pageSize) || int(pageSize)%systemSectorSize != 0 {
+		return
+	}
+	if _, _, ok := detectDMPageHash(page); ok {
+		return
+	}
+	trailerLen, ok := inferDMPageProtectionTrailerLen(page)
+	if !ok || trailerLen != pageTailReservedLen(pageSize) {
+		return
+	}
+	sectors := int(pageSize) / systemSectorSize
+	tailStart := int(pageSize) - trailerLen
+	for sector := 1; sector < sectors; sector++ {
+		src := tailStart + (sector-1)*4
+		dst := sector*systemSectorSize - 4
+		if src+4 > int(pageSize) || dst+4 > int(pageSize) {
+			return
+		}
+		copy(page[dst:dst+4], page[src:src+4])
 	}
 }
 

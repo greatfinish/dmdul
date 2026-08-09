@@ -1,0 +1,7 @@
+create asmdisk '/dev/dmasm/rbln4a' 'RBLN4A' 6000
+create asmdisk '/dev/dmasm/rbln4b' 'RBLN4B' 6000
+create asmdisk '/dev/dmasm/rbln4c' 'RBLN4C' 6000
+create asmdisk '/dev/dmasm/rbln4d' 'RBLN4D' 6000
+create asmdisk '/dev/dmasm/rbln4e' 'RBLN4E' 6000
+create asmdisk '/dev/dmasm/rbln4r' 'RBLN4R' 6000
+exit

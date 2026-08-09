@@ -12,6 +12,147 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.7.0 - DMASM Raw Recovery
+
+### Added
+
+- 新增 DMASM 裸盘只读恢复路径。`set asm_disk <member>[,<member>...];` 配合
+  `set system +GROUP/.../SYSTEM.DBF;`，可直接从离线成员盘解析 ASM 逻辑文件，无需
+  DMASMSVR、DMASMAPI 或 `asmcmd cp`。
+- 新增 `list asmfile;`，显示 INODE 中恢复的 file id、逻辑大小、extent 数、INODE
+  物理地址和完整 ASM 路径；`list datafile;` 同时支持 ASM 中的 SYSTEM、ROLL、TEMP、
+  MAIN 和用户表空间 DBF。
+- 新增 DMASM 非镜像环境只读解析器：支持 32 MiB 保留区、1 MiB AU、4 MiB extent、
+  512 字节 INODE、32 字节 XDESC 链及跨成员盘地址；链成环、缺盘、错类型、未对齐和
+  越界地址均会拒绝。
+- 新增镜像版 DMASM `0x3001` 只读解析器：解码动态 AU 大小、磁盘/组头、512 字节
+  INODE、32 字节 AU 描述符、`prev/next` 链、双副本数组和 16 位 logical AU sequence。
+  已支持 1/4/32 MiB AU、EXTERNAL/NORMAL/HIGH、0/32 KiB 条带；NORMAL/HIGH 按显式
+  copy 数组定位副本，某个副本发生 I/O 错误时自动尝试下一个副本。
+- 新增镜像版 AU 1 group-header generation 和 AU 2 成员表解析。成员记录包含状态、
+  disk id、AU 数、failure group 与磁盘名；普通读取只使用当前 NORMAL 成员。
+- 新增多磁盘组联合读取。一次 `asm_disk` 可以同时配置多个组的成员，解析器按磁盘头
+  group id 分组，按 AU 1 组名路由 `+GROUP/...`，并从相同数据库目录发现跨组 DBF。
+- 镜像版 `.inode` 支持跨多个逻辑 AU 合并目录；AU=32 MiB 时仍按 1 MiB 分块扫描，
+  不会一次分配整个 AU。Windows 可直接读取 VMware `monolithicFlat` 的 `*-flat.vmdk`。
+- 镜像版大成员盘支持多个 descriptor 区域。解析器按 `AU_SIZE/32` 条描述符分段读取，
+  不再要求整块成员盘的 AU map 全部容纳在 AU 0。
+- `init.dul` 持久化 `asm_disk`；SQL、dmfldr、DMP 的表级、用户级和整库卸载均可复用
+  ASM reader 与现有 page plan。
+- bootstrap 会把字典引用的 `(group_id,file_id)` 与实际离线 DBF 集合核对。缺少成员或
+  数据文件时输出 `missing_files`，最终状态为 `SUCCESS_WITH_WARNINGS`；DDL 仍可恢复，
+  但受影响表不会再被误解为已确认的空表。
+- ASM 字典的 `tables.tsv` 通过 storage root 和 leaf chain 生成
+  `header_file/header_block/bytes/blocks/extents` 段摘要。该过程只读计划页，不扫描整个
+  ASM 逻辑数据文件；普通文件模式对未解析表继续保留流式段扫描补充。
+- 新增 [DMASM 裸盘离线读取与恢复](docs/dmasm-raw-recovery.md)，记录物理结构、公式、
+  操作流程、安全边界和 DMDSC 实机证据。
+- DMASM 文档按官方定义区分非镜像环境的 DESC/INODE/DATA 簇与镜像环境的描述/INODE/数据 AU，
+  补充 DMASM REDO、超 65535-AU 文件、早期 64 GiB DESC 边界和残留恢复缺口。
+- 新增 DMASM 磁盘逻辑结构与离线 ASM 文件定位图，提供可编辑 SVG 和 README/专题文档
+  使用的 PNG，展示两代存储模型、四类关键内容及完整裸盘定位链。
+
+### Fixed
+
+- 镜像版 AU 描述符从物理 AU 8 开始；AU 0 前 256 字节属于磁盘头。排除
+  `file_id=0xFFFE/0xFFFF` 分配器保留项，避免把管理字段误判为普通文件副本链。
+- 镜像版 INODE 逻辑大小按 `0x118` 起的 7 字节小端单位值乘 256 解析，修复大于
+  256 MiB 文件的错误尺寸；完整 file id 同时纳入 group id 和 AU 大小编码。
+- 镜像版 INODE logical AU 数改为读取 `+0x103..+0x104` 的未对齐小端 `uint16`。
+  旧逻辑按 `+0x100` 大端读取只在 0 至 255 AU 时碰巧正确，会把 33000 AU 截断为 232。
+- 镜像版 INODE 副本数改为读取 `+0x113` 单字节。`+0x110` 是独立分配属性，部分 DBF
+  会形成 `0x01000001` / `0x02000002`；此前按大端 u32 读取会把单/双副本误报为
+  16777217/33554434。
+- NORMAL 副本不再只依赖“扫描两个成员后按 file/sequence 聚合”的推断。解析器现在
+  显式消费描述符 copy 数组，并在成员存在时交叉校验副本、前后链和 logical sequence。
+- 修复 AU 描述符 sequence/健康位边界。logical sequence 位于 `+0x1B..+0x1C`，
+  `+0x1D` 是副本失败位图；此前把健康位并入 sequence 会产生 131073 等伪序号并中断
+  OFFLINE 副本读取。
+- 修复 REPLACE 后旧成员重新出现时被误聚合为第三副本的问题。解析器选择最高 generation
+  的组头副本，从 AU 2 成员表排除 OFFLINE/RECONNECT、DELETED、名称或 AU 数不匹配的盘；
+  同 generation 的多个成员表副本不一致时拒绝继续。
+- 修复 32 KiB 用户数据页的扇区保护尾解析。保护页尾部保留 40 字节，旧逻辑按固定
+  8 字节尾计算会把 slot 目录错移 32 字节，并让跨 4 KiB 边界的字段混入保护值。现在
+  根据 `n_slot/n_rec/free_end` 和可解码行头选择布局，再恢复七组边界原字节。
+
+- Standard Bootstrap 的 SYSTEM page cache 现在继承逻辑 reader。ASM 模式可以完整走
+  page 0 anchor、storage root 和 leaf chain，不再因把 `+DMDATA/...` 当成本地路径而
+  回退全 SYSTEM 流式扫描。
+- 收紧 PAGE_CHECK 哈希尾部的 slot 布局判定。32 KiB 页中，错误的固定尾部候选即使
+  “大部分 slot 合理”也不会提前胜出，修复 SYSCOLUMNS 页错移 32 字节后漏用户表的问题。
+- DMASM 中 `TEMP0.DBF` / `TEMP1.DBF` 正确映射为 group 3 的 file 0/1。
+- 单字节 `CHAR(1)` / `CHARACTER(1)` 按 DM 行格式的固定长度列解析，宽 `CHAR` 继续使用
+  变长编码。修复固定区后续 DATE/DATETIME 错位并导致整行跳过的问题。
+- SYSTEXTS 增加标准数据行解析：支持大端行长度、2-bit metadata、固定 `ID/SEQNO` 和
+  `0x02` / `0x04` 内联 CLOB 封装，同时保留旧偏移布局回退。修复 32 KiB 页环境中已找到
+  VIEW 对象但正文为空的问题。
+- 恢复出的 VIEW 源码即使省略模式名，也会按字典 owner 重写为 `owner.view_name`，避免
+  以 SYSDBA 执行对象脚本时把视图建进错误模式。
+- 同一离线输入出现重复 `(group_id,file_id)` 时不再静默采用先扫描到的文件，而是拒绝
+  bootstrap/unload 并同时报告两个逻辑路径，防止跨库或重复快照混入。
+- 镜像磁盘头按官方范围校验 AU 大小，只接受 1/2/4/8/16/32/64 MiB；磁盘几何使用
+  溢出检查。非镜像 INODE 重复项按物理地址稳定选择，相同路径元数据冲突时拒绝继续。
+- 清理流式扫描和 dmfldr 改造后不再可达的旧整文件扫描、CSV 渲染及兼容包装器；最新版
+  `staticcheck` 全量检查无告警。
+
+- 同步 `dmdul help` 的交互命令摘要，补齐 `list datafile`、`list asmfile`、`list schema`、
+  `describe`、`unload schema`、`check pages` 和 `set asm_disk`；参数错误提示明确 `csv` 是
+  `fldr` 的历史别名。
+
+### Security
+
+- 文档中的实机口令改为 `<PASSWORD>` 占位符；虚拟机配置、虚拟磁盘、内存与快照文件
+  加入 `.gitignore`，避免宿主路径、MAC、UUID 或大型实验盘进入仓库。
+
+### Verified
+
+- 在双节点 DMDSC 测试环境的 `/dev/asmdisk/dmdata01` 上直接恢复 256 MiB
+  `SYSTEM.DBF`（64 extents、32 KiB 页、8192 页），Standard Bootstrap 约 6 秒完成。
+- 直接从 `DMTEST_TS01.DBF` 用户级抽取 3 张表：planned pages 3、direct pages read 3、
+  fallback 0；`T_DEPARTMENT`、`T_EMPLOYEE`、`T_SALES_ORDER` 共 13 行零失败，DDL、中文、
+  `CHAR(1)`、DATE、DATETIME、DECIMAL、注释和数据与在线查询逐值一致。
+- 对象级抽取恢复 DMTEST 用户、3 张表、2 个序列、1 个完整视图、2 个索引、12 个约束和
+  3 条表注释；视图模式名与字典 owner 一致。
+- 镜像版六个确定性文件覆盖 EXT4/NORM4/EXT32、1/4/32 MiB AU、EXTERNAL/NORMAL
+  和 0/32 KiB 条带。文件头、条带边界、AU 边界、4-AU group 边界、中点和尾页的
+  4 KiB 标签、逻辑偏移及填充值全部与写入程序一致。
+- 完成双节点镜像 DMDSC 冷快照验证：停止 DB/ASM/CSS 和两台 VM 后复制 8 条 VMDK 链，
+  共 160 GiB；16 个源/目标文件 SHA-256 全部一致，8 条 VMDK 链检查通过。
+- Windows 直接从冷快照的 5 个 `*-flat.vmdk` 完成 Standard Bootstrap：发现 3 个磁盘组、
+  5 个成员、55 个 ASM 文件和 8 个 DBF，约 6 秒恢复 1097 个对象、2 个用户、5 张表、
+  33 列、1 个视图、3 个序列、2 个例程和 1 个触发器。
+- ASMTEST 对象 DDL 完整生成；4 张表导出 14 行，planned/direct pages 为 4/4，
+  fallback 0、失败 0。在线只读基线与冷副本生成的 9 个 DDL/数据文件 SHA-256 全部一致。
+- LAB03-HIGH 使用四成员、四 failure group、4 MiB AU 和 HIGH 三副本。两个 256 MiB
+  确定性文件覆盖 coarse/32 KiB 条带，131072 个 4 KiB 页全量校验通过，每个逻辑 AU
+  都恢复出三个物理副本；裸盘重建的真实 DBF 与官方复制文件逐字节一致。
+- HIGH 表空间的 `ASMTEST.T_HIGH_COPY` 在线裸盘卸载 20000 行、失败 0，351 个计划叶子页
+  全部直接读取、fallback 0；行号、条带标记和 512 字节 payload 逐行校验一致。
+- LAB03 完成 12 条 VMDK 链冷快照：24 个源/副本文件共 223338305041 字节，SHA-256
+  差异 0，12 条链均为 consistent。Windows 裸盘 Standard Bootstrap 发现 5 个磁盘组、
+  12 个成员、73 个 ASM 文件和 9 个 DBF；冷副本同样导出 20000 行、失败 0，数据 SQL
+  与在线结果 SHA-256 完全相同。验证后两节点均恢复 OPEN，在线统计保持不变。
+- LAB04 完成 NORMAL 组 ADD/REBALANCE/OFFLINE/RECONNECT/REPLACE 差分：短窗口重连为
+  `RESYNC 71/71`，替换为 `REPLACE 932/932`，旧 disk 3 变为 DELETED，备用盘获得
+  disk 9。14 个 512 MiB 确定性文件在每个静态阶段均保持双副本。
+- LAB04 在替换后同时输入 A/B/旧D/E/R，修复前稳定复现“每个 AU 三副本”；修复后只
+  采用当前 `0/1/8/9` 成员，7 GiB 数据逐 4 KiB 页校验通过。
+- LAB05 使用 80 GiB 稀疏盘、EXTERNAL、AU=1 MiB 创建 64 个子目录和 5200 个真实小文件，
+  恢复 5270 条最终目录记录。`.inode` 跨 physical AU 8/2117/4166，2048 与 4096 条记录
+  两个边界前后的文件均可打开。
+- LAB05 使用 33000-AU 和 28000-AU 两个大文件真实跨越 AU 32768、65536 的第二、第三
+  descriptor 区域；官方检查均为 `0 mirs err`，dmdul 在全部 DB/ASM/CSS 进程停止后
+  恢复 33000/28000 条 AU map，并成功读取跨区位置与文件尾。
+- LAB05 的 80 GiB VMware 稀疏成员盘在约 61 GiB DMASM 逻辑文件分配后，宿主实际分配
+  仅 137.0625 MiB；保留完整 allocated-range 证据，确认大规模元数据样本未占满宿主盘。
+- 使用 15 个离线镜像成员完成跨 EXT4/NORM4/EXT32/HIGH4/RBLN4 的端到端回归：
+  Standard Bootstrap 为 `SUCCESS`，7 张表均生成段摘要；`ASMTEST.T_EMPLOYEE` 6 行通过
+  1 个计划页直接读出，fallback 0、失败 0。
+- 仅提供 NORM4/EXT32 的不完整成员集时，bootstrap 准确报告缺少的 5/0、8/0、9/0，
+  状态为 `SUCCESS_WITH_WARNINGS`；尝试卸载缺失组中的表时明确报告目标数据文件不可用。
+
+------
+
 ## v0.6.6 - CLI Output Polish
 
 ### Fixed

@@ -59,6 +59,32 @@ DMDUL> set case_sensitive auto;
 DMDUL> set charset auto;
 ```
 
+### DMASM 裸盘模式
+
+数据库文件位于离线 DMASM 成员盘时，使用 ASM 逻辑路径代替普通 `SYSTEM.DBF` 路径：
+
+```text
+DMDUL> set asm_disk /dev/dmasm/ext4a,/dev/dmasm/ext4b,/dev/dmasm/norm4a,/dev/dmasm/norm4b,/dev/dmasm/ext32a;
+DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
+DMDUL> list asmfile;
+DMDUL> list datafile;
+DMDUL> bootstrap;
+```
+
+`list asmfile` 从 INODE 列出逻辑文件；`list datafile` 读取各 DBF 的第 0 页，恢复
+tablespace group、file id、页数和大小。后续 `unload` 仍使用同一套 storage root、
+page refs 和 leaf chain，不会复制中间 DBF。多成员盘和多磁盘组成员统一用逗号分隔，
+解析器按磁盘头 group id 分组；镜像组会结合 AU 1 generation 和 AU 2 当前成员表排除
+OFFLINE、RECONNECT、DELETED 及替换后的旧盘，再按 `+GROUP/...` 路由逻辑文件。
+
+VMware `monolithicFlat` 冷副本可以直接使用 `*-flat.vmdk`，不要传只包含描述信息的
+`.vmdk` descriptor 文件。当前已验证 DMASM 非镜像环境以及镜像环境的
+1/4/32 MiB AU、EXTERNAL/NORMAL/HIGH 和 0/32 KiB 条带组合。
+
+裸设备必须来自同一时点的一致性副本。对 DMDSC 共享盘，先停止所有节点的数据库和 ASM
+写入，或使用存储快照；不要把运行中读取成功当成一致性保证。当前支持范围和物理格式见
+[DMASM 裸盘离线读取与恢复](dmasm-raw-recovery.md)。
+
 查看当前参数：
 
 ```text

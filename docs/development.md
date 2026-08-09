@@ -6,7 +6,6 @@
 cmd/dmdul/          CLI 入口
 internal/cli/       命令行解析、参数默认值、控制台输出
 internal/dm/        达梦文件解析、DDL 导出、数据导出
-internal/storage/   文件检查和十六进制采样
 internal/version/   版本字符串
 docs/               用户文档和逆向研究笔记
 research/           临时实验脚本和研究材料
@@ -78,14 +77,26 @@ DMDUL> unload table SYSDBA.T;
 漏掉会让新版本看起来凭空"胖"了一大圈。`-s -w` 与 `-X` 注入不冲突，`dmdul version`
 照常打印完整版本串。
 
-三条命令要在**同一个 PowerShell 会话**里依次执行，后两条复用第一条定义的 `$ldflags`：
+先在干净工作区完成版本提交并创建 tag。以下命令从 `HEAD` 上的精确 tag 读取版本号，
+如果尚未打 tag 会立即停止，避免二进制、压缩包名称和源码版本不一致。三段命令要在
+**同一个 PowerShell 会话**里依次执行，后两段复用第一段定义的 `$ldflags`：
 
 ```powershell
-$ver = "v0.6.4"; $commit = git rev-parse --short HEAD; $ldflags = "-s -w -X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit -X dmdul/internal/version.BuildTime=$(Get-Date -Format yyyy-MM-dd)"; go build -ldflags $ldflags -o bin\dmdul.exe .\cmd\dmdul; if ($?) { .\bin\dmdul.exe version }
+$ver = (git describe --tags --exact-match HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or !$ver) { throw "HEAD must have an exact release tag" }
+$commit = git rev-parse --short HEAD
+$buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+$ldflags = "-s -w -X dmdul/internal/version.Version=$ver -X dmdul/internal/version.Commit=$commit -X dmdul/internal/version.BuildTime=$buildTime"
+go build -trimpath -ldflags $ldflags -o bin\dmdul.exe .\cmd\dmdul
+if ($?) { .\bin\dmdul.exe version }
 ```
 
 ```powershell
-$env:GOOS="linux"; $env:GOARCH="amd64"; go build -ldflags $ldflags -o bin\dmdul .\cmd\dmdul; Remove-Item Env:GOOS, Env:GOARCH
+$env:CGO_ENABLED="0"
+$env:GOOS="linux"
+$env:GOARCH="amd64"
+go build -trimpath -ldflags $ldflags -o bin\dmdul .\cmd\dmdul
+Remove-Item Env:CGO_ENABLED, Env:GOOS, Env:GOARCH
 ```
 
 ```powershell
@@ -122,7 +133,7 @@ go build -o bin\dmdul.exe .\cmd\dmdul
 - 临时脚本放在 `research/`。
 - 已验证并进入主流程的规则记录到 `docs/offline-system-scan.md`。
 - 系统字典字段含义记录到 `docs/system-dictionary-fields.md`。
-- 不要把生产库文件、导出 SQL、含密码的配置提交到仓库。
+- 不要把生产库文件、导出 SQL、含密码的配置、VM 配置或虚拟磁盘提交到仓库。
 
 ## 发布前检查清单
 

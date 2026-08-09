@@ -13,6 +13,25 @@ import (
 	"testing"
 )
 
+func TestDataFilePageReaderUsesLogicalReader(t *testing.T) {
+	const pageSize = 8192
+	raw := make([]byte, pageSize*2)
+	copy(raw[pageSize+0x100:], "DMASM-LOGICAL-PAGE")
+	source := fixedSizeReaderAt{ReaderAt: bytes.NewReader(raw), size: int64(len(raw))}
+	key := dataFileKey{groupID: 5, fileID: 0}
+	reader := newDataFilePageReader([]dataFileRef{{
+		key: key, path: "+DMDATA/DMDB/TBS01.DBF", reader: source,
+	}}, pageSize)
+	defer reader.close()
+	page, err := reader.readPage(dataPageRef{key: key, pageNo: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(page[0x100 : 0x100+len("DMASM-LOGICAL-PAGE")]); got != "DMASM-LOGICAL-PAGE" {
+		t.Fatalf("logical page payload = %q", got)
+	}
+}
+
 func TestSplitDataOutputRouterLimitsOpenFilesAndReopensForAppend(t *testing.T) {
 	dir := t.TempDir()
 	tables := make(map[uint32]dataTableInfo)
@@ -661,6 +680,25 @@ func TestBuildStoragePagePlanRejectsBrokenLeafChain(t *testing.T) {
 	}
 	if !strings.Contains(reason, "storage_id=9999") {
 		t.Fatalf("unexpected broken-chain reason %q", reason)
+	}
+}
+
+func TestBuildStoragePagePlanReportsMissingDataFileIdentity(t *testing.T) {
+	cache := newDataFilePageCache(nil, 8192)
+	plan, reason := buildStoragePagePlanDetailed(indexDef{ID: 1041, GroupID: 9, RootFile: 2, RootPage: 16}, cache)
+	if len(plan) != 0 || reason != "data file group=9 file=2 is unavailable" {
+		t.Fatalf("plan=%v reason=%q", plan, reason)
+	}
+}
+
+func TestDataFileRefsFromSourcesRejectsDuplicateIdentity(t *testing.T) {
+	raw := make([]byte, 8192)
+	sources := []OfflineDataSource{
+		{GroupID: 5, FileID: 0, Path: "+DATA/DB/A.DBF", Reader: bytes.NewReader(raw)},
+		{GroupID: 5, FileID: 0, Path: "+DATA/DB/B.DBF", Reader: bytes.NewReader(raw)},
+	}
+	if _, err := dataFileRefsFromSources(sources); err == nil || !strings.Contains(err.Error(), "duplicate data file identity group=5 file=0") {
+		t.Fatalf("unexpected duplicate identity error: %v", err)
 	}
 }
 
@@ -1472,6 +1510,44 @@ func TestRenderInsertForRowBeforeTrailingColumnsWereAdded(t *testing.T) {
 		t.Fatalf("unexpected data bounds: %d..%d", start, end)
 	}
 	want := `INSERT INTO JYC."t" ("id", "name", "birth") VALUES (10, NULL, NULL);`
+	if !strings.Contains(sql, want) {
+		t.Fatalf("unexpected insert sql: %s", sql)
+	}
+}
+
+func TestRenderInsertWithFixedCharOneBeforeDateTime(t *testing.T) {
+	row := []byte{
+		0x00, 0x3C, 0x00, 0x00,
+		0xE9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x0A, 0x00, 0x00, 0x00,
+		0xE7, 0x87, 0x79,
+		'Y',
+		0xEA, 0x07, 0x2C, 0x2D, 0x9C, 0x01, 0x00, 0x00,
+		0x86, 0xE5, 0xBC, 0xA0, 0xE4, 0xBC, 0x9F,
+		0x94, 'z', 'h', 'a', 'n', 'g', 'w', 'e', 'i', '@', 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm',
+		0x83, 0xC3, 0x02, 0x56,
+	}
+	info := dataTableInfo{
+		table: dictionaryObject{Owner: "DMTEST", Name: "T_EMPLOYEE"},
+		columns: []columnDef{
+			{ColID: 0, Name: "EMP_ID", DataType: "BIGINT", Length: 8, Nullable: "N"},
+			{ColID: 1, Name: "DEPT_ID", DataType: "INT", Length: 4, Nullable: "N"},
+			{ColID: 2, Name: "EMP_NAME", DataType: "VARCHAR", Length: 100, Nullable: "N"},
+			{ColID: 3, Name: "EMAIL", DataType: "VARCHAR", Length: 128, Nullable: "Y"},
+			{ColID: 4, Name: "SALARY", DataType: "DECIMAL", Length: 12, Scale: 2, Nullable: "N"},
+			{ColID: 5, Name: "HIRE_DATE", DataType: "DATE", Length: 3, Nullable: "N"},
+			{ColID: 6, Name: "ACTIVE_FLAG", DataType: "CHAR", Length: 1, Nullable: "N"},
+			{ColID: 7, Name: "CREATED_AT", DataType: "DATETIME", Length: 8, Scale: 6, Nullable: "N"},
+		},
+	}
+	sql, start, end, err := renderInsertForDataRow(info, row, textDecoder{preferred: "utf-8"})
+	if err != nil {
+		t.Fatalf("renderInsertForDataRow returned error: %v", err)
+	}
+	if start != 4 || end != len(row) {
+		t.Fatalf("unexpected data bounds: %d..%d", start, end)
+	}
+	want := "VALUES (1001, 10, '张伟', 'zhangwei@example.com', 18500, DATE '2023-03-15', 'Y', DATETIME '2026-08-05 13:33:51.000000');"
 	if !strings.Contains(sql, want) {
 		t.Fatalf("unexpected insert sql: %s", sql)
 	}

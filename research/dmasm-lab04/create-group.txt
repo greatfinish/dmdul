@@ -1,0 +1,18 @@
+create diskgroup 'RBLN4' normal redundancy failgroup 'RBL_FG1' asmdisk '/dev/dmasm/rbln4a' failgroup 'RBL_FG2' asmdisk '/dev/dmasm/rbln4b' failgroup 'RBL_FG3' asmdisk '/dev/dmasm/rbln4c' failgroup 'RBL_FG4' asmdisk '/dev/dmasm/rbln4d' attribute au_size=4, redo_size=128
+create asmfile '+RBLN4/rebalance_stripe0_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_stripe32_au4.dat' size 512 normal redundancy striping 32
+create asmfile '+RBLN4/rebalance_fill0_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill1_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill2_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill3_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill4_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill5_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill6_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill7_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill8_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill9_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill10_au4.dat' size 512 normal redundancy striping 0
+create asmfile '+RBLN4/rebalance_fill11_au4.dat' size 512 normal redundancy striping 0
+lsdg
+lsdsk
+exit

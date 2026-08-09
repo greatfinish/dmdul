@@ -1,0 +1,2 @@
+create asmfile '+META1/descriptor_span_au1.dat' size 33000 external redundancy striping 0
+exit

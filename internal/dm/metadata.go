@@ -1,8 +1,8 @@
 package dm
 
 import (
-	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -150,6 +150,45 @@ func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath stri
 	return meta
 }
 
+// InspectDatabaseMetadataFromReader reads database geometry and persistent
+// flags from a logical SYSTEM.DBF source such as a file inside offline DMASM.
+func InspectDatabaseMetadataFromReader(systemPath string, reader io.ReaderAt, size int64, charsetPreference string) DatabaseMetadata {
+	meta := DefaultDatabaseMetadata()
+	meta.SystemPath = systemPath
+	if preferred := strings.TrimSpace(charsetPreference); preferred != "" && !strings.EqualFold(preferred, "auto") {
+		meta.Charset = preferred
+		meta.CharsetSource = "decoder setting"
+		meta.HasCharsetFlag = false
+	}
+	header, err := readSystemHeaderFromReader(reader, size)
+	if err != nil {
+		return meta
+	}
+	if extentSize, source := detectSystemExtentSize(header); extentSize != 0 {
+		meta.ExtentSize, meta.ExtentSizeSource = extentSize, source
+	}
+	meta.PageSize, meta.PageSizeSource = detectSystemPageSize(header, size)
+	meta.PageCount, meta.PageCountSource = detectSystemPageCount(header, size, meta.PageSize)
+	if charset, ok := detectSystemCharsetFromReader(reader, meta.PageSize); ok {
+		meta.Charset = charset.DisplayName
+		meta.CharsetSource = charset.Source
+		meta.CharsetFlag = charset.Flag
+		meta.HasCharsetFlag = true
+	}
+	if caseSensitive, ok := detectSystemCaseSensitiveFromReader(reader, meta.PageSize); ok {
+		meta.CaseSensitive = caseSensitive
+		meta.CaseSensitiveSource = "SYSTEM.DBF page 4 + 0x2C"
+		meta.HasCaseSensitive = true
+	}
+	if stream, streamErr := openSystemPageStreamReader(systemPath, reader, size); streamErr == nil {
+		if instanceName, source, ok := detectSystemInstanceNameFromStream(stream); ok {
+			meta.InstanceName = instanceName
+			meta.InstanceNameSrc = source
+		}
+	}
+	return meta
+}
+
 func (m DatabaseMetadata) ExtentComparison() string {
 	return compareIniUint(m.IniExtentSize, uint64(m.ExtentSize), "not set")
 }
@@ -191,9 +230,18 @@ func detectSystemCaseSensitiveFromFile(path string, pageSize uint32) (bool, bool
 	}
 	defer file.Close()
 
+	return detectSystemCaseSensitiveFromReader(file, pageSize)
+}
+
+func detectSystemCaseSensitiveFromReader(reader interface {
+	ReadAt([]byte, int64) (int, error)
+}, pageSize uint32) (bool, bool) {
+	if reader == nil || pageSize == 0 {
+		return false, false
+	}
 	offset := int64(pageSize)*systemControlPage4No + systemCaseSensitiveFlagOffset
 	buf := []byte{0}
-	if _, err := file.ReadAt(buf, offset); err != nil {
+	if _, err := reader.ReadAt(buf, offset); err != nil {
 		return false, false
 	}
 	return systemCaseSensitiveFromFlag(buf[0])
@@ -231,9 +279,18 @@ func detectSystemCharsetFromFile(path string, pageSize uint32) (systemCharset, b
 	}
 	defer file.Close()
 
+	return detectSystemCharsetFromReader(file, pageSize)
+}
+
+func detectSystemCharsetFromReader(reader interface {
+	ReadAt([]byte, int64) (int, error)
+}, pageSize uint32) (systemCharset, bool) {
+	if reader == nil || pageSize == 0 {
+		return systemCharset{}, false
+	}
 	offset := int64(pageSize)*systemControlPage4No + systemUnicodeFlagOffset
 	buf := []byte{0}
-	if _, err := file.ReadAt(buf, offset); err != nil {
+	if _, err := reader.ReadAt(buf, offset); err != nil {
 		return systemCharset{}, false
 	}
 	return systemCharsetFromFlag(buf[0])
@@ -282,15 +339,28 @@ func readSystemHeader(path string) ([]byte, int64, error) {
 	if err != nil {
 		return nil, 0, err
 	}
+	header, err := readSystemHeaderFromReader(file, stat.Size())
+	return header, stat.Size(), err
+}
+
+func readSystemHeaderFromReader(reader interface {
+	ReadAt([]byte, int64) (int, error)
+}, size int64) ([]byte, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("SYSTEM.DBF reader is nil")
+	}
+	if size < systemHeaderReadSize {
+		return nil, fmt.Errorf("SYSTEM.DBF header is too small")
+	}
 	header := make([]byte, systemHeaderReadSize)
-	n, err := file.Read(header)
-	if err != nil {
-		return nil, 0, err
+	n, err := reader.ReadAt(header, 0)
+	if err != nil && err != io.EOF {
+		return nil, err
 	}
 	if n < systemHeaderReadSize {
-		return nil, 0, fmt.Errorf("SYSTEM.DBF header is too small")
+		return nil, fmt.Errorf("SYSTEM.DBF header is too small")
 	}
-	return header, stat.Size(), nil
+	return header, nil
 }
 
 func loadDMIni(path string) (map[string]string, bool) {
@@ -386,11 +456,4 @@ func defaultIfEmpty(value string, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func readHeaderU32(header []byte, off int) uint32 {
-	if len(header) < off+4 {
-		return 0
-	}
-	return binary.LittleEndian.Uint32(header[off:])
 }

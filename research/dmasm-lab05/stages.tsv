@@ -1,0 +1,9 @@
+stage	generated_files	catalog_entries	inode_aus	inode_physical_aus	free_aus	last_or_added_file_id	note
+00-empty-group	0	3	1	8	79861	0x85000007	root, .inode and aredo.log
+02-files-1900	1900	1968	1	8	77961	0x850007BE	below first INODE boundary
+03-files-2000	2000	2068	2	8,2117	77860	0x85000822	f001981 starts INODE sequence 1
+04-files-4000	4000	4068	2	8,2117	75860	0x85000FF2	below second INODE boundary
+05-files-4100	4100	4168	3	8,2117,4166	75759	0x85001056	f004029 starts INODE sequence 2
+06-files-5200	5200	5268	3	8,2117,4166	74659	0x850014A2	requested metadata-scale catalog
+07-descriptor-span	5200	5269	3	8,2117,4166	41659	0x850014A3	33000-AU file crosses descriptor region 1
+08-third-descriptor-region	5200	5270	3	8,2117,4166	13659	0x850014A4	28000-AU file crosses descriptor region 2

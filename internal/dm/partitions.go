@@ -120,49 +120,6 @@ func ScanPartitions(opts PartitionScanOptions) (*PartitionScanResult, error) {
 	return result, nil
 }
 
-func scanPartitionsByTable(data []byte, pageSize uint32, decoder textDecoder, tables map[uint32]dictionaryObject, matcher ownerMatcher) map[uint32][]PartitionInfo {
-	partitionsByTable := make(map[uint32][]PartitionInfo)
-	iterDictionarySlotRanges(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16, nextOff uint16) {
-		for rowOff := int(slotOff); rowOff+sysHPartTypeOffset+2 < int(nextOff); rowOff++ {
-			part, ok := parseDDLPartitionRowAt(page, rowOff, pageNo, slotNo, slotOff, pageSize, decoder)
-			if !ok {
-				continue
-			}
-			table, ok := tables[part.BaseTableID]
-			if !ok || !matcher.allowed(table.Owner) {
-				continue
-			}
-			partitionsByTable[part.BaseTableID] = append(partitionsByTable[part.BaseTableID], PartitionInfo{
-				BaseTableID:      part.BaseTableID,
-				PartTableID:      part.PartTableID,
-				Type:             part.Type,
-				Name:             part.Name,
-				HighValue:        append([]byte(nil), part.HighValue...),
-				HighValuePreview: partitionHighValuePreview(part.HighValue),
-				HighValueHex:     partitionHighValueHex(part.HighValue, 64),
-				PageNo:           part.Location.PageNo,
-				SlotNo:           part.Location.SlotNo,
-				SlotOffset:       part.Location.SlotOffset,
-				RowOffset:        part.Location.RowOffset,
-			})
-			rowLen := int(binary.LittleEndian.Uint16(page[rowOff+0x01:]))
-			if rowLen > 0 {
-				rowOff += rowLen - 1
-			}
-		}
-	})
-	for tableID, parts := range partitionsByTable {
-		sort.Slice(parts, func(i, j int) bool {
-			if parts[i].PartTableID == parts[j].PartTableID {
-				return parts[i].Name < parts[j].Name
-			}
-			return parts[i].PartTableID < parts[j].PartTableID
-		})
-		partitionsByTable[tableID] = parts
-	}
-	return partitionsByTable
-}
-
 func partitionedTablesFromMap(tables map[uint32]dictionaryObject, partitionsByTable map[uint32][]PartitionInfo) []PartitionedTable {
 	var result []PartitionedTable
 	for tableID, parts := range partitionsByTable {
@@ -200,23 +157,6 @@ func countPartitionKeys(keysByTable map[uint32][]uint16) int {
 		count += len(keys)
 	}
 	return count
-}
-
-func scanPartitionKeysByTable(data []byte, pageSize uint32, tables map[uint32]dictionaryObject, matcher ownerMatcher) map[uint32][]uint16 {
-	keysByTable := make(map[uint32][]uint16)
-	decoder := textDecoder{preferred: "utf-8"}
-	iterDictionaryRows(data, pageSize, func(page []byte, _ uint32, _ uint16, slotOff uint16) {
-		tableID, colIDs, ok := parseTabPartInfoRow(page, int(slotOff), pageSize, decoder)
-		if !ok {
-			return
-		}
-		table, ok := tables[tableID]
-		if !ok || !matcher.allowed(table.Owner) {
-			return
-		}
-		keysByTable[tableID] = colIDs
-	})
-	return keysByTable
 }
 
 func sysObjInfosColumns() []columnDef {
@@ -296,33 +236,6 @@ func decodeTabPartBinValue(binValue []byte) ([]uint16, bool) {
 		colIDs = append(colIDs, binary.LittleEndian.Uint16(binValue[off:]))
 	}
 	return colIDs, true
-}
-
-func scanDictionaryObjects(data []byte, pageSize uint32, decoder textDecoder) map[uint32]dictionaryObject {
-	objects := make(map[uint32]dictionaryObject)
-	iterDictionaryRows(data, pageSize, func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
-		obj, ok := parseDDLObjectRow(page, int(slotOff), pageNo, slotNo, slotOff, pageSize, decoder)
-		if !ok {
-			return
-		}
-		if _, exists := objects[obj.ID]; exists {
-			return
-		}
-		objects[obj.ID] = obj
-	})
-	return objects
-}
-
-func iterDictionarySlotRanges(data []byte, pageSize uint32, visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16, nextOff uint16)) {
-	if pageSize == 0 {
-		return
-	}
-	totalPages := len(data) / int(pageSize)
-	for pageNo := 0; pageNo < totalPages; pageNo++ {
-		start := pageNo * int(pageSize)
-		page := data[start : start+int(pageSize)]
-		iterDictionarySlotRangesInPage(page, pageSize, uint32(pageNo), visit)
-	}
 }
 
 func iterDictionarySlotRangesInPage(page []byte, pageSize uint32, pageNo uint32, visit func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16, nextOff uint16)) {

@@ -2,6 +2,7 @@ package dm
 
 import (
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -9,6 +10,9 @@ import (
 
 type DictionaryOptions struct {
 	SystemPath     string
+	SystemReader   io.ReaderAt
+	SystemSize     int64
+	DataSources    []OfflineDataSource
 	ControlPath    string
 	ControlDULPath string
 	OwnerFilter    string
@@ -228,7 +232,13 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	if opts.SystemPath == "" {
 		return nil, fmt.Errorf("bootstrap requires SYSTEM.DBF path")
 	}
-	stream, err := openSystemPageStream(opts.SystemPath)
+	var stream *systemPageStream
+	var err error
+	if opts.SystemReader != nil {
+		stream, err = openSystemPageStreamReader(opts.SystemPath, opts.SystemReader, opts.SystemSize)
+	} else {
+		stream, err = openSystemPageStream(opts.SystemPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -496,7 +506,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			}
 		}
 	}
-	segments := inferDictionaryTableSegments(opts.ControlPath, opts.ControlDULPath, filepath.Dir(opts.SystemPath), pageSize, extentSize, tables, indexObjects, indexes, partitionsByTable, tableList)
+	segments, err := inferDictionaryTableSegments(opts.ControlPath, opts.ControlDULPath, filepath.Dir(opts.SystemPath), opts.DataSources, pageSize, extentSize, tables, indexObjects, indexes, partitionsByTable, tableList)
+	if err != nil {
+		return nil, err
+	}
 	for i := range tableList {
 		if seg, ok := segments[tableList[i].ID]; ok {
 			tableList[i].HeaderFile = seg.fileID

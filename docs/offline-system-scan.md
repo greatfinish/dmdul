@@ -101,7 +101,7 @@ these observed page rules:
 | --- | --- |
 | Page size | From `SYSTEM.DBF + 0x84`, currently `8192` |
 | Slot count | `page + 0x24`, little-endian `u16` |
-| Slot array start | `page_size - 8 - slot_count * 2` |
+| Slot array start | 根据固定尾、HASH 尾或扇区保护尾选择，见下文 |
 | Slot entry | `u16` row offset inside page |
 
 The protection-byte tail length is modeled separately as:
@@ -157,11 +157,12 @@ Why this matters:
   restoring from the tail can corrupt valid strings, as seen in the 32 KiB
   `gxs` sample where `CURRENT_TIMESTAMP` crossed `0x4FFC..0x4FFF`; the in-place
   bytes were already `52 52 45 4E` (`RREN`) and had to be kept.
-- Dictionary slot-array positioning still uses the fixed 8-byte page trailer:
-  `slot_array_start = page_size - 8 - slot_count * 2`.
-- Ordinary user data pages can store row/slot offset information in the tail.
-  data unload therefore does not run this protection-byte restoration on
-  `MAIN.DBF`/user tablespace pages unless a page-specific rule is proven.
+- Slot-array positioning is not universally based on a fixed 8-byte trailer.
+  DMDUL compares fixed, HASH, and sector-protection candidates using
+  `n_slot/n_rec/free_end` plus decodable row headers.
+- Ordinary user data pages are restored only when this structural evidence
+  proves that the page tail contains sector-boundary backups. Fixed-tail and
+  HASH pages remain byte-for-byte unchanged.
 
 Verified examples from `oldpro/gr/SYSTEM.DBF`:
 
@@ -214,11 +215,12 @@ These offsets are from the current sample and are useful bootstrap anchors. We
 will temporarily treat them as fixed official locations, but they still need to
 be verified against more DM versions, page sizes, and initialized databases.
 
-Dictionary page slot arrays are located with a fixed 8-byte page trailer:
-`slot_array_start = page_size - 8 - slot_count * 2`. This is separate from the
-page-protection tail bytes used to restore bytes around 4 KiB sector boundaries.
-Using the protection-tail length for slot-array positioning shifts 8 KiB pages
-by 8 bytes and can miss active user objects such as `HR_TEST.EMP_INFO`.
+Dictionary pages do not use one universal tail size. A structurally valid fixed
+8-byte candidate remains authoritative, which prevents an 8 KiB page from being
+shifted by an inferred protection tail and missing objects such as
+`HR_TEST.EMP_INFO`. HASH pages move the slot directory by the digest size. A
+protected 32 KiB row page can instead reserve 40 bytes and therefore moves the
+slot directory by 32 bytes relative to the fixed candidate.
 
 | Requested object | Observed owner | Type | Subtype | Object id | Row offset | Page | Page offset | Slot | Name offset | Note |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -317,9 +319,10 @@ ordinary data-page layout:
 - page `+0x3A`: table assist index id
 - ordinary row-area samples commonly start at page `+0x62`; this is not a
   universal offset for every DM page kind
-- CRC/unchecked data-page slots use
-  `slot_array_start = page_size - 8 - slot_count * 2`; `PAGE_CHECK=2` HASH
-  pages use `page_size - digest_size - 8 - slot_count * 2`
+- fixed-tail data pages use `page_size - 8 - slot_count * 2`; `PAGE_CHECK=2`
+  HASH pages use `page_size - digest_size - 8 - slot_count * 2`; proven
+  sector-protected pages use
+  `page_size - ((page_size/4096-1)*4+12) - slot_count*2`
 - the first two row bytes are a big-endian length/status word:
   `physical_length = u16be(row[0:2]) & 0x7FFF` and
   `deleted = u16be(row[0:2]) & 0x8000 != 0`
@@ -364,8 +367,11 @@ from the variable-value stream and represented by the row trailer instead of an
 `0x80` marker; in that case the trailing nullable zero-valued fixed columns are
 treated as `NULL`.
 
-Chained rows, migrated rows, out-of-row LOB payloads, LOB segment/page traversal,
-and full null bitmap semantics are still pending research items.
+The current decoder uses explicit 2-bit column metadata, follows 21-byte
+out-of-row LOB locators through `0x20` pages, and follows Long Row locators
+through `0x22` pages. Ordinary unload remains slot-only. Complete offline
+transaction visibility and Undo PRE IMAGE reconstruction, plus independently
+verified migrated/chained-row pointer formats, remain research items.
 
 Verified heap/NOBRANCH example:
 

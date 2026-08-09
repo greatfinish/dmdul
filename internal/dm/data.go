@@ -42,6 +42,8 @@ var errUnsupportedRowMetadataState = errors.New("unsupported row metadata state"
 
 type DataExportOptions struct {
 	SystemPath          string
+	SystemReader        SizedReaderAt
+	DataSources         []OfflineDataSource
 	ControlPath         string
 	ControlDULPath      string
 	DataDir             string
@@ -141,6 +143,7 @@ type dataFileRef struct {
 	key            dataFileKey
 	path           string
 	tablespaceName string
+	reader         SizedReaderAt
 }
 
 type dataPageRef struct {
@@ -178,7 +181,7 @@ type dataTableInfo struct {
 	// can be visited through more than one storage (historical assists,
 	// orphan recovery, recover mode). Plain direct-read exports visit each
 	// physical row exactly once (page-level dedup), so the pointer stays nil
-	// there — tracking would burn O(columns) strings per row, gigabytes on
+	// there; tracking would burn O(columns) strings per row, gigabytes on
 	// 10M-row tables. The state is shared by all candidates of one table and
 	// self-disables once maxCoverageKeysPerTable is reached.
 	coverage *tableCoverageState
@@ -782,7 +785,13 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}
 
-	stream, err := openSystemPageStream(opts.SystemPath)
+	var stream *systemPageStream
+	var err error
+	if opts.SystemReader != nil {
+		stream, err = openSystemPageStreamReader(opts.SystemPath, opts.SystemReader, opts.SystemReader.Size())
+	} else {
+		stream, err = openSystemPageStream(opts.SystemPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -815,7 +824,11 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 		caseSensitive := opts.DMPCaseSensitive
 		if caseSensitive == nil {
-			caseSensitive = detectDMPCaseSensitive(opts.SystemPath, dataDir, pageSize)
+			if detected, ok := stream.caseSensitive(); ok {
+				caseSensitive = &detected
+			} else {
+				caseSensitive = detectDMPCaseSensitive(opts.SystemPath, dataDir, pageSize)
+			}
 		}
 		dmpConfig = dataDMPOutputConfig{
 			charset: dmpCharset, extentSize: stream.extentSize, pageSize: pageSize,
@@ -892,9 +905,17 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	applyDictionaryPartitionOverrides(opts.Dictionary, dictionaryTables, tables, ownerMatcher, partitionsByTable, nil)
 	dataStorageByTable := tableStorageByID(tables, indexObjects, indexes, nil)
 	secondaryIndexStorageIDs := secondaryIndexStorageIDSet(indexObjects, indexes)
-	dataFiles, err := resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
-	if err != nil {
-		return nil, err
+	var dataFiles []dataFileRef
+	if len(opts.DataSources) > 0 {
+		dataFiles, err = dataFileRefsFromSources(opts.DataSources)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		dataFiles, err = resolveDataFiles(opts.ControlPath, opts.ControlDULPath, dataDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	dataFilePages := newDataFilePageCache(dataFiles, pageSize)
 	lobReader := &dmLOBReader{cache: dataFilePages}
@@ -1018,6 +1039,12 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	}()
 
 	if len(assistByID) == 0 || len(dataFiles) == 0 {
+		if len(assistByID) == 0 {
+			result.FallbackReasons = append(result.FallbackReasons, "no table data storage mapping is available for the selected tables")
+		}
+		if len(dataFiles) == 0 {
+			result.FallbackReasons = append(result.FallbackReasons, "no user data files are available; selected tables were not scanned")
+		}
 		result.TableRowCounts = finalizeDataTableRowStats(rowStats)
 		result.TablesWithoutRows = len(result.TableRowCounts)
 		result.TableOutputs = output.tableOutputs()
@@ -1385,7 +1412,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 				break
 			}
 			touchedFiles[file.key] = true
-			pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
+			pagesScanned, scanErr := forEachDataFileRefPage(file, pageSize, func(page []byte, pageNo uint32) error {
 				assistIndexID := dataPageStorageID(page)
 				candidates := assistByID[assistIndexID]
 				if len(candidates) == 0 && !liveStorageIDs[assistIndexID] {
@@ -1463,7 +1490,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 					continue
 				}
 				touchedFiles[file.key] = true
-				pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
+				pagesScanned, scanErr := forEachDataFileRefPage(file, pageSize, func(page []byte, pageNo uint32) error {
 					ref := dataPageRef{key: file.key, pageNo: pageNo}
 					if processedDirectPages[ref] || !pageHeaderMatchesRef(page, ref) || !isProbableDMDataPage(page, pageSize) {
 						return nil
@@ -2458,6 +2485,38 @@ func resolveDataFiles(controlPath string, controlDULPath string, dataDir string)
 	return refs, nil
 }
 
+func dataFileRefsFromSources(sources []OfflineDataSource) ([]dataFileRef, error) {
+	refs := make([]dataFileRef, 0, len(sources))
+	seen := make(map[dataFileKey]string)
+	for _, source := range sources {
+		if source.Reader == nil || source.GroupID < 4 {
+			continue
+		}
+		key := dataFileKey{groupID: source.GroupID, fileID: source.FileID}
+		if previous, exists := seen[key]; exists {
+			return nil, fmt.Errorf("duplicate data file identity group=%d file=%d: %s and %s", key.groupID, key.fileID, previous, source.Path)
+		}
+		seen[key] = source.Path
+		refs = append(refs, dataFileRef{
+			key: key, path: source.Path, tablespaceName: source.Tablespace, reader: source.Reader,
+		})
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].key.groupID == refs[j].key.groupID {
+			return refs[i].key.fileID < refs[j].key.fileID
+		}
+		return refs[i].key.groupID < refs[j].key.groupID
+	})
+	return refs, nil
+}
+
+func forEachDataFileRefPage(file dataFileRef, pageSize uint32, visit func(page []byte, pageNo uint32) error) (int, error) {
+	if file.reader != nil {
+		return forEachSizedReaderPage(file.reader, pageSize, visit)
+	}
+	return forEachDataFilePage(file.path, pageSize, visit)
+}
+
 func scanDataFilesByPageHeader(dataDir string, tablespaceNames map[uint32]string, seenKeys map[dataFileKey]bool) []dataFileRef {
 	if dataDir == "" {
 		return nil
@@ -2534,22 +2593,6 @@ func resolveDataFilePath(controlValue string, dataDir string) (string, bool) {
 		return controlValue, true
 	}
 	return "", false
-}
-
-func filterNeededDataFiles(files []dataFileRef, needed map[dataFileKey]bool, scanAll bool) []dataFileRef {
-	if scanAll {
-		return files
-	}
-	if len(needed) == 0 {
-		return nil
-	}
-	var result []dataFileRef
-	for _, file := range files {
-		if needed[file.key] {
-			result = append(result, file)
-		}
-	}
-	return result
 }
 
 type locatedDataRow struct {
@@ -2759,40 +2802,6 @@ func renderInsertForDataRowWithMeta(info dataTableInfo, row []byte, decoder text
 	return b.String(), dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), nil
 }
 
-func renderCSVForDataRow(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, error) {
-	record, dataStart, dataEnd, _, err := renderCSVForDataRowWithMeta(info, row, decoder)
-	return record, dataStart, dataEnd, err
-}
-
-func renderCSVForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDecoder) ([]string, int, int, dataRowRenderMeta, error) {
-	values, dataStart, dataEnd, err := parseDataRowValues(row, info.columns, decoder, info.historicalRows, info.lobReader)
-	if err != nil {
-		return nil, 0, 0, dataRowRenderMeta{}, err
-	}
-	record := make([]string, 0, len(info.columns))
-	for _, col := range info.columns {
-		value, ok := values[col.ColID]
-		if !ok {
-			record = append(record, "")
-			continue
-		}
-		csvValue, err := csvValueForDataColumn(col, value.value)
-		if err != nil {
-			return nil, 0, 0, dataRowRenderMeta{}, err
-		}
-		record = append(record, csvValue)
-	}
-	return record, dataStart, dataEnd, dataRowRenderMetaForValues(info.columns, values, info.coverage.active()), nil
-}
-
-func csvHeaderForDataTable(info dataTableInfo) []string {
-	header := make([]string, 0, len(info.columns))
-	for _, col := range info.columns {
-		header = append(header, col.Name)
-	}
-	return header
-}
-
 func dataRowRenderMetaForValues(columns []columnDef, values map[uint16]dataValue, trackCoverage bool) dataRowRenderMeta {
 	ordered := append([]columnDef(nil), columns...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].ColID < ordered[j].ColID })
@@ -2980,10 +2989,10 @@ func dataStorageColumns(columns []columnDef) []columnDef {
 	var varCols []columnDef
 	for _, col := range ordered {
 		switch {
-		case isVariableDataType(col.DataType):
-			varCols = append(varCols, col)
 		case fixedDataSizeForColumn(col) > 0:
 			fixedCols = append(fixedCols, col)
+		case isVariableDataType(col.DataType):
+			varCols = append(varCols, col)
 		default:
 			varCols = append(varCols, col)
 		}
@@ -3153,10 +3162,10 @@ func parseDataRowValuesHeuristic(row []byte, columns []columnDef, decoder textDe
 	var varCols []columnDef
 	for _, col := range columns {
 		switch {
-		case isVariableDataType(col.DataType):
-			varCols = append(varCols, col)
 		case fixedDataSizeForColumn(col) > 0:
 			fixedCols = append(fixedCols, col)
+		case isVariableDataType(col.DataType):
+			varCols = append(varCols, col)
 		}
 	}
 
@@ -3329,10 +3338,6 @@ func isNumberDataType(dataType string) bool {
 	}
 }
 
-func fixedDataSize(dataType string) int {
-	return fixedDataSizeForType(normalizeDataType(dataType), 0)
-}
-
 func fixedDataSizeForColumn(col columnDef) int {
 	return fixedDataSizeForType(normalizeDataType(col.DataType), col.Length)
 }
@@ -3364,6 +3369,13 @@ func fixedDataSizeForType(dataType string, length uint32) int {
 		return 8
 	case "BINARY":
 		return int(length)
+	case "CHAR", "CHARACTER":
+		// DM stores single-byte CHAR(1) flags in the fixed section without a
+		// short-value length marker. Wider CHAR values remain variable-width.
+		if length == 1 {
+			return 1
+		}
+		return 0
 	case "DATE":
 		return 3
 	case "TIME":
@@ -3477,6 +3489,11 @@ func parseFixedDataValuePresent(col columnDef, row []byte, pos int) (any, int, e
 			return nil, pos, fmt.Errorf("BINARY out of range")
 		}
 		return dmBinary(append([]byte(nil), row[pos:pos+size]...)), pos + size, nil
+	case "CHAR", "CHARACTER":
+		if size != 1 || pos+size > len(row) {
+			return nil, pos, fmt.Errorf("%s out of range", dataType)
+		}
+		return string(row[pos : pos+size]), pos + size, nil
 	case "DATE":
 		if pos+3 > len(row) {
 			return nil, pos, fmt.Errorf("DATE out of range")
@@ -3546,6 +3563,8 @@ func parseFixedDataValuePresent(col columnDef, row []byte, pos int) (any, int, e
 
 func isFixedNullSentinel(dataType string, raw []byte) bool {
 	switch dataType {
+	case "CHAR", "CHARACTER":
+		return len(raw) == 1 && (raw[0] == 0 || raw[0] == 0xFF)
 	case "DATE":
 		if len(raw) != 3 {
 			return false
@@ -4620,25 +4639,6 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 		}
 		return sqlLiteral(text), nil
 	}
-}
-
-func csvValueForDataColumn(col columnDef, value any) (string, error) {
-	var err error
-	value, err = materializeDataValue(value)
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", col.Name, err)
-	}
-	if value == nil {
-		return "", nil
-	}
-	if raw, ok := value.(dmBinary); ok {
-		return strings.ToUpper(hex.EncodeToString(raw)), nil
-	}
-	text := fmt.Sprintf("%v", value)
-	if strings.ContainsRune(text, '\uFFFD') || containsBadControl(text) {
-		return "", fmt.Errorf("invalid text value for %s", col.Name)
-	}
-	return text, nil
 }
 
 func materializeDataValue(value any) (any, error) {

@@ -1,0 +1,10 @@
+stage	disk_id	disk_name	member_state	view_status	result
+03-rebalance-same-fg	2	DMASMRBLN4C	1	NORMAL	current member
+04-offline-c	2	DMASMRBLN4C	5	OFFLINE	excluded from ordinary raw reads
+05-timeout-recovered-c	2	DMASMRBLN4C	0	absent	DELETED after RECOVER 930/930
+05-offline-d	3	DMASMRBLN4D	5	OFFLINE	excluded from ordinary raw reads
+05-reconnect-running-d	3	DMASMRBLN4D	5	RECONNECT	excluded until RESYNC completes
+05-reconnected-d	3	DMASMRBLN4D	1	NORMAL	current member after RESYNC 71/71
+06-offline-d	3	DMASMRBLN4D	5	OFFLINE	excluded from ordinary raw reads
+06-replaced-d-r	3	DMASMRBLN4D	0	absent	DELETED old member
+06-replaced-d-r	9	DMASMRBLN4R	1	NORMAL	current replacement member

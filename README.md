@@ -10,15 +10,17 @@
 
 `dmdul` 是一个使用 Go 编写的达梦数据库离线恢复与数据抽取工具。当数据库无法正常
 `open`、无法通过常规恢复流程启动时，它可以直接读取 `SYSTEM.DBF`、可选的 `dm.ctl`
-以及用户表空间 DBF 文件：
+以及用户表空间 DBF 文件，也可以从离线 DMASM 裸盘恢复这些逻辑文件：
 
 - 恢复数据库对象定义和用户字典；
 - 导出表结构及相关对象 DDL；
 - 导出 SQL、dmfldr 分隔文本或达梦 DMP 数据；
 - 尝试恢复 `DELETE` / `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
+- 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
+  AU 映射、副本数组和条带数据。
 
-**v0.6.6 主题：CLI Output Polish**
+**v0.7.0 主题：DMASM Raw Recovery**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -36,7 +38,7 @@
 当前能力链已经覆盖从离线物理文件到官方导入工具的完整路径：
 
 ```text
-SYSTEM.DBF / dm.ctl / user tablespace DBF
+SYSTEM.DBF / dm.ctl / user tablespace DBF / offline DMASM raw disks
                     |
                     v
             Standard Bootstrap
@@ -67,9 +69,18 @@ SYSTEM.DBF / dm.ctl / user tablespace DBF
 
 ## 存储结构理解
 
-下面两张示意图概括了 `dmdul` 当前采用的结构理解：第一张从 `SYSTEM.DBF` 文件布局出发，
-说明初始化参数、page 0 锚点以及 `SYSOBJECTS`、`SYSINDEXES` 与其他系统字典之间的关系；
-第二张进一步展示典型 8K 数据页中页头、行记录、空闲区、槽目录和页尾的组织方式。
+下面三张示意图概括了 `dmdul` 当前采用的结构理解：第一张从 DMASM 成员盘进入 ASM
+文件；第二张从 `SYSTEM.DBF` 的 page 0 锚点进入系统字典；第三张展示典型 8K 数据页中
+页头、行记录、空闲区、槽目录和页尾的组织方式。
+
+### DMASM 磁盘与 ASM 文件定位
+
+![DMASM 磁盘逻辑结构与离线 ASM 文件定位示意图](docs/images/dmasm-file-layout-map.png)
+
+该图明确区分 DMASM 非镜像环境的 DESC/INODE/DATA 簇与镜像环境的描述/INODE/数据 AU，
+并展示 descriptor map、INODE 目录、副本、条带和 dmdul 逻辑 `ReaderAt` 的衔接关系。
+
+深入阅读：[DMASM 裸盘离线读取与恢复](docs/dmasm-raw-recovery.md)
 
 ### SYSTEM.DBF 与系统字典
 
@@ -94,12 +105,20 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
 深入阅读：[DM8 普通行页格式研究](docs/row-page-format.md) ·
 [DM8 PAGE_CHECK 页校验实验](docs/page-check.md)
 
-> **说明：** 两图基于 `dmdul` 的研究与实验观察，用于帮助理解解析思路，并非达梦官方格式文档。
+> **说明：** 三图基于官方概念及 `dmdul` 的研究实验，用于帮助理解解析思路，并非达梦公开的固定磁盘格式规范。
 > 不同数据库版本、表类型和存储策略的实际字段布局可能存在差异，请以目标文件的解析结果为准。
 
 ------
 
 ## 核心能力
+
+- **DMASM 裸盘读取**：只读解析 DMASM 非镜像与镜像环境的实测布局，把
+  `+GROUP/path/file.DBF` 映射为随机读逻辑文件。镜像版支持 1/4/32 MiB AU、
+  EXTERNAL/NORMAL/HIGH、0/32 KiB 条带、副本重试和跨磁盘组 DBF 发现；AU 1
+  generation 与 AU 2 当前成员表可排除 OFFLINE、RECONNECT、DELETED 和替换后的旧盘。
+  Standard Bootstrap 与用户表 page plan 直接在裸盘 reader 上运行，不依赖 DMASMSVR，
+  也不生成中间 DBF 副本。详见
+  [DMASM 裸盘离线读取与恢复](docs/dmasm-raw-recovery.md)。
 
 - **Standard Bootstrap**：通过 page 0 anchor 进入 `SYSOBJECTS` / `SYSINDEXES`，再按
   storage root、内部页引用和 leaf chain 下载核心系统字典；第二阶段包含
@@ -108,7 +127,8 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
   结合可选 `dm.ctl` 恢复数据库名，并持久化到 `init.dul`。
 - **磁盘字典**：生成可人工审查和修改的 `dmdul_dict/*.tsv`，再次启动后可直接
   `load dictionary;`，无需重复 bootstrap；用户与模式归属、分区键、分区顺序和完整
-  二进制边界值也会落盘。
+  二进制边界值也会落盘。表段的 `header_file/header_block/blocks/extents` 优先从
+  storage page plan 推导；ASM 模式只读取计划页，不会为生成段摘要而扫描整个逻辑 DBF。
   重新 bootstrap 时先在临时目录生成并校验完整字典，再切换目录；旧字典自动备份。
 - **对象恢复**：恢复用户、角色授权、表、字段、索引、约束、注释、分区、视图、
   序列、过程、函数、包、包体、触发器、同义词和对象授权；序列会沿 `INFO5` 的
@@ -122,8 +142,9 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
   `min(CPU 核数, 8)`，无需配置）；LOB/Long Row 页链由锚点行 worker 整链跟随，
   单一 writer 按批次序合并，输出与单线程逐字节一致。实测 1000 万行表 4 核
   87 秒、8 核 49 秒完成 SQL 卸载。
-- **用户页原样读取**：页保护边界恢复仅用于 `SYSTEM.DBF` 标准字典下载；普通数据页、LOB
-  和 Long Row 页保持磁盘原始字节，避免接近满页时把页尾 slot 项误写到活动行边界。
+- **用户页保护识别**：普通数据页先根据 `n_slot/n_rec/free_end`、slot 候选和可解码行头
+  识别固定尾、HASH 尾或扇区保护尾。只有结构证据成立时，才从页尾恢复 4 KiB 边界原字节；
+  其他页面保持原样，避免把 slot 或 HASH 内容误写进活动行。
 - **普通行页解析**：按页尾 slot 目录定位活动行，正确解释大端行长状态字、`0x8000`
   DELETE 标志、`n_rec` 滞后和 free-row 链；普通 `unload` 不再扫描无 slot 物理空洞。
 - **事务控制尾识别**：解码常见的 19 字节 `clu_rowid + rollback address + trx_id`
@@ -176,6 +197,7 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
 | Standard Bootstrap | ✅ 支持 | 两阶段字典下载、结构化日志、流式 fallback |
+| DMASM 裸盘读取 | 🧪 实验支持 | 非镜像 + 镜像环境；AU map、NORMAL/HIGH 副本、细条带、多磁盘组、generation/成员状态筛选、缺失 group/file 预警 |
 | `SYSTEM.DBF` 参数解析 | ✅ 支持 | extent/page/page count、字符集、大小写标志、open history 实例名 |
 | `dm.ctl` / DBF 文件识别 | ✅ 支持 | 数据库名、表空间、group/file、数据文件路径 |
 | `control.dul` / `init.dul` | ✅ 支持 | 文件清单、参数值、参数来源及重新加载 |
@@ -460,6 +482,13 @@ DMDUL> bootstrap;
 `list datafile;` 会列出已识别的所有数据文件及其表空间、组/文件号、页数和可读状态，
 恢复前建议先跑一次，确认文件都被正确识别、没有读不到的。
 
+### 3. 使用离线 DMASM 成员盘
+
+如果数据库文件仍位于 DMASM 中，不需要先执行 `asmcmd cp`。`dmdul` 可以把同一冷快照
+中的裸设备或 VMware `*-flat.vmdk` 组合成只读 ASM 文件源，再按
+`+GROUP/path/SYSTEM.DBF` 启动字典恢复。完整的文件准备、安全停写、预检、抽取和验证步骤
+见下文 [DMASM 裸盘离线抽取](#dmasm-裸盘离线抽取)。
+
 `bootstrap;` 会生成：
 
 ```text
@@ -504,6 +533,209 @@ output/DATABASE_data.sql
 对象元数据、空表定义及全部可恢复数据的 `output/DATABASE.dmp`。
 `case_sensitive=auto` 会从 `SYSTEM.DBF` 第 4 页偏移 `0x2C` 读取建库标志并写入
 DMP 文件头，避免 `dimp` 因大小写敏感参数不一致等待人工确认。
+
+------
+
+## DMASM 裸盘离线抽取
+
+`dmdul` 可以直接读取离线 DMASM 成员盘中的文件目录、AU 映射、副本和条带数据，向上层
+提供只读的 ASM 逻辑文件。后续 `bootstrap`、page plan、数据页和 LOB 解析流程与普通 DBF
+一致，整个过程不要求启动 DMASMSVR，也不生成中间 DBF。
+
+> 当前能力来自特定 DM8 build 的物理差分实验，不是达梦公开的固定磁盘格式规范。
+> 正式恢复必须基于一致冷快照，并在隔离数据库中验证全部导出结果。
+
+### 1. 确定需要哪些成员盘
+
+需要复制的范围取决于恢复目标。`SYSTEM.DBF` 所在磁盘组负责提供数据字典；用户数据还可能
+位于 MAIN、用户表空间、分区表空间或独立 LOB 表空间所在的其他磁盘组。
+
+| 恢复目标 | 必需的 DMASM 成员副本 |
+| --- | --- |
+| `bootstrap`、查看字典、只导出 DDL | `SYSTEM.DBF` 所在磁盘组的同一时点成员副本 |
+| 抽取指定表 | SYSTEM 磁盘组，以及该表、各分区和 LOB 数据所在磁盘组的成员副本 |
+| 抽取用户或模式 | SYSTEM 磁盘组，以及选中用户或模式引用的全部数据文件所在磁盘组 |
+| `unload database` 整库抽取 | 所有包含数据库 DBF 的磁盘组及其成员副本 |
+
+还需要提前记录 `SYSTEM.DBF` 的 ASM 逻辑路径，例如：
+
+```text
++NORM4/data/MIRRORDB/SYSTEM.DBF
+```
+
+数据库仍可查询时，可以在停库前记录全部数据文件路径：
+
+```sql
+SELECT GROUP_ID, ID, PATH
+FROM V$DATAFILE
+ORDER BY GROUP_ID, ID;
+```
+
+`dm.ctl`、`dm.ini`、`dmdcr.ini` 和 CSS 配置可以保留作为身份与部署信息证据，但不是
+直接读取 DMASM 中 DBF 的必需输入。独立且不承载目标 DBF 的 DCR、VOTE 和联机日志磁盘组，
+也不需要加入普通 DDL/表数据抽取的输入盘集。
+
+冗余级别会影响最低盘集：
+
+- EXTERNAL 没有 ASM 数据副本，承载目标 AU 的成员盘不可缺少。
+- NORMAL/HIGH 可以在某个副本不可读时尝试其他副本，但仍建议提供同一时点的全部活动成员。
+- 不要混用不同快照时间、不同重平衡阶段或不同 generation 的成员盘。
+
+### 2. 制作一致冷快照
+
+DMASM 元数据事务当前不会由 `dmdul` 重放。快照采集期间如果仍有节点写盘，INODE、描述项
+和数据 AU 可能来自不同时间点，因此必须先停止整个共享存储写入链路：
+
+1. 在控制节点停止数据库服务组，再停止 ASM 服务组。
+2. 停止所有节点上的数据库、ASM 和 CSS 服务。
+3. 确认没有 `dmserver`、`dmasmsvr`、`dmasmsvrm` 或 `dmcss` 进程持有成员盘。
+4. 同时复制全部相关成员盘，或创建存储层同一时点的一致性快照。
+5. 记录副本大小和 SHA256；后续只读取副本，原始成员盘保持只读和隔离。
+
+只停止一个 DMDSC 节点不构成一致快照。另一个节点仍可能修改 ASM 元数据、数据库页、
+联机日志和 DCRV。
+
+### 3. 准备可读取的成员副本
+
+Linux 可以直接传入只读裸设备、快照块设备或成员盘镜像。裸设备通常需要 `root` 或等价的
+只读权限：
+
+```text
+/dev/dmasm/ext4a
+/dev/dmasm/ext4b
+/dev/dmasm/norm4a
+/dev/dmasm/norm4b
+```
+
+VMware `monolithicFlat` 环境应传入描述文件 `FLAT` 行引用的实际数据区：
+
+```text
+D:\snapshot\ext4a-flat.vmdk
+D:\snapshot\ext4b-flat.vmdk
+D:\snapshot\norm4a-flat.vmdk
+D:\snapshot\norm4b-flat.vmdk
+```
+
+不要把只有少量元数据的 `.vmdk` descriptor 文件作为 `asm_disk`。如果虚拟磁盘包含快照
+增量链，应先生成同一时间点的完整 flat 冷副本，不能直接混合基础盘和不同时间点的 delta。
+
+### 4. 配置 ASM 数据源
+
+Linux 裸设备示例：
+
+```text
+sudo ./dmdul
+
+DMDUL> set asm_disk /dev/dmasm/ext4a,/dev/dmasm/ext4b,/dev/dmasm/norm4a,/dev/dmasm/norm4b,/dev/dmasm/ext32a;
+DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
+DMDUL> set output_dir /recovery/output;
+DMDUL> show parameter;
+```
+
+Windows flat VMDK 示例：
+
+```text
+DMDUL> set asm_disk D:\snapshot\ext4a-flat.vmdk,D:\snapshot\ext4b-flat.vmdk,D:\snapshot\norm4a-flat.vmdk,D:\snapshot\norm4b-flat.vmdk,D:\snapshot\ext32a-flat.vmdk;
+DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
+DMDUL> set output_dir D:\snapshot\output;
+DMDUL> show parameter;
+```
+
+`asm_disk` 接受多个磁盘组的成员，统一用逗号分隔。它与 ASM 逻辑 `system` 路径会写入
+当前生效的 `init.dul`，后续会话可以通过 `load parameter;` 重新加载。
+
+### 5. 在 bootstrap 前检查 ASM 文件集
+
+先列出 ASM INODE 目录和识别到的数据库文件：
+
+```text
+DMDUL> list asmfile;
+DMDUL> list datafile;
+```
+
+`list asmfile` 用于确认逻辑目录中存在预期的 SYSTEM、MAIN、ROLL、TEMP 和用户 DBF。
+`list datafile` 会读取每个 DBF 的第 0 页，显示表空间、group/file、页数、大小和状态。
+
+继续执行前应确认：
+
+- 预期磁盘组和成员盘均已识别；
+- `SYSTEM.DBF` 的逻辑路径正确；
+- 目标表空间文件没有遗漏；
+- DBF 的 group/file 身份没有异常重复；
+- 页数非零，状态为 `OK`，没有 `UNREADABLE` 或 `SIZE?`。
+
+任何关键数据文件缺失时，应先补齐成员副本，再执行 `bootstrap`。冗余副本可读不代表当前
+盘集一定完整，尤其要核对跨磁盘组的分区和 LOB 文件。
+
+### 6. 下载并检查数据库字典
+
+文件集通过预检后，再从 ASM 逻辑 `SYSTEM.DBF` 执行 Standard Bootstrap：
+
+```text
+DMDUL> bootstrap;
+DMDUL> show parameter;
+DMDUL> list user;
+DMDUL> list schema;
+DMDUL> list table ASMTEST;
+DMDUL> describe ASMTEST.T_DEPARTMENT;
+```
+
+重点核对数据库名、实例名、页大小、簇大小、字符集和大小写敏感标志，并检查目标表的
+tablespace、storage_id、root、header_file/header_block、分区及字段定义。`bootstrap`
+会生成或更新 `control.dul`、`init.dul`、`dul.log` 和 `dmdul_dict/`。
+
+### 7. 按恢复级别导出
+
+只导出对象定义，不读取表数据：
+
+```text
+DMDUL> unload object ASMTEST;
+DMDUL> unload object all;
+```
+
+以可读 SQL 导出指定表：
+
+```text
+DMDUL> set data_format sql;
+DMDUL> unload table ASMTEST.T_DEPARTMENT;
+```
+
+为 `dmfldr` 生成分隔文本和控制文件：
+
+```text
+DMDUL> set data_format fldr;
+DMDUL> unload user ASMTEST;
+```
+
+以达梦 DMP 导出表、用户、模式或整库：
+
+```text
+DMDUL> set data_format dmp;
+DMDUL> unload table ASMTEST.T_DEPARTMENT;
+DMDUL> unload user ASMTEST;
+DMDUL> unload schema ASMTEST;
+DMDUL> unload database;
+```
+
+大表、分区表和行外 LOB 优先使用 DMP；需要人工检查行值时使用 SQL；需要通过 `dmfldr`
+高速装载时使用 FLDR。输出默认进入启动目录下的 `output/`，也可以通过 `output_dir` 指定。
+
+### 8. 验证抽取结果
+
+先检查 `dul.log` 和命令汇总中的以下信息：
+
+- 每张表的 `rows unloaded` 与 `rows failed`；
+- `planned pages` 与 `direct pages read`；
+- `fallback pages scanned` 与 `fallback reason`；
+- ASM 成员与 DBF 身份校验、缺失 `group/file` 预警；
+- 发生降级时的 `fallback reason`，其中会保留不可读根页或缺失数据文件的物理坐标。
+
+随后在隔离 DM8 实例中导入结果。DMP 使用 `dimp`，FLDR 使用生成的 `.ctl` 和 `dmfldr`，
+SQL 通过 `disql` 或能够处理相应语句长度的客户端执行。至少核对对象数量、表行数、关键列、
+分区行分布、LOB 长度及哈希。验证完成前，不要把导出文件直接导入生产库。
+
+当前已验证范围、物理结构、实验依据和未覆盖边界见
+[DMASM 裸盘离线读取与恢复](docs/dmasm-raw-recovery.md)。
 
 ------
 
@@ -699,6 +931,7 @@ load parameter;
 load dictionary;
 show parameter;
 list datafile;
+list asmfile;
 list user;
 list table <owner>;
 describe <owner.table_name>;
@@ -712,6 +945,7 @@ set data_format sql;
 set data_format fldr;
 set data_format dmp;
 set case_sensitive auto;
+set asm_disk <raw member>[,<raw member>...];
 exit;
 ```
 
@@ -782,11 +1016,13 @@ go build -ldflags "-s -w" -o bin/dmdul ./cmd/dmdul
 - [使用示例](https://github.com/greatfinish/dmdul/blob/main/docs/usage.md)
 - [配置和参数说明](https://github.com/greatfinish/dmdul/blob/main/docs/config.md)
 - [离线恢复流程](https://github.com/greatfinish/dmdul/blob/main/docs/recovery-workflow.md)
+- [实战：1000 万行表 DMP 与 dmfldr 双通道往返](https://github.com/greatfinish/dmdul/blob/main/docs/practice-10m-two-channel.md)
 - [本地开发、测试、构建说明](https://github.com/greatfinish/dmdul/blob/main/docs/development.md)
 - [版本变更记录](https://github.com/greatfinish/dmdul/blob/main/CHANGELOG.md)
 - [DM8 DMP 格式研究记录](https://github.com/greatfinish/dmdul/blob/main/docs/dmp-format-research.md)
 - [DM8 普通行页格式与解析边界](https://github.com/greatfinish/dmdul/blob/main/docs/row-page-format.md)
 - [DM8 PAGE_CHECK 页校验实验](https://github.com/greatfinish/dmdul/blob/main/docs/page-check.md)
+- [DMASM 裸盘离线读取与恢复](https://github.com/greatfinish/dmdul/blob/main/docs/dmasm-raw-recovery.md)
 - [逆向扫描笔记](https://github.com/greatfinish/dmdul/blob/main/docs/offline-system-scan.md)
 - [系统字典字段笔记](https://github.com/greatfinish/dmdul/blob/main/docs/system-dictionary-fields.md)
 
@@ -872,7 +1108,8 @@ dul.log
 | v0.6.4 | 分隔文本改为 dmfldr 可装载格式（`.txt` + 每表 `.ctl`）、`describe`、逐表 rows unloaded、多模式 `CREATE SCHEMA` |
 | v0.6.5 | 修复大于 8 MiB 的表 DMP 无法被 `dimp` 导入、离线恢复标准流程文档 |
 | v0.6.6 | `list` 系列表头大写+下划线、列宽自适应、dmfldr 装载命令引号订正 |
-| v0.6.x | 迁移行/链式行、损坏页诊断、更多 DM8 版本兼容验证 |
+| v0.7.0 | DMASM 非镜像/镜像裸盘读取、多磁盘组、NORMAL/HIGH 副本与条带、ASM page plan 直读 |
+| v0.7.x | DMASM REDO、超 65535-AU 单文件、更多 DM8 build 与条带组合验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
 ------
