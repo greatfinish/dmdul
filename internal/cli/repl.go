@@ -143,6 +143,8 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 		return false, s.executeLoad(fields[1:], stdout)
 	case "list":
 		return false, s.executeList(fields[1:], stdout)
+	case "cp", "copy":
+		return false, s.executeCopy(fields[1:], stdout)
 	case "unload":
 		return false, s.executeUnload(fields[1:], stdout)
 	case "recover":
@@ -171,6 +173,10 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      List resolved data files with tablespace, page count and read status (pre-flight check).")
 	fmt.Fprintln(stdout, "  list asmfile;")
 	fmt.Fprintln(stdout, "      List files recovered from offline DMASM INODE metadata.")
+	fmt.Fprintln(stdout, "  cp <+GROUP/path/file> <filesystem file|directory>;")
+	fmt.Fprintln(stdout, "      Copy one logical ASM file to a regular filesystem without overwriting an existing file.")
+	fmt.Fprintln(stdout, "  cp datafile <filesystem directory>;")
+	fmt.Fprintln(stdout, "      Copy every DBF in the configured ASM database directory to regular files.")
 	fmt.Fprintln(stdout, "  describe <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Show one table's recovered definition, physical location and columns (alias: desc).")
 	fmt.Fprintln(stdout, "  list user;")
@@ -2401,29 +2407,39 @@ func (s *interactiveSession) ensureASMOpen() error {
 	if !dm.IsASMPath(s.systemPath) {
 		return nil
 	}
-	if s.asmStorage != nil && s.asmSystem != nil {
+	if s.asmStorage != nil && s.asmSystem != nil && s.asmDataSources != nil {
+		return nil
+	}
+	if err := s.ensureASMStorageOpen(); err != nil {
+		return err
+	}
+	system, err := s.asmStorage.Open(s.systemPath)
+	if err != nil {
+		s.closeASM()
+		return err
+	}
+	sources, err := s.asmStorage.DataFiles(s.systemPath)
+	if err != nil {
+		s.closeASM()
+		return err
+	}
+	s.asmSystem = system
+	s.asmDataSources = sources
+	return nil
+}
+
+func (s *interactiveSession) ensureASMStorageOpen() error {
+	if s.asmStorage != nil {
 		return nil
 	}
 	if len(s.asmDisks) == 0 {
-		return fmt.Errorf("ASM system path %s requires: set asm_disk <raw member>[,<raw member>...]", s.systemPath)
+		return fmt.Errorf("ASM access requires: set asm_disk <raw member>[,<raw member>...]")
 	}
 	storage, err := dm.OpenRawASMStorage(s.asmDisks...)
 	if err != nil {
 		return err
 	}
-	system, err := storage.Open(s.systemPath)
-	if err != nil {
-		storage.Close()
-		return err
-	}
-	sources, err := storage.DataFiles(s.systemPath)
-	if err != nil {
-		storage.Close()
-		return err
-	}
 	s.asmStorage = storage
-	s.asmSystem = system
-	s.asmDataSources = sources
 	return nil
 }
 

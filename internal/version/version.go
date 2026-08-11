@@ -4,7 +4,7 @@ var (
 	Name = "dmdul"
 	// Version is the fallback for builds without -ldflags injection; release
 	// builds override it with the git tag (see docs/development.md).
-	Version   = "v0.7.0"
+	Version   = "v0.7.1"
 	Commit    = "unknown"
 	BuildTime = "unknown"
 )

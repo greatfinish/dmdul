@@ -80,6 +80,34 @@ bootstrap 还会把字典中各表的 `group_id/root_file` 与实际输入的 DB
 这个状态允许继续恢复 SYSTEM 字典和 DDL，但不能把受影响表的零行结果解释为空表。补齐
 同一冷快照中的成员盘后重新 bootstrap，直到 `missing_files` 消失。
 
+### 将 ASM 逻辑文件复制到文件系统
+
+直接卸载数据时不需要复制中间 DBF。需要保存普通文件副本或交给其他文件级工具时，使用
+`cp` 把逻辑 ASM 文件流式写入文件系统。
+
+```text
+# 单文件；目标可以是文件名，也可以是已有目录
+DMDUL> cp +NORM4/data/MIRRORDB/SYSTEM.DBF /recovery/dbf/SYSTEM.DBF;
+
+# 当前数据库目录中的全部 DBF，包含跨磁盘组数据文件
+DMDUL> cp datafile /recovery/dbf;
+```
+
+Windows 示例：
+
+```text
+DMDUL> cp +NORM4/data/MIRRORDB/SYSTEM.DBF D:\recovery\dbf;
+DMDUL> cp datafile D:\recovery\dbf;
+```
+
+复制器复用 INODE、AU map、副本数组和条带映射，使用 4 MiB 固定缓冲区，不会把整个 DBF
+读入内存。每个目标先写同目录临时文件，写满 INODE 记录的逻辑长度并同步后再改名；已存在
+的目标不会被覆盖。命令输出和 `dul.log` 同时保存字节数、SHA-256 与耗时。
+
+`cp datafile` 在写入前完成全量目标检查。不同磁盘组中的 DBF 如果具有相同文件名，命令会
+停止并要求分别指定目标文件名。批量复制不是跨文件事务：某个文件读取失败时，当前临时文件
+会删除，已经成功发布的 DBF 保留。
+
 ## 读取架构
 
 ```text
@@ -97,13 +125,13 @@ raw member disks / flat VMDKs
               v
        logical ASM ReaderAt
               |
-       +------+------+
-       |             |
-       v             v
-   bootstrap      page plan
-                     |
-                     v
-                  unload
+       +------+------+------+
+       |             |      |
+       v             v      v
+      cp         bootstrap page plan
+       |                    |
+       v                    v
+ filesystem DBF          unload
 ```
 
 `RawASMStorage` 先按磁盘头中的 group id 对输入成员分组。镜像组再选择最高 AU 1

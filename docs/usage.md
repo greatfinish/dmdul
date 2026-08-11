@@ -85,6 +85,16 @@ VMware `monolithicFlat` 冷副本可以直接使用 `*-flat.vmdk`，不要传只
 写入，或使用存储快照；不要把运行中读取成功当成一致性保证。当前支持范围和物理格式见
 [DMASM 裸盘离线读取与恢复](dmasm-raw-recovery.md)。
 
+需要生成普通文件系统 DBF 时，可以复制单个 ASM 文件，或复制当前数据库目录中的全部 DBF：
+
+```text
+DMDUL> cp +NORM4/data/MIRRORDB/SYSTEM.DBF D:\recovery\dbf;
+DMDUL> cp datafile D:\recovery\dbf;
+```
+
+`cp` 使用固定缓冲区流式写入并输出 SHA-256。它默认拒绝覆盖已有文件；`cp datafile` 还会在
+开始前检查同名目标冲突。正常 `bootstrap` 和 `unload` 不依赖这一步。
+
 查看当前参数：
 
 ```text

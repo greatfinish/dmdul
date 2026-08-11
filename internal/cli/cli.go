@@ -24,6 +24,8 @@ Main interactive commands:
   load dictionary;
   list datafile;
   list asmfile;
+  cp <+GROUP/path/file> <filesystem file|directory>;
+  cp datafile <filesystem directory>;
   list user;
   list schema [owner];
   list table <owner>;

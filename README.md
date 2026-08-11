@@ -20,7 +20,7 @@
 - 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
   AU 映射、副本数组和条带数据。
 
-**v0.7.0 主题：DMASM Raw Recovery**
+**v0.7.1 主题：DMASM Logical File Copy**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -215,7 +215,7 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
 | 能力 | 状态 | 说明 |
 | --- | --- | --- |
 | Standard Bootstrap | ✅ 支持 | 两阶段字典下载、结构化日志、流式 fallback |
-| DMASM 裸盘读取 | 🧪 实验支持 | 非镜像 + 镜像环境；AU map、NORMAL/HIGH 副本、细条带、多磁盘组、generation/成员状态筛选、缺失 group/file 预警 |
+| DMASM 裸盘读取 | 🧪 实验支持 | 非镜像 + 镜像环境；AU map、NORMAL/HIGH 副本、细条带、多磁盘组、generation/成员状态筛选、缺失 group/file 预警，以及 ASM 逻辑文件流式复制 |
 | `SYSTEM.DBF` 参数解析 | ✅ 支持 | extent/page/page count、字符集、大小写标志、open history 实例名 |
 | `dm.ctl` / DBF 文件识别 | ✅ 支持 | 数据库名、表空间、group/file、数据文件路径 |
 | `control.dul` / `init.dul` | ✅ 支持 | 文件清单、参数值、参数来源及重新加载 |
@@ -685,6 +685,39 @@ DMDUL> list datafile;
 任何关键数据文件缺失时，应先补齐成员副本，再执行 `bootstrap`。冗余副本可读不代表当前
 盘集一定完整，尤其要核对跨磁盘组的分区和 LOB 文件。
 
+#### 可选：把 ASM 逻辑文件复制为普通 DBF
+
+`bootstrap` 和 `unload` 可以直接读取裸盘，不要求先生成中间 DBF。需要把文件交给其他工具、
+独立核对文件内容或保存普通文件副本时，可以使用 `cp`。
+
+复制一个逻辑文件。目标是已有目录时，输出文件沿用 ASM 路径中的文件名：
+
+```text
+DMDUL> cp +NORM4/data/MIRRORDB/SYSTEM.DBF D:\recovery\dbf;
+DMDUL> cp +EXT32/data/MIRRORDB/TBS_EXT32.DBF D:\recovery\dbf\TBS_EXT32.DBF;
+```
+
+复制当前 ASM 数据库目录中识别到的全部 DBF：
+
+```text
+DMDUL> cp datafile D:\recovery\dbf;
+```
+
+`cp datafile` 以当前 `system` 的数据库目录为范围，包含跨磁盘组发现的 SYSTEM、ROLL、MAIN、
+TEMP 和用户表空间 DBF。命令会先检查全部目标文件名；同名冲突或已有目标文件会在复制前
+报错，不会覆盖。复制过程使用固定大小缓冲区，先写同目录临时文件，完整同步后再改名。
+控制台和 `dul.log` 会记录逻辑字节数、SHA-256 和耗时。批量复制中途发生读盘错误时，
+当前临时文件会被删除，此前已经完成的 DBF 会保留。
+
+复制完成后可以切换到普通文件系统路径继续恢复：
+
+```text
+DMDUL> set data_dir D:\recovery\dbf;
+DMDUL> set system D:\recovery\dbf\SYSTEM.DBF;
+DMDUL> list datafile;
+DMDUL> bootstrap;
+```
+
 ### 6. 下载并检查数据库字典
 
 文件集通过预检后，再从 ASM 逻辑 `SYSTEM.DBF` 执行 Standard Bootstrap：
@@ -950,6 +983,8 @@ load dictionary;
 show parameter;
 list datafile;
 list asmfile;
+cp <+GROUP/path/file> <filesystem file|directory>;
+cp datafile <filesystem directory>;
 list user;
 list table <owner>;
 describe <owner.table_name>;
@@ -1127,6 +1162,7 @@ dul.log
 | v0.6.5 | 修复大于 8 MiB 的表 DMP 无法被 `dimp` 导入、离线恢复标准流程文档 |
 | v0.6.6 | `list` 系列表头大写+下划线、列宽自适应、dmfldr 装载命令引号订正 |
 | v0.7.0 | DMASM 非镜像/镜像裸盘读取、多磁盘组、NORMAL/HIGH 副本与条带、ASM page plan 直读 |
+| v0.7.1 | ASM 逻辑文件流式复制、整套 DBF 物化、SHA-256 证据与安全目标预检 |
 | v0.7.x | DMASM REDO、超 65535-AU 单文件、更多 DM8 build 与条带组合验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 

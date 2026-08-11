@@ -26,7 +26,7 @@ func TestRunHelp(t *testing.T) {
 		t.Fatalf("help output should mention dmdul, got %q", stdout.String())
 	}
 	for _, want := range []string{
-		"bootstrap;", "list datafile;", "list asmfile;", "list schema [owner];",
+		"bootstrap;", "list datafile;", "list asmfile;", "cp datafile <filesystem directory>;", "list schema [owner];",
 		"describe <owner.table_name>;", "unload object <owner|all>;",
 		"unload schema <schema>[,<schema>...];", "unload database;",
 		"recover table", "check pages", "set asm_disk",
@@ -69,7 +69,7 @@ func TestRunInteractiveHelpAndExit(t *testing.T) {
 		t.Fatalf("RunInteractive returned error: %v", err)
 	}
 	output := stdout.String()
-	for _, want := range []string{"dmdul: Release " + version.Version, "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list asmfile;", "set asm_disk", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
+	for _, want := range []string{"dmdul: Release " + version.Version, "Dameng Database Offline Recovery & Data Unloader", "Copyright (c) 2026 greatfinish", "https://github.com/greatfinish/dmdul", "DMDUL>", "bootstrap;", "list asmfile;", "cp datafile", "set asm_disk", "list user;", "unload table", "unload object", "unload database", "recover table", "bye"} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("interactive output should contain %q, got %q", want, output)
 		}
@@ -1368,5 +1368,82 @@ func TestDescribeRejectsBadNameAndMissingTable(t *testing.T) {
 	}
 	if err := session.executeDescribe([]string{"APP.GHOST"}, &stdout); err == nil {
 		t.Fatal("describe must report a table missing from the dictionary")
+	}
+}
+
+type cliCopyReader struct{ size int64 }
+
+func (r cliCopyReader) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	n := len(p)
+	if remaining := r.size - off; int64(n) > remaining {
+		n = int(remaining)
+	}
+	clear(p[:n])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (r cliCopyReader) Size() int64 { return r.size }
+
+func TestCopyCommandDestinationAndSingleTarget(t *testing.T) {
+	destination, err := copyCommandDestination([]string{"to", `"D:\recovery files"`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if destination != `D:\recovery files` {
+		t.Fatalf("destination = %q", destination)
+	}
+	dir := t.TempDir()
+	target, err := resolveSingleASMCopyTarget("+DATA/DMDB/SYSTEM.DBF", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != filepath.Join(dir, "SYSTEM.DBF") {
+		t.Fatalf("single-file target = %q", target)
+	}
+}
+
+func TestPlanASMDataFileCopiesRejectsCollisionsBeforeCopy(t *testing.T) {
+	dir := t.TempDir()
+	sources := []dm.OfflineDataSource{
+		{GroupID: 0, FileID: 0, Path: "+DATA/DMDB/SYSTEM.DBF", Reader: cliCopyReader{size: 8192}},
+		{GroupID: 4, FileID: 0, Path: "+DATA/DMDB/MAIN.DBF", Reader: cliCopyReader{size: 16384}},
+	}
+	plans, err := planASMDataFileCopies(sources, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 || plans[0].targetPath != filepath.Join(dir, "SYSTEM.DBF") || plans[1].targetPath != filepath.Join(dir, "MAIN.DBF") {
+		t.Fatalf("unexpected copy plans: %+v", plans)
+	}
+
+	duplicate := append([]dm.OfflineDataSource(nil), sources...)
+	duplicate = append(duplicate, dm.OfflineDataSource{
+		GroupID: 5, FileID: 0, Path: "+OTHER/DMDB/main.dbf", Reader: cliCopyReader{size: 8192},
+	})
+	if _, err := planASMDataFileCopies(duplicate, dir); err == nil || !strings.Contains(err.Error(), "both map to target filename") {
+		t.Fatalf("expected duplicate target-name error, got %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), []byte("existing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := planASMDataFileCopies(sources, dir); err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected existing-target error, got %v", err)
+	}
+}
+
+func TestCopyCommandRequiresConfiguredASMSource(t *testing.T) {
+	session := newInteractiveSession()
+	if err := session.executeCopy([]string{"+DATA/DMDB/SYSTEM.DBF", filepath.Join(t.TempDir(), "SYSTEM.DBF")}, io.Discard); err == nil || !strings.Contains(err.Error(), "set asm_disk") {
+		t.Fatalf("expected asm_disk requirement, got %v", err)
+	}
+	if err := session.executeCopy([]string{"datafile", t.TempDir()}, io.Discard); err == nil || !strings.Contains(err.Error(), "ASM system path") {
+		t.Fatalf("expected ASM system-path requirement, got %v", err)
 	}
 }

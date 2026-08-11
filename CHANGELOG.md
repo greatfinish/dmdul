@@ -14,10 +14,31 @@ v主版本.次版本.修订版本
 
 ## 未发布
 
+------
+
+## v0.7.1 - DMASM Logical File Copy
+
+### Added
+
+- 新增交互命令 `cp <+GROUP/path/file> <filesystem file|directory>;`，把 DMASM INODE 中的
+  单个逻辑文件流式复制到普通文件系统。
+- 新增 `cp datafile <directory>;`，一次复制当前 ASM 数据库目录中识别到的全部 DBF，
+  包含分布在不同磁盘组中的 SYSTEM、ROLL、MAIN、TEMP 和用户表空间文件。
+- ASM 文件复制使用 4 MiB 有界缓冲、同目录临时文件、落盘同步和原子改名；默认拒绝覆盖
+  已有文件，并在批量写入前检查目标文件名冲突。控制台与 `dul.log` 记录字节数、SHA-256
+  和耗时。
+
+### Tests
+
+- 新增 ASM 跨 extent 文件复制、精确字节与 SHA-256、已有目标保护、读取失败临时文件清理、
+  Windows 带空格路径和批量同名冲突测试。
+
 ### Documentation
 
 - 重绘 README 能力链，明确区分“离线文件系统 DBF 直读”和“DMASM 成员裸盘 -> 磁盘组元数据
   -> ASM 逻辑 DBF”两条输入路径，并补全 `disql`、`dmfldr`、`dimp` 三种官方回灌工具。
+- README、使用示例和 DMASM 专题文档新增 `cp` 单文件/整套 DBF 复制流程、安全边界及切换回
+  文件系统恢复路径的步骤。
 
 ------
 
