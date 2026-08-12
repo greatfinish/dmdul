@@ -65,6 +65,9 @@ func RunInteractive(input io.Reader, stdout io.Writer, stderr io.Writer) error {
 	fmt.Fprintln(stdout, "Type help; for available commands.")
 
 	session.autoProbeStartupSystem(stdout)
+	if err := session.writeInitDUL(); err != nil {
+		fmt.Fprintf(stderr, "warning: write init.dul after startup discovery: %v\n", err)
+	}
 
 	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
@@ -172,7 +175,7 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "  list datafile;")
 	fmt.Fprintln(stdout, "      List resolved data files with tablespace, page count and read status (pre-flight check).")
 	fmt.Fprintln(stdout, "  list asmfile;")
-	fmt.Fprintln(stdout, "      List files recovered from offline DMASM INODE metadata.")
+	fmt.Fprintln(stdout, "      List files recovered from DMASM INODE metadata and discover SYSTEM.DBF candidates.")
 	fmt.Fprintln(stdout, "  cp <+GROUP/path/file> <filesystem file|directory>;")
 	fmt.Fprintln(stdout, "      Copy one logical ASM file to a regular filesystem without overwriting an existing file.")
 	fmt.Fprintln(stdout, "  cp datafile <filesystem directory>;")
@@ -202,7 +205,7 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Files are located in data_dir; add 'control' to follow dm.ctl absolute paths.")
 	fmt.Fprintln(stdout, "  set system <SYSTEM.DBF path>;")
 	fmt.Fprintln(stdout, "  set asm_disk <raw member>[,<raw member>...];")
-	fmt.Fprintln(stdout, "      Read +GROUP/... files directly from offline DMASM member disks (read-only).")
+	fmt.Fprintln(stdout, "      Open offline DMASM members read-only; a unique SYSTEM.DBF is selected automatically.")
 	fmt.Fprintln(stdout, "  set data_dir <DBF directory>;")
 	fmt.Fprintln(stdout, "  set control <dm.ctl path>;")
 	fmt.Fprintln(stdout, "  set output_dir <directory>;")
@@ -388,6 +391,7 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 	value := strings.Join(args[1:], " ")
 	switch name {
 	case "system", "file":
+		asmSelection := dm.IsASMPath(value) && len(s.asmDisks) > 0
 		s.closeASM()
 		s.systemPath = value
 		s.dictionary = nil
@@ -395,6 +399,35 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		s.charsetExplicit = false
 		s.resetDatabaseMetadata()
 		fmt.Fprintf(stdout, "%s = %s\n", name, value)
+		if asmSelection {
+			discovery, err := s.discoverASMSystem()
+			if err != nil {
+				return err
+			}
+			if discovery.Selected == "" {
+				if _, persistErr := s.persistASMDiscovery(discovery); persistErr != nil {
+					return persistErr
+				}
+				return fmt.Errorf("ASM SYSTEM.DBF candidate not found: %s", value)
+			}
+			catalogFiles, err := s.persistASMDiscovery(discovery)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "ASM catalog: %s, %s (databases=%d data_files=%d selected=%s)\n",
+				catalogFiles.DatabasesPath, catalogFiles.DataFilesPath,
+				catalogFiles.DatabaseCount, catalogFiles.DataFileCount, discovery.Selected)
+		} else if len(s.asmDisks) > 0 {
+			catalogFiles, err := s.clearPersistedASMSelection()
+			if err != nil {
+				return err
+			}
+			if catalogFiles != nil {
+				fmt.Fprintf(stdout, "ASM catalog: %s, %s (databases=%d data_files=%d selected=none)\n",
+					catalogFiles.DatabasesPath, catalogFiles.DataFilesPath,
+					catalogFiles.DatabaseCount, catalogFiles.DataFileCount)
+			}
+		}
 		s.probeDatabaseIdentity(stdout, true)
 		return nil
 	case "asm_disk", "asm_disks", "asmdisk":
@@ -404,15 +437,45 @@ func (s *interactiveSession) executeSet(args []string, stdout io.Writer) error {
 		if len(s.asmDisks) == 0 {
 			return fmt.Errorf("asm_disk requires at least one raw member path")
 		}
-		fmt.Fprintf(stdout, "asm_disk = %s\n", strings.Join(s.asmDisks, ","))
-		if dm.IsASMPath(s.systemPath) {
-			s.probeDatabaseIdentity(stdout, true)
+		// Configuring raw members switches discovery to ASM. A filesystem
+		// default must not prevent a unique ASM SYSTEM.DBF from being selected.
+		if !dm.IsASMPath(s.systemPath) {
+			s.systemPath = ""
+			s.charset = "auto"
+			s.charsetExplicit = false
+			s.resetDatabaseMetadata()
 		}
+		fmt.Fprintf(stdout, "asm_disk = %s\n", strings.Join(s.asmDisks, ","))
+		discovery, err := s.discoverASMSystem()
+		if err != nil {
+			return err
+		}
+		printASMSystemDiscovery(stdout, discovery)
+		catalogFiles, err := s.persistASMDiscovery(discovery)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "ASM catalog: %s, %s (databases=%d data_files=%d)\n",
+			catalogFiles.DatabasesPath, catalogFiles.DataFilesPath,
+			catalogFiles.DatabaseCount, catalogFiles.DataFileCount)
 		return nil
 	case "data_dir", "datadir":
 		s.dataDir = value
 		s.dataDirSet = strings.TrimSpace(value) != ""
 		s.dictionary = nil
+		if len(s.asmDisks) > 0 && s.asmStorage != nil {
+			discovery, err := s.discoverASMSystem()
+			if err != nil {
+				return err
+			}
+			catalogFiles, err := s.persistASMDiscovery(discovery)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "ASM catalog: %s, %s (databases=%d data_files=%d)\n",
+				catalogFiles.DatabasesPath, catalogFiles.DataFilesPath,
+				catalogFiles.DatabaseCount, catalogFiles.DataFileCount)
+		}
 	case "control", "ctl":
 		s.controlPath = value
 		s.controlProvided = strings.TrimSpace(value) != ""
@@ -492,7 +555,7 @@ func (s *interactiveSession) executeShow(args []string, stdout io.Writer) error 
 
 func (s *interactiveSession) executeList(args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: list datafile | list user | list schema [owner] | list table <owner>")
+		return fmt.Errorf("usage: list asmfile | list datafile | list user | list schema [owner] | list table <owner>")
 	}
 	// list datafile inspects physical files and must work before bootstrap,
 	// so it does not require a loaded dictionary.
@@ -520,7 +583,7 @@ func (s *interactiveSession) executeList(args []string, stdout io.Writer) error 
 		}
 		s.printSchemas(stdout, owner)
 	default:
-		return fmt.Errorf("usage: list datafile | list user | list schema [owner] | list table <owner>")
+		return fmt.Errorf("usage: list asmfile | list datafile | list user | list schema [owner] | list table <owner>")
 	}
 	return nil
 }
@@ -621,6 +684,24 @@ func formatDescribeType(col dm.DictionaryColumn) string {
 // group/file id, page count and read status — a pre-flight check that all DBFs
 // were identified and are readable, in the spirit of DUL's "show datafiles".
 func (s *interactiveSession) printDataFiles(stdout io.Writer) error {
+	if len(s.asmDisks) > 0 && strings.TrimSpace(s.systemPath) == "" {
+		discovery, err := s.discoverASMSystem()
+		if err != nil {
+			return err
+		}
+		if discovery.Selected == "" {
+			if _, persistErr := s.persistASMDiscovery(discovery); persistErr != nil {
+				return persistErr
+			}
+			printASMSystemDiscovery(stdout, discovery)
+			return fmt.Errorf("ASM SYSTEM.DBF is not selected; run list asmfile, then set system <ASM path>")
+		}
+		if _, err := s.persistASMDiscovery(discovery); err != nil {
+			return err
+		}
+		printASMSystemDiscovery(stdout, discovery)
+		return nil
+	}
 	if dm.IsASMPath(s.systemPath) {
 		if err := s.ensureASMOpen(); err != nil {
 			return err
@@ -690,9 +771,17 @@ func (s *interactiveSession) printASMDataFiles(stdout io.Writer) error {
 	if pageSize == 0 {
 		pageSize = dm.DefaultPageSize
 	}
-	spaces := make([]string, 0, len(s.asmDataSources))
-	paths := make([]string, 0, len(s.asmDataSources))
-	for _, source := range s.asmDataSources {
+	printASMDataSourceTable(stdout, s.asmDataSources, pageSize)
+	return nil
+}
+
+func printASMDataSourceTable(stdout io.Writer, sources []dm.OfflineDataSource, pageSize uint32) {
+	if pageSize == 0 {
+		pageSize = dm.DefaultPageSize
+	}
+	spaces := make([]string, 0, len(sources))
+	paths := make([]string, 0, len(sources))
+	for _, source := range sources {
 		spaces = append(spaces, defaultIfBlank(source.Tablespace, "?"))
 		paths = append(paths, source.Path)
 	}
@@ -706,28 +795,40 @@ func (s *interactiveSession) printASMDataFiles(stdout io.Writer) error {
 		{title: "path", width: widestValue("path", paths)},
 	})
 	okCount := 0
-	for _, source := range s.asmDataSources {
-		size := source.Reader.Size()
-		status := "OK"
-		if size <= 0 || size%int64(pageSize) != 0 {
-			status = "SIZE?"
-		} else {
+	for _, source := range sources {
+		size, pages, status := asmDataSourceStatus(source, pageSize)
+		if status == "OK" {
 			okCount++
 		}
 		fmt.Fprintf(stdout, format,
 			fmt.Sprint(source.GroupID), fmt.Sprint(source.FileID), defaultIfBlank(source.Tablespace, "?"),
-			fmt.Sprint(size/int64(pageSize)), fmt.Sprintf("%.1f", float64(size)/(1024*1024)), status, source.Path)
+			fmt.Sprint(pages), fmt.Sprintf("%.1f", float64(size)/(1024*1024)), status, source.Path)
 	}
 	fmt.Fprintf(stdout, "data files: %d (readable & page-aligned: %d), page_size=%d, source=DMASM raw\n",
-		len(s.asmDataSources), okCount, pageSize)
-	return nil
+		len(sources), okCount, pageSize)
+}
+
+func asmDataSourceStatus(source dm.OfflineDataSource, pageSize uint32) (int64, int64, string) {
+	if pageSize == 0 {
+		pageSize = dm.DefaultPageSize
+	}
+	if source.Reader == nil {
+		return 0, 0, "UNREADABLE"
+	}
+	size := source.Reader.Size()
+	pages := size / int64(pageSize)
+	if size <= 0 || size%int64(pageSize) != 0 {
+		return size, pages, "SIZE?"
+	}
+	return size, pages, "OK"
 }
 
 func (s *interactiveSession) printASMFiles(stdout io.Writer) error {
-	if !dm.IsASMPath(s.systemPath) {
-		return fmt.Errorf("list asmfile requires set asm_disk and an ASM system path such as +DMDATA/.../SYSTEM.DBF")
+	discovery, err := s.discoverASMSystem()
+	if err != nil {
+		return err
 	}
-	if err := s.ensureASMOpen(); err != nil {
+	if _, err := s.persistASMDiscovery(discovery); err != nil {
 		return err
 	}
 	files := s.asmStorage.Files()
@@ -750,7 +851,260 @@ func (s *interactiveSession) printASMFiles(stdout io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "asm files: %d, groups=%d, disks=%d, source=DMASM INODE\n",
 		len(files), s.asmStorage.GroupCount(), s.asmStorage.DiskCount())
+	printASMSystemDiscovery(stdout, discovery)
 	return nil
+}
+
+type asmDatabaseDiscovery struct {
+	Candidate   dm.RawASMFileInfo
+	Metadata    dm.DatabaseMetadata
+	System      *dm.RawASMFile
+	ControlPath string
+	DataFiles   []dm.OfflineDataSource
+	Err         error
+}
+
+type asmSystemDiscovery struct {
+	Candidates   []dm.RawASMFileInfo
+	Databases    []asmDatabaseDiscovery
+	Selected     string
+	AutoSelected bool
+}
+
+func (s *interactiveSession) discoverASMSystem() (asmSystemDiscovery, error) {
+	if err := s.ensureASMStorageOpen(); err != nil {
+		return asmSystemDiscovery{}, err
+	}
+	candidates := s.asmStorage.SystemFiles()
+	selected, autoSelected := selectASMSystemCandidate(s.systemPath, candidates)
+	if selected == "" {
+		if strings.TrimSpace(s.systemPath) != "" {
+			s.systemPath = ""
+			s.dictionary = nil
+			s.charset = "auto"
+			s.charsetExplicit = false
+			s.resetDatabaseMetadata()
+		}
+	} else if !sameASMPath(s.systemPath, selected) {
+		s.systemPath = selected
+		s.dictionary = nil
+		s.charset = "auto"
+		s.charsetExplicit = false
+		s.resetDatabaseMetadata()
+	} else {
+		// Keep the canonical path spelling recovered from the INODE catalog.
+		s.systemPath = selected
+	}
+	databases := make([]asmDatabaseDiscovery, 0, len(candidates))
+	for _, candidate := range candidates {
+		database := s.inspectASMDatabase(candidate)
+		databases = append(databases, database)
+		if selected != "" && sameASMPath(selected, candidate.Path) {
+			s.asmSystem = database.System
+			s.asmDataSources = database.DataFiles
+			if database.System != nil {
+				s.metadata = database.Metadata
+			}
+		}
+	}
+	if selected == "" {
+		s.asmSystem = nil
+		s.asmDataSources = nil
+	}
+	if autoSelected {
+		s.log(fmt.Sprintf("[ASM] SYSTEM.DBF auto-selected path=%q candidates=%d", selected, len(candidates)))
+	} else if len(candidates) != 1 {
+		s.log(fmt.Sprintf("[ASM] SYSTEM.DBF discovery candidates=%d selected=%q", len(candidates), selected))
+	}
+	return asmSystemDiscovery{
+		Candidates: candidates, Databases: databases,
+		Selected: selected, AutoSelected: autoSelected,
+	}, nil
+}
+
+func (s *interactiveSession) inspectASMDatabase(candidate dm.RawASMFileInfo) asmDatabaseDiscovery {
+	database := asmDatabaseDiscovery{Candidate: candidate}
+	system, err := s.asmStorage.Open(candidate.Path)
+	if err != nil {
+		database.Err = fmt.Errorf("open SYSTEM.DBF: %w", err)
+		return database
+	}
+	database.System = system
+	database.Metadata, err = dm.InspectDatabaseHeaderMetadataFromReader(
+		candidate.Path, system, system.Size(), "auto",
+	)
+	if err != nil {
+		database.Metadata = dm.DatabaseMetadata{SystemPath: candidate.Path}
+		database.ControlPath = s.applyASMDatabaseName(&database.Metadata, candidate.Path)
+		database.Err = fmt.Errorf("inspect SYSTEM.DBF: %w", err)
+		return database
+	}
+	database.ControlPath = s.applyASMDatabaseName(&database.Metadata, candidate.Path)
+	database.DataFiles, err = s.asmStorage.DataFiles(candidate.Path)
+	if err != nil {
+		database.Err = fmt.Errorf("discover DBF files: %w", err)
+	}
+	return database
+}
+
+func (s *interactiveSession) applyASMDatabaseName(metadata *dm.DatabaseMetadata, systemPath string) string {
+	if metadata == nil {
+		return ""
+	}
+	if name := asmDatabaseName(systemPath); name != "" {
+		metadata.DatabaseName = name
+		metadata.DatabaseNameSrc = "DMASM path"
+	}
+	if s.asmStorage == nil {
+		return ""
+	}
+	control, err := s.asmStorage.DatabaseFile(systemPath, "dm.ctl")
+	if err != nil || control == nil {
+		return ""
+	}
+	if name, nameErr := dm.InspectControlDatabaseNameFromReader(control, control.Size()); nameErr == nil {
+		metadata.DatabaseName = name
+		metadata.DatabaseNameSrc = "DMASM dm.ctl"
+	}
+	return control.Info().Path
+}
+
+func (s *interactiveSession) persistASMDiscovery(discovery asmSystemDiscovery) (*dm.ASMCatalogFilesResult, error) {
+	catalog := &dm.ASMCatalog{}
+	members := strings.Join(s.asmDisks, ",")
+	for index, database := range discovery.Databases {
+		status := "OK"
+		errorText := ""
+		if database.Err != nil {
+			status = "ERROR"
+			errorText = database.Err.Error()
+		}
+		name := defaultIfBlank(database.Metadata.DatabaseName, asmDatabaseName(database.Candidate.Path))
+		catalog.Databases = append(catalog.Databases, dm.ASMCatalogDatabase{
+			CandidateNo:  index + 1,
+			Selected:     discovery.Selected != "" && sameASMPath(discovery.Selected, database.Candidate.Path),
+			DatabaseName: name, DatabaseNameSrc: database.Metadata.DatabaseNameSrc,
+			SystemPath: database.Candidate.Path, ControlPath: database.ControlPath, ASMMembers: members,
+			Charset: database.Metadata.Charset, CharsetFlag: database.Metadata.CharsetFlag,
+			HasCharsetFlag: database.Metadata.HasCharsetFlag,
+			PageSize:       database.Metadata.PageSize, PageCount: database.Metadata.PageCount,
+			ExtentSize:       database.Metadata.ExtentSize,
+			CaseSensitive:    database.Metadata.CaseSensitive,
+			HasCaseSensitive: database.Metadata.HasCaseSensitive,
+			DataFileCount:    len(database.DataFiles), Status: status, Error: errorText,
+		})
+		for _, source := range database.DataFiles {
+			size, pages, fileStatus := asmDataSourceStatus(source, database.Metadata.PageSize)
+			catalog.DataFiles = append(catalog.DataFiles, dm.ASMCatalogDataFile{
+				CandidateNo: index + 1, DatabaseName: name, SystemPath: database.Candidate.Path,
+				GroupID: source.GroupID, FileID: source.FileID, Tablespace: source.Tablespace,
+				Pages: pages, SizeBytes: size, Status: fileStatus, Path: source.Path,
+			})
+		}
+	}
+	result, err := dm.WriteASMCatalogFiles(s.effectiveDictionaryDir(), catalog)
+	if err != nil {
+		return nil, fmt.Errorf("persist ASM database catalog: %w", err)
+	}
+	s.log(fmt.Sprintf("[ASM] catalog databases=%d data_files=%d selected=%q dir=%q",
+		result.DatabaseCount, result.DataFileCount, discovery.Selected, result.Dir))
+	return result, nil
+}
+
+func (s *interactiveSession) clearPersistedASMSelection() (*dm.ASMCatalogFilesResult, error) {
+	dir := s.effectiveDictionaryDir()
+	catalog, files, err := dm.LoadASMCatalogFiles(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load ASM database catalog: %w", err)
+	}
+	changed := false
+	for index := range catalog.Databases {
+		if catalog.Databases[index].Selected {
+			catalog.Databases[index].Selected = false
+			changed = true
+		}
+	}
+	if !changed {
+		return files, nil
+	}
+	result, err := dm.WriteASMCatalogFiles(dir, catalog)
+	if err != nil {
+		return nil, fmt.Errorf("clear ASM database selection: %w", err)
+	}
+	s.log(fmt.Sprintf("[ASM] catalog selection cleared databases=%d data_files=%d dir=%q",
+		result.DatabaseCount, result.DataFileCount, result.Dir))
+	return result, nil
+}
+
+func selectASMSystemCandidate(current string, candidates []dm.RawASMFileInfo) (string, bool) {
+	if dm.IsASMPath(current) {
+		for _, candidate := range candidates {
+			if sameASMPath(current, candidate.Path) {
+				return candidate.Path, false
+			}
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0].Path, true
+	}
+	return "", false
+}
+
+func sameASMPath(left string, right string) bool {
+	normalize := func(value string) string {
+		value = strings.TrimSpace(strings.ReplaceAll(value, "\\", "/"))
+		for strings.Contains(value, "//") {
+			value = strings.ReplaceAll(value, "//", "/")
+		}
+		return strings.TrimSuffix(value, "/")
+	}
+	return strings.EqualFold(normalize(left), normalize(right))
+}
+
+func printASMSystemDiscovery(stdout io.Writer, discovery asmSystemDiscovery) {
+	fmt.Fprintf(stdout, "SYSTEM.DBF candidates: %d\n", len(discovery.Candidates))
+	if len(discovery.Databases) == 0 {
+		for index, candidate := range discovery.Candidates {
+			fmt.Fprintf(stdout, "  %d. %s\n", index+1, candidate.Path)
+		}
+	} else {
+		for index, database := range discovery.Databases {
+			fmt.Fprintf(stdout, "\ndatabase %d/%d:\n", index+1, len(discovery.Databases))
+			fmt.Fprintf(stdout, "  database name: %s (%s)\n",
+				defaultIfBlank(database.Metadata.DatabaseName, asmDatabaseName(database.Candidate.Path)),
+				defaultIfBlank(database.Metadata.DatabaseNameSrc, "ASM directory"))
+			fmt.Fprintf(stdout, "  charset: %s\n", defaultIfBlank(database.Metadata.Charset, "unknown"))
+			fmt.Fprintf(stdout, "  page size: %d bytes\n", database.Metadata.PageSize)
+			fmt.Fprintf(stdout, "  page count: %d\n", database.Metadata.PageCount)
+			fmt.Fprintf(stdout, "  extent size: %d pages\n", database.Metadata.ExtentSize)
+			if database.Metadata.HasCaseSensitive {
+				caseSensitive := 0
+				if database.Metadata.CaseSensitive {
+					caseSensitive = 1
+				}
+				fmt.Fprintf(stdout, "  case sensitive: %d\n", caseSensitive)
+			}
+			fmt.Fprintf(stdout, "  system path: %s\n", database.Candidate.Path)
+			if database.Err != nil {
+				fmt.Fprintf(stdout, "  data files: unavailable (%v)\n", database.Err)
+				continue
+			}
+			printASMDataSourceTable(stdout, database.DataFiles, database.Metadata.PageSize)
+		}
+	}
+	switch {
+	case discovery.AutoSelected:
+		fmt.Fprintf(stdout, "system = %s (auto-selected)\n", discovery.Selected)
+	case discovery.Selected != "":
+		fmt.Fprintf(stdout, "system = %s (selected)\n", discovery.Selected)
+	case len(discovery.Candidates) == 0:
+		fmt.Fprintln(stdout, "system = (not selected; no SYSTEM.DBF found in the configured ASM members)")
+	default:
+		fmt.Fprintln(stdout, "system = (not selected; run set system <ASM path>)")
+	}
 }
 
 func (s *interactiveSession) executeLoad(args []string, stdout io.Writer) error {
@@ -842,10 +1196,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	var metadata dm.DatabaseMetadata
 	if asmMode {
 		metadata = dm.InspectDatabaseMetadataFromReader(systemPath, s.asmSystem, s.asmSystem.Size(), configuredCharset)
-		if name := asmDatabaseName(systemPath); name != "" {
-			metadata.DatabaseName = name
-			metadata.DatabaseNameSrc = "DMASM path"
-		}
+		s.applyASMDatabaseName(&metadata, systemPath)
 	} else {
 		metadata = dm.InspectDatabaseMetadata(systemPath, ctlPath, "", configuredCharset)
 	}
@@ -908,6 +1259,17 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("write dictionary files: %w", err)
 	}
+	var asmCatalogFiles *dm.ASMCatalogFilesResult
+	if asmMode {
+		discovery, discoveryErr := s.discoverASMSystem()
+		if discoveryErr != nil {
+			return fmt.Errorf("refresh ASM database catalog after bootstrap: %w", discoveryErr)
+		}
+		asmCatalogFiles, err = s.persistASMDiscovery(discovery)
+		if err != nil {
+			return err
+		}
+	}
 	s.systemPath = systemPath
 	s.controlPath = ctlPath
 	s.controlProvided = ctlProvided
@@ -930,6 +1292,11 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		dictFiles.UserCount, dictFiles.SchemaCount, dictFiles.TableCount, dictFiles.ColumnCount, dictFiles.ViewCount, dictFiles.SequenceCount,
 		dictFiles.RoutineCount, dictFiles.TriggerCount, dictFiles.SynonymCount, dictFiles.TabPrivilegeCount,
 		dictFiles.PartitionCount, dictFiles.PartitionKeyCount, dictFiles.Dir))
+	if asmCatalogFiles != nil {
+		s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=output name=asm_catalog status=OK databases=%d data_files=%d databases_path=%q datafiles_path=%q",
+			asmCatalogFiles.DatabaseCount, asmCatalogFiles.DataFileCount,
+			asmCatalogFiles.DatabasesPath, asmCatalogFiles.DataFilesPath))
+	}
 	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=complete status=%s mode=%s objects=%d elapsed_ms=%d",
 		status, dict.BootstrapMode, dict.ObjectCount, time.Since(startedAt).Milliseconds()))
 
@@ -2566,6 +2933,21 @@ func (s *interactiveSession) loadInitDULCommand(stdout io.Writer, commandName st
 	} else {
 		fmt.Fprintf(stdout, "init loaded: %s\n", path)
 	}
+	if len(s.asmDisks) > 0 {
+		discovery, err := s.discoverASMSystem()
+		if err != nil {
+			return fmt.Errorf("refresh ASM database catalog after loading %s: %w", commandName, err)
+		}
+		printASMSystemDiscovery(stdout, discovery)
+		catalogFiles, err := s.persistASMDiscovery(discovery)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "ASM catalog: %s, %s (databases=%d data_files=%d selected=%s)\n",
+			catalogFiles.DatabasesPath, catalogFiles.DataFilesPath,
+			catalogFiles.DatabaseCount, catalogFiles.DataFileCount,
+			defaultIfBlank(discovery.Selected, "none"))
+	}
 	return nil
 }
 
@@ -2946,9 +3328,7 @@ func (s *interactiveSession) probeDatabaseIdentity(stdout io.Writer, announce bo
 			return
 		}
 		meta := dm.InspectDatabaseMetadataFromReader(path, s.asmSystem, s.asmSystem.Size(), s.charset)
-		if name := asmDatabaseName(path); name != "" {
-			meta.DatabaseName, meta.DatabaseNameSrc = name, "DMASM path"
-		}
+		s.applyASMDatabaseName(&meta, path)
 		s.metadata = meta
 		parts := []string{"db_name=" + meta.DatabaseName, "instance=" + meta.InstanceName,
 			fmt.Sprintf("page_size=%d", meta.PageSize), fmt.Sprintf("pages=%d", meta.PageCount), "charset=" + meta.Charset}
@@ -3002,7 +3382,32 @@ func (s *interactiveSession) probeDatabaseIdentity(stdout io.Writer, announce bo
 // none is found it prints a one-line hint to set the paths manually.
 func (s *interactiveSession) autoProbeStartupSystem(stdout io.Writer) {
 	if dm.IsASMPath(s.systemPath) && len(s.asmDisks) > 0 {
+		discovery, err := s.discoverASMSystem()
+		if err != nil {
+			fmt.Fprintf(stdout, "detected: DMASM source unavailable: %v\n", err)
+			return
+		}
+		if _, err := s.persistASMDiscovery(discovery); err != nil {
+			fmt.Fprintf(stdout, "warning: %v\n", err)
+			return
+		}
 		s.probeDatabaseIdentity(stdout, true)
+		return
+	}
+	if strings.TrimSpace(s.systemPath) == "" && len(s.asmDisks) > 0 {
+		discovery, err := s.discoverASMSystem()
+		if err != nil {
+			fmt.Fprintf(stdout, "detected: DMASM source unavailable: %v\n", err)
+			return
+		}
+		printASMSystemDiscovery(stdout, discovery)
+		if _, err := s.persistASMDiscovery(discovery); err != nil {
+			fmt.Fprintf(stdout, "warning: %v\n", err)
+			return
+		}
+		if discovery.Selected != "" {
+			s.probeDatabaseIdentity(stdout, true)
+		}
 		return
 	}
 	var exeDir string

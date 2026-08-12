@@ -3,6 +3,7 @@ package dm
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -47,6 +48,34 @@ func InspectControlFile(path string) (*ControlInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read dm.ctl: %w", err)
 	}
+	return inspectControlBytes(buf, path)
+}
+
+// InspectControlFileFromReader parses a dm.ctl logical file directly from a
+// random-access source such as an offline DMASM INODE file.
+func InspectControlFileFromReader(reader io.ReaderAt, size int64, path string) (*ControlInfo, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("dm.ctl reader is nil")
+	}
+	if size < 8 {
+		return nil, fmt.Errorf("dm.ctl is too small")
+	}
+	const maxOfflineControlSize = int64(64 * 1024 * 1024)
+	if size > maxOfflineControlSize {
+		return nil, fmt.Errorf("dm.ctl is unexpectedly large: %d bytes", size)
+	}
+	buf := make([]byte, int(size))
+	n, err := reader.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return nil, fmt.Errorf("read dm.ctl: %w", err)
+	}
+	if n != len(buf) {
+		return nil, fmt.Errorf("read dm.ctl: short read %d/%d", n, len(buf))
+	}
+	return inspectControlBytes(buf, path)
+}
+
+func inspectControlBytes(buf []byte, path string) (*ControlInfo, error) {
 	if len(buf) < 8 {
 		return nil, fmt.Errorf("dm.ctl is too small")
 	}
@@ -82,6 +111,35 @@ func InspectControlFile(path string) (*ControlInfo, error) {
 	}
 
 	return info, nil
+}
+
+// InspectControlDatabaseNameFromReader reads only the fixed dm.ctl header.
+// It is used by raw DMASM discovery so the database name can be reported
+// without copying the control file out of the disk group.
+func InspectControlDatabaseNameFromReader(reader io.ReaderAt, size int64) (string, error) {
+	if reader == nil {
+		return "", fmt.Errorf("dm.ctl reader is nil")
+	}
+	if size < 8 {
+		return "", fmt.Errorf("dm.ctl is too small")
+	}
+	readSize := int64(0x84)
+	if size < readSize {
+		readSize = size
+	}
+	buf := make([]byte, int(readSize))
+	n, err := reader.ReadAt(buf, 0)
+	if err != nil && err != io.EOF {
+		return "", fmt.Errorf("read dm.ctl header: %w", err)
+	}
+	if n < 8 {
+		return "", fmt.Errorf("dm.ctl header is too small")
+	}
+	name := strings.TrimSpace(readCString(buf[4:n]))
+	if name == "" {
+		return "", fmt.Errorf("dm.ctl database name is empty")
+	}
+	return name, nil
 }
 
 type printableString struct {

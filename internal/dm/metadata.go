@@ -150,9 +150,11 @@ func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath stri
 	return meta
 }
 
-// InspectDatabaseMetadataFromReader reads database geometry and persistent
-// flags from a logical SYSTEM.DBF source such as a file inside offline DMASM.
-func InspectDatabaseMetadataFromReader(systemPath string, reader io.ReaderAt, size int64, charsetPreference string) DatabaseMetadata {
+// InspectDatabaseHeaderMetadataFromReader reads database geometry and
+// persistent flags from a logical SYSTEM.DBF without scanning its dictionary
+// pages. It is intended for lightweight discovery, including listing multiple
+// databases found in offline DMASM storage.
+func InspectDatabaseHeaderMetadataFromReader(systemPath string, reader io.ReaderAt, size int64, charsetPreference string) (DatabaseMetadata, error) {
 	meta := DefaultDatabaseMetadata()
 	meta.SystemPath = systemPath
 	if preferred := strings.TrimSpace(charsetPreference); preferred != "" && !strings.EqualFold(preferred, "auto") {
@@ -162,7 +164,7 @@ func InspectDatabaseMetadataFromReader(systemPath string, reader io.ReaderAt, si
 	}
 	header, err := readSystemHeaderFromReader(reader, size)
 	if err != nil {
-		return meta
+		return meta, err
 	}
 	if extentSize, source := detectSystemExtentSize(header); extentSize != 0 {
 		meta.ExtentSize, meta.ExtentSizeSource = extentSize, source
@@ -180,6 +182,14 @@ func InspectDatabaseMetadataFromReader(systemPath string, reader io.ReaderAt, si
 		meta.CaseSensitiveSource = "SYSTEM.DBF page 4 + 0x2C"
 		meta.HasCaseSensitive = true
 	}
+	return meta, nil
+}
+
+// InspectDatabaseMetadataFromReader reads database geometry, persistent flags,
+// and the latest instance identity from a logical SYSTEM.DBF source such as a
+// file inside offline DMASM.
+func InspectDatabaseMetadataFromReader(systemPath string, reader io.ReaderAt, size int64, charsetPreference string) DatabaseMetadata {
+	meta, _ := InspectDatabaseHeaderMetadataFromReader(systemPath, reader, size, charsetPreference)
 	if stream, streamErr := openSystemPageStreamReader(systemPath, reader, size); streamErr == nil {
 		if instanceName, source, ok := detectSystemInstanceNameFromStream(stream); ok {
 			meta.InstanceName = instanceName

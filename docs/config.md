@@ -219,6 +219,8 @@ datafile 5 0 TBS_BIN_TEST D:\temp\oldpro\TBS_BIN_TEST01.DBF
 | 文件 | 说明 |
 | --- | --- |
 | `meta.tsv` | SYSTEM.DBF、页大小、字符集、对象数量等摘要。 |
+| `asm_databases.tsv` | ASM 候选数据库、选择状态、SYSTEM/dm.ctl 路径、成员盘及数据库基本参数。仅 ASM 模式生成。 |
+| `asm_datafiles.tsv` | 每个 ASM 候选数据库对应的完整 DBF 集合及 group/file、表空间、页数、大小和状态。仅 ASM 模式生成。 |
 | `users.tsv` | 用户/owner 列表。 |
 | `schemas.tsv` | 模式 ID、模式名、所属用户 ID 和用户名；用于区分 DMP 的 OWNER 与 SCHEMAS 级别。 |
 | `tables.tsv` | 用户表摘要，包含 table id、owner、表名、表空间、段头文件/页号、段大小、存储组织、是否临时表、是否分区。 |

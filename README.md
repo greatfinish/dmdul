@@ -20,7 +20,7 @@
 - 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
   AU 映射、副本数组和条带数据。
 
-**v0.7.1 主题：DMASM Logical File Copy**
+**v0.7.2 主题：DMASM Multi-Database Discovery**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -645,34 +645,59 @@ Linux 裸设备示例：
 sudo ./dmdul
 
 DMDUL> set asm_disk /dev/dmasm/ext4a,/dev/dmasm/ext4b,/dev/dmasm/norm4a,/dev/dmasm/norm4b,/dev/dmasm/ext32a;
-DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
+DMDUL> list asmfile;
 DMDUL> set output_dir /recovery/output;
 DMDUL> show parameter;
+```
+
+只有一个 `SYSTEM.DBF` 时会自动设置 `system`。有多个候选时，在 `list asmfile` 后执行：
+
+```text
+DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
 ```
 
 Windows flat VMDK 示例：
 
 ```text
 DMDUL> set asm_disk D:\snapshot\ext4a-flat.vmdk,D:\snapshot\ext4b-flat.vmdk,D:\snapshot\norm4a-flat.vmdk,D:\snapshot\norm4b-flat.vmdk,D:\snapshot\ext32a-flat.vmdk;
-DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
+DMDUL> list asmfile;
 DMDUL> set output_dir D:\snapshot\output;
 DMDUL> show parameter;
 ```
 
-`asm_disk` 接受多个磁盘组的成员，统一用逗号分隔。它与 ASM 逻辑 `system` 路径会写入
-当前生效的 `init.dul`，后续会话可以通过 `load parameter;` 重新加载。
+`asm_disk` 接受多个磁盘组的成员，统一用逗号分隔。设置后会立即扫描 INODE 目录并查找
+`SYSTEM.DBF`。工具会为每个发现的数据库打印数据库名、字符集、页大小、页数、簇大小、
+大小写敏感标志和 `SYSTEM.DBF` 路径，随后用与 `list datafile` 相同的表格列出该库跨磁盘组
+分布的 SYSTEM、ROLL、TEMP、MAIN 与用户表空间 DBF。存在多个数据库时会同时展开所有文件集，
+但不会自动猜测活动数据库，必须执行 `set system <ASM path>;` 明确选择；只有一个候选时会自动
+写入 `system`。`asm_disk` 与最终选定的 ASM 逻辑 `system` 路径都会写入当前生效的
+`init.dul`，后续会话可以通过 `load parameter;` 重新加载。
+
+发现结果同时写入 `dmdul_dict/asm_databases.tsv` 和 `dmdul_dict/asm_datafiles.tsv`。第一张表
+每个候选数据库一行，记录 `selected`、数据库名、ASM `SYSTEM.DBF` / `dm.ctl` 路径、成员盘、
+字符集和存储参数；第二张表以 `candidate_no + system_path` 关联该库全部 DBF 的 group/file、
+表空间、页数、字节数、状态和 ASM 路径。多库环境执行 `set system +GROUP/.../SYSTEM.DBF;`
+后，`selected` 会同步切换；bootstrap 原子重建 `dmdul_dict` 后也会重新生成这两张清单。
+重新启动或执行 `load parameter;` 时会按 `init.dul` 中的成员盘重新核对清单；如果改为普通文件系统
+`SYSTEM.DBF`，ASM 候选仍完整保留，仅将全部 `selected` 更新为 `NO`。
 
 ### 5. 在 bootstrap 前检查 ASM 文件集
 
-先列出 ASM INODE 目录和识别到的数据库文件：
+`list asmfile` 不要求预先设置 `system`，可先列出 ASM INODE 目录、所有 `SYSTEM.DBF` 候选，
+以及每个数据库的基本信息和数据文件集合。确认或选择数据库后，也可以单独检查当前活动数据库
+的全部数据文件：
 
 ```text
 DMDUL> list asmfile;
 DMDUL> list datafile;
 ```
 
-`list asmfile` 用于确认逻辑目录中存在预期的 SYSTEM、MAIN、ROLL、TEMP 和用户 DBF。
-`list datafile` 会读取每个 DBF 的第 0 页，显示表空间、group/file、页数、大小和状态。
+如果输出多个候选，`set asm_disk` 和 `list asmfile` 会先完整展示各库文件集；随后应执行
+`set system <ASM path>;` 选择活动数据库，再运行 `list datafile;` 或 `bootstrap;`。
+
+`list asmfile` 用于确认各磁盘组的逻辑目录及 SYSTEM 候选；`list datafile` 以已选
+`SYSTEM.DBF` 的数据库目录为范围，跨所有已配置磁盘组发现 SYSTEM、MAIN、ROLL、TEMP
+和用户表空间 DBF，并读取每个文件的第 0 页，显示表空间、group/file、页数、大小和状态。
 
 继续执行前应确认：
 
@@ -792,45 +817,104 @@ SQL 通过 `disql` 或能够处理相应语句长度的客户端执行。至少�
 
 ## 推荐恢复流程
 
+恢复开始时先确定输入来源。普通文件系统 DBF 与 DMASM 成员裸盘是两条独立入口；完成
+数据库身份和文件集核对后，二者汇合到同一套 Standard Bootstrap 与卸载流程。
+
 ```text
-准备 SYSTEM.DBF、dm.ctl、用户表空间 DBF
-        |
-        v
-启动 dmdul
-        |
-        v
-set data_dir
-        |
-        v
-set system / set control / show parameter
-        |
-        v
-bootstrap
-        |
-        v
-检查 dmdul_dict
-        |
-        v
-必要时人工修正 users.tsv / tables.tsv / columns.tsv / partitions.tsv / partition_keys.tsv 等
-        |
-        v
-load dictionary
-        |
-        v
-unload object / table / user / database
-        |
-        +----------------+----------------+----------------+
-        |                |                |                |
-        v                v                v                v
-      DDL SQL        INSERT SQL     dmfldr txt+ctl        DMP
-        |                |                |                |
-        +----------------+----------------+                v
-                         |                               dimp
-                         +---------------+----------------+
-                                         |
-                                         v
-                                  隔离测试库验证
+                    同一时点的只读离线输入
+                             |
+              +--------------+--------------+
+              |                             |
+              v                             v
+     文件系统 SYSTEM.DBF + DBF       全部相关 DMASM 成员盘
+       （dm.ctl 可选核对）          （裸设备或 *-flat.vmdk）
+              |                             |
+              v                             v
+        list datafile                 set asm_disk
+              |                             |
+              |                             v
+              |               发现 SYSTEM.DBF 与完整 DBF 集合
+              |                             |
+              |                +------------+------------+
+              |                |                         |
+              |                v                         v
+              |         唯一候选自动选择          多候选 set system
+              |                |                         |
+              |                +------------+------------+
+              |                             |
+              |                             v
+              |              list asmfile / list datafile
+              |                             |
+              +--------------+--------------+
+                             |
+                             v
+                核对数据库身份、文件状态与 group/file
+                             |
+                             v
+            check pages（文件系统 DBF 可疑时执行）
+                             |
+                             v
+                         bootstrap
+                             |
+                             v
+              检查 dmdul_dict；必要时修订 TSV
+                             |
+                             v
+                load dictionary（仅修订后需要）
+                             |
+                             v
+            unload object / table / user / schema / database
+                             |
+         +-------------------+-------------------+
+         |                   |                   |
+         v                   v                   v
+  DDL / INSERT SQL     dmfldr txt + ctl      Native DMP
+         |                   |                   |
+         v                   v                   v
+       disql               dmfldr               dimp
+         |                   |                   |
+         +-------------------+-------------------+
+                             |
+                             v
+                      隔离测试库验证
 ```
+
+文件系统 DBF 放在同一恢复目录时，最短流程如下：
+
+```text
+DMDUL> list datafile;
+DMDUL> show parameter;
+DMDUL> bootstrap;
+```
+
+DMASM 裸盘先指定一个可写工作目录，再配置**同一时点的全部相关成员盘**：
+
+```text
+DMDUL> set data_dir D:\recovery\asm-work;
+DMDUL> set asm_disk D:\snapshot\data01-flat.vmdk,D:\snapshot\data02-flat.vmdk;
+DMDUL> list asmfile;
+```
+
+`set asm_disk` 会立即按数据库打印基本参数和 DBF 集合。只有一个 `SYSTEM.DBF` 候选时自动
+选中；存在多个候选时必须从输出中选择目标库，再继续：
+
+```text
+DMDUL> set system +DATA/data/DMDB/SYSTEM.DBF;
+DMDUL> list datafile;
+DMDUL> show parameter;
+DMDUL> bootstrap;
+```
+
+候选数据库和各自文件集会在 bootstrap 前写入 `dmdul_dict/asm_databases.tsv` 与
+`asm_datafiles.tsv`。不要只按数据库名判断候选，应同时核对 `system_path`、页大小、字符集、
+group/file、表空间和文件状态。需要把 ASM 逻辑文件交给其他工具时，可先执行
+`cp datafile <directory>;`，再按文件系统 DBF 流程恢复；直接 bootstrap/unload 不依赖复制。
+当前 `check pages` 只扫描文件系统 `data_dir`，若要对 ASM 中的全部 DBF 做逐页诊断，也应先
+`cp datafile`，切换到复制目录后再执行。
+
+建议每个离线快照使用独立工作目录。准备重新扫描时直接执行 `bootstrap;`，不要先让 `list`
+或 `unload` 自动加载旧的完整字典。bootstrap 会原子重建字典目录，并在 ASM 模式下恢复候选
+数据库清单；只有人工修订 TSV 或明确复用已审核字典时才执行 `load dictionary;`。
 
 详细流程见：[离线恢复流程](https://github.com/greatfinish/dmdul/blob/main/docs/recovery-workflow.md)。
 
@@ -879,6 +963,8 @@ DMDUL> unload user HR_TEST;
 | 文件            | 说明                                       |
 | --------------- | ------------------------------------------ |
 | `meta.tsv`      | SYSTEM.DBF、bootstrap 模式、页大小、字符集、大小写标志、对象数量等摘要 |
+| `asm_databases.tsv` | ASM 候选数据库、当前选择状态、SYSTEM/dm.ctl 路径、成员盘和数据库基本参数 |
+| `asm_datafiles.tsv` | 按候选数据库关联的完整 ASM DBF 集合、group/file、表空间、页数、大小和状态 |
 | `users.tsv`     | 用户 / owner 列表                          |
 | `schemas.tsv`   | 模式及其所属用户，用于区分 OWNER 与 SCHEMAS |
 | `tables.tsv`    | 表摘要、表空间、段信息、storage 信息       |
@@ -1163,6 +1249,7 @@ dul.log
 | v0.6.6 | `list` 系列表头大写+下划线、列宽自适应、dmfldr 装载命令引号订正 |
 | v0.7.0 | DMASM 非镜像/镜像裸盘读取、多磁盘组、NORMAL/HIGH 副本与条带、ASM page plan 直读 |
 | v0.7.1 | ASM 逻辑文件流式复制、整套 DBF 物化、SHA-256 证据与安全目标预检 |
+| v0.7.2 | DMASM 多数据库自动发现、唯一候选自动选择、候选 DBF 集合持久化与多库隔离 |
 | v0.7.x | DMASM REDO、超 65535-AU 单文件、更多 DM8 build 与条带组合验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 

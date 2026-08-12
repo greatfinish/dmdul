@@ -188,26 +188,46 @@ func RebuildDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesR
 	}
 
 	backupDir := ""
+	catalogOnlyDir := ""
 	if info, statErr := os.Stat(dir); statErr == nil {
 		if !info.IsDir() {
 			return nil, "", fmt.Errorf("dictionary path exists but is not a directory: %s", dir)
 		}
-		backupDir, err = nextDictionaryBackupDir(dir, time.Now())
-		if err != nil {
-			return nil, "", err
+		catalogOnly, catalogErr := isASMCatalogOnlyDirectory(dir)
+		if catalogErr != nil {
+			return nil, "", catalogErr
 		}
-		if err := os.Rename(dir, backupDir); err != nil {
-			return nil, "", fmt.Errorf("archive previous dictionary to %s: %w", backupDir, err)
+		if catalogOnly {
+			catalogOnlyDir, err = allocateTemporarySiblingDirectory(dir, ".catalog-")
+			if err != nil {
+				return nil, "", err
+			}
+			if err := os.Rename(dir, catalogOnlyDir); err != nil {
+				return nil, "", fmt.Errorf("stage ASM-only dictionary directory %s: %w", dir, err)
+			}
+		} else {
+			backupDir, err = nextDictionaryBackupDir(dir, time.Now())
+			if err != nil {
+				return nil, "", err
+			}
+			if err := os.Rename(dir, backupDir); err != nil {
+				return nil, "", fmt.Errorf("archive previous dictionary to %s: %w", backupDir, err)
+			}
 		}
 	} else if !os.IsNotExist(statErr) {
 		return nil, "", fmt.Errorf("inspect dictionary directory: %w", statErr)
 	}
 
 	if err := os.Rename(stagingDir, dir); err != nil {
-		if backupDir != "" {
+		if catalogOnlyDir != "" {
+			_ = os.Rename(catalogOnlyDir, dir)
+		} else if backupDir != "" {
 			_ = os.Rename(backupDir, dir)
 		}
 		return nil, "", fmt.Errorf("activate staged dictionary: %w", err)
+	}
+	if catalogOnlyDir != "" {
+		_ = os.RemoveAll(catalogOnlyDir)
 	}
 	stagingActive = false
 	result := dictionaryFilesResultForDir(dir)
@@ -224,6 +244,38 @@ func RebuildDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesR
 	result.PartitionCount = staged.PartitionCount
 	result.PartitionKeyCount = staged.PartitionKeyCount
 	return result, backupDir, nil
+}
+
+func isASMCatalogOnlyDirectory(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, fmt.Errorf("inspect dictionary directory %s: %w", dir, err)
+	}
+	if len(entries) == 0 {
+		return false, nil
+	}
+	allowed := map[string]bool{
+		strings.ToLower(ASMDatabaseCatalogFileName): true,
+		strings.ToLower(ASMDataFileCatalogFileName): true,
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !allowed[strings.ToLower(entry.Name())] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func allocateTemporarySiblingDirectory(dir string, suffix string) (string, error) {
+	parent := filepath.Dir(dir)
+	temporary, err := os.MkdirTemp(parent, "."+filepath.Base(dir)+suffix)
+	if err != nil {
+		return "", fmt.Errorf("allocate temporary dictionary path: %w", err)
+	}
+	if err := os.Remove(temporary); err != nil {
+		return "", fmt.Errorf("prepare temporary dictionary path: %w", err)
+	}
+	return temporary, nil
 }
 
 func nextDictionaryBackupDir(dir string, now time.Time) (string, error) {

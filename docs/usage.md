@@ -61,15 +61,24 @@ DMDUL> set charset auto;
 
 ### DMASM 裸盘模式
 
-数据库文件位于离线 DMASM 成员盘时，使用 ASM 逻辑路径代替普通 `SYSTEM.DBF` 路径：
+数据库文件位于离线 DMASM 成员盘时，先配置所有成员并列出 INODE 目录：
 
 ```text
 DMDUL> set asm_disk /dev/dmasm/ext4a,/dev/dmasm/ext4b,/dev/dmasm/norm4a,/dev/dmasm/norm4b,/dev/dmasm/ext32a;
-DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
 DMDUL> list asmfile;
 DMDUL> list datafile;
 DMDUL> bootstrap;
 ```
+
+设置 `asm_disk` 后会按数据库分组打印数据库名、字符集、页大小等基本信息，并用
+`list datafile` 样式列出每个数据库对应的 ASM DBF 路径集合。唯一的 `SYSTEM.DBF` 候选会
+自动设置；存在多个候选时，各库信息都会显示，但仍应执行
+`set system +GROUP/path/SYSTEM.DBF;` 明确活动数据库，再继续 `list datafile` 和 `bootstrap`。
+
+ASM 候选和各自完整 DBF 集合会分别写入 `dmdul_dict/asm_databases.tsv` 与
+`dmdul_dict/asm_datafiles.tsv`。多库环境切换 `set system` 后，前者的 `selected` 列会同步更新；
+重启、`load parameter` 和 bootstrap 重建字典目录后，两张清单仍会自动核对或恢复。切换到普通
+文件系统 `SYSTEM.DBF` 时不会删除 ASM 候选，只会把所有候选更新为 `selected=NO`。
 
 `list asmfile` 从 INODE 列出逻辑文件；`list datafile` 读取各 DBF 的第 0 页，恢复
 tablespace group、file id、页数和大小。后续 `unload` 仍使用同一套 storage root、

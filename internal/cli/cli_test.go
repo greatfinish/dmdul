@@ -99,6 +99,255 @@ func TestASMDisksPersistInInitDUL(t *testing.T) {
 	}
 }
 
+func TestSelectASMSystemCandidate(t *testing.T) {
+	candidates := []dm.RawASMFileInfo{
+		{Path: "+DATA1/DB1/SYSTEM.DBF"},
+		{Path: "+DATA2/DB2/SYSTEM.DBF"},
+	}
+
+	selected, auto := selectASMSystemCandidate(`+data2\db2\system.dbf`, candidates)
+	if selected != "+DATA2/DB2/SYSTEM.DBF" || auto {
+		t.Fatalf("explicit selection = %q, auto=%t", selected, auto)
+	}
+	selected, auto = selectASMSystemCandidate("", candidates[:1])
+	if selected != "+DATA1/DB1/SYSTEM.DBF" || !auto {
+		t.Fatalf("unique selection = %q, auto=%t", selected, auto)
+	}
+	selected, auto = selectASMSystemCandidate("", candidates)
+	if selected != "" || auto {
+		t.Fatalf("ambiguous selection = %q, auto=%t", selected, auto)
+	}
+	selected, auto = selectASMSystemCandidate("+OLD/DB/SYSTEM.DBF", candidates)
+	if selected != "" || auto {
+		t.Fatalf("stale selection = %q, auto=%t", selected, auto)
+	}
+}
+
+func TestPrintASMFilesDoesNotRequireSystemPath(t *testing.T) {
+	session := newInteractiveSession()
+	session.asmDisks = []string{"member.raw"}
+	session.asmStorage = &dm.RawASMStorage{}
+	var stdout bytes.Buffer
+
+	if err := session.printASMFiles(&stdout); err != nil {
+		t.Fatalf("list asmfile without system path: %v", err)
+	}
+	for _, want := range []string{
+		"asm files: 0", "SYSTEM.DBF candidates: 0", "system = (not selected; no SYSTEM.DBF found",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("list asmfile output missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestPrintASMSystemDiscovery(t *testing.T) {
+	var stdout bytes.Buffer
+	printASMSystemDiscovery(&stdout, asmSystemDiscovery{
+		Candidates:   []dm.RawASMFileInfo{{Path: "+DATA/DB/SYSTEM.DBF"}},
+		Selected:     "+DATA/DB/SYSTEM.DBF",
+		AutoSelected: true,
+	})
+	for _, want := range []string{"SYSTEM.DBF candidates: 1", "1. +DATA/DB/SYSTEM.DBF", "system = +DATA/DB/SYSTEM.DBF (auto-selected)"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("discovery output missing %q:\n%s", want, stdout.String())
+		}
+	}
+
+	stdout.Reset()
+	printASMSystemDiscovery(&stdout, asmSystemDiscovery{Candidates: []dm.RawASMFileInfo{
+		{Path: "+DATA1/DB1/SYSTEM.DBF"},
+		{Path: "+DATA2/DB2/SYSTEM.DBF"},
+	}})
+	for _, want := range []string{
+		"SYSTEM.DBF candidates: 2", "1. +DATA1/DB1/SYSTEM.DBF", "2. +DATA2/DB2/SYSTEM.DBF",
+		"system = (not selected; run set system <ASM path>)",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("ambiguous discovery output missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestPrintASMSystemDiscoveryShowsEveryDatabaseAndItsDataFiles(t *testing.T) {
+	db1System := "+DATA1/data/DB1/SYSTEM.DBF"
+	db2System := "+DATA2/data/DB2/SYSTEM.DBF"
+	var stdout bytes.Buffer
+	printASMSystemDiscovery(&stdout, asmSystemDiscovery{
+		Candidates: []dm.RawASMFileInfo{{Path: db1System}, {Path: db2System}},
+		Databases: []asmDatabaseDiscovery{
+			{
+				Candidate: dm.RawASMFileInfo{Path: db1System},
+				Metadata: dm.DatabaseMetadata{
+					DatabaseName: "DB1", DatabaseNameSrc: "DMASM path",
+					Charset: "UTF-8 (UNICODE_FLAG=1)", PageSize: 8192,
+					PageCount: 1024, ExtentSize: 16,
+				},
+				DataFiles: []dm.OfflineDataSource{
+					{GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: db1System, Reader: cliCopyReader{size: 8192 * 1024}},
+					{GroupID: 4, FileID: 0, Tablespace: "MAIN", Path: "+DATA1/data/DB1/MAIN.DBF", Reader: cliCopyReader{size: 8192 * 2048}},
+				},
+			},
+			{
+				Candidate: dm.RawASMFileInfo{Path: db2System},
+				Metadata: dm.DatabaseMetadata{
+					DatabaseName: "DB2", DatabaseNameSrc: "DMASM path",
+					Charset: "EUC-KR (UNICODE_FLAG=2)", PageSize: 32768,
+					PageCount: 512, ExtentSize: 64,
+				},
+				DataFiles: []dm.OfflineDataSource{
+					{GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: db2System, Reader: cliCopyReader{size: 32768 * 512}},
+					{GroupID: 6, FileID: 0, Tablespace: "TBS_APP", Path: "+APP/data/DB2/TBS_APP01.DBF", Reader: cliCopyReader{size: 32768 * 1024}},
+				},
+			},
+		},
+	})
+
+	output := stdout.String()
+	for _, want := range []string{
+		"SYSTEM.DBF candidates: 2", "database 1/2:", "database name: DB1 (DMASM path)",
+		"charset: UTF-8 (UNICODE_FLAG=1)", "page size: 8192 bytes", db1System,
+		"database 2/2:", "database name: DB2 (DMASM path)",
+		"charset: EUC-KR (UNICODE_FLAG=2)", "page size: 32768 bytes", db2System,
+		"+DATA1/data/DB1/MAIN.DBF", "+APP/data/DB2/TBS_APP01.DBF",
+		"GROUP", "TABLESPACE", "STATUS", "system = (not selected; run set system <ASM path>)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("multi-database discovery output missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Count(output, "data files: 2 (readable & page-aligned: 2)") != 2 {
+		t.Fatalf("each database must have an independent data-file summary:\n%s", output)
+	}
+}
+
+func TestPrintASMSystemDiscoveryContinuesAfterDamagedCandidate(t *testing.T) {
+	var stdout bytes.Buffer
+	printASMSystemDiscovery(&stdout, asmSystemDiscovery{
+		Candidates: []dm.RawASMFileInfo{
+			{Path: "+DATA/GOOD/SYSTEM.DBF"},
+			{Path: "+DATA/BROKEN/SYSTEM.DBF"},
+		},
+		Databases: []asmDatabaseDiscovery{
+			{
+				Candidate: dm.RawASMFileInfo{Path: "+DATA/GOOD/SYSTEM.DBF"},
+				Metadata:  dm.DatabaseMetadata{DatabaseName: "GOOD", DatabaseNameSrc: "DMASM path", Charset: "GB18030", PageSize: 8192},
+				DataFiles: []dm.OfflineDataSource{{GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: "+DATA/GOOD/SYSTEM.DBF", Reader: cliCopyReader{size: 8192}}},
+			},
+			{
+				Candidate: dm.RawASMFileInfo{Path: "+DATA/BROKEN/SYSTEM.DBF"},
+				Err:       fmt.Errorf("inspect SYSTEM.DBF: short read"),
+			},
+		},
+	})
+	output := stdout.String()
+	for _, want := range []string{
+		"database name: GOOD", "+DATA/GOOD/SYSTEM.DBF", "data files: 1",
+		"database name: BROKEN", "+DATA/BROKEN/SYSTEM.DBF",
+		"data files: unavailable (inspect SYSTEM.DBF: short read)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("damaged-candidate output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestPersistASMDiscoveryWritesCompleteMultiDatabaseCatalog(t *testing.T) {
+	workDir := t.TempDir()
+	session := newInteractiveSession()
+	t.Cleanup(session.closeLog)
+	session.dataDir = workDir
+	session.dataDirSet = true
+	session.asmDisks = []string{"disk-a.raw", "disk-b.raw"}
+	discovery := asmSystemDiscovery{
+		Candidates: []dm.RawASMFileInfo{
+			{Path: "+DATA/DB1/SYSTEM.DBF"},
+			{Path: "+DATA/DB2/SYSTEM.DBF"},
+		},
+		Selected: "+DATA/DB2/SYSTEM.DBF",
+		Databases: []asmDatabaseDiscovery{
+			{
+				Candidate:   dm.RawASMFileInfo{Path: "+DATA/DB1/SYSTEM.DBF"},
+				Metadata:    dm.DatabaseMetadata{DatabaseName: "DB1", DatabaseNameSrc: "DMASM path", Charset: "UTF-8", PageSize: 8192, PageCount: 1024, ExtentSize: 16},
+				ControlPath: "+DATA/DB1/dm.ctl",
+				DataFiles: []dm.OfflineDataSource{
+					{GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: "+DATA/DB1/SYSTEM.DBF", Reader: cliCopyReader{size: 8192 * 1024}},
+					{GroupID: 4, FileID: 0, Tablespace: "MAIN", Path: "+DATA/DB1/MAIN.DBF", Reader: cliCopyReader{size: 8192*2048 + 1}},
+				},
+			},
+			{
+				Candidate: dm.RawASMFileInfo{Path: "+DATA/DB2/SYSTEM.DBF"},
+				Metadata:  dm.DatabaseMetadata{DatabaseName: "DB2", DatabaseNameSrc: "DMASM path", Charset: "GB18030", PageSize: 32768, PageCount: 512, ExtentSize: 64},
+				DataFiles: []dm.OfflineDataSource{
+					{GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: "+DATA/DB2/SYSTEM.DBF", Reader: cliCopyReader{size: 32768 * 512}},
+				},
+			},
+		},
+	}
+	result, err := session.persistASMDiscovery(discovery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DatabaseCount != 2 || result.DataFileCount != 3 {
+		t.Fatalf("persist result = %+v", result)
+	}
+	catalog, _, err := dm.LoadASMCatalogFiles(session.effectiveDictionaryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Databases[0].Selected || !catalog.Databases[1].Selected {
+		t.Fatalf("selected database = %+v", catalog.Databases)
+	}
+	if catalog.Databases[0].ASMMembers != "disk-a.raw,disk-b.raw" || catalog.Databases[0].ControlPath != "+DATA/DB1/dm.ctl" {
+		t.Fatalf("database evidence = %+v", catalog.Databases[0])
+	}
+	if catalog.DataFiles[1].Status != "SIZE?" {
+		t.Fatalf("misaligned data file was not persisted: %+v", catalog.DataFiles)
+	}
+}
+
+func TestClearPersistedASMSelectionKeepsAllCandidatesAndDataFiles(t *testing.T) {
+	workDir := t.TempDir()
+	session := newInteractiveSession()
+	t.Cleanup(session.closeLog)
+	session.dataDir = workDir
+	session.dataDirSet = true
+	session.asmDisks = []string{"disk-a.raw", "disk-b.raw"}
+	catalog := &dm.ASMCatalog{
+		Databases: []dm.ASMCatalogDatabase{
+			{CandidateNo: 1, Selected: true, DatabaseName: "DB1", SystemPath: "+DATA1/DB1/SYSTEM.DBF"},
+			{CandidateNo: 2, DatabaseName: "DB2", SystemPath: "+DATA2/DB2/SYSTEM.DBF"},
+		},
+		DataFiles: []dm.ASMCatalogDataFile{
+			{CandidateNo: 1, DatabaseName: "DB1", SystemPath: "+DATA1/DB1/SYSTEM.DBF", Path: "+DATA1/DB1/SYSTEM.DBF"},
+			{CandidateNo: 1, DatabaseName: "DB1", SystemPath: "+DATA1/DB1/SYSTEM.DBF", Path: "+DATA1/DB1/MAIN.DBF"},
+			{CandidateNo: 2, DatabaseName: "DB2", SystemPath: "+DATA2/DB2/SYSTEM.DBF", Path: "+DATA2/DB2/SYSTEM.DBF"},
+		},
+	}
+	if _, err := dm.WriteASMCatalogFiles(session.effectiveDictionaryDir(), catalog); err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.clearPersistedASMSelection()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DatabaseCount != 2 || result.DataFileCount != 3 {
+		t.Fatalf("clear result = %+v", result)
+	}
+	loaded, _, err := dm.LoadASMCatalogFiles(session.effectiveDictionaryDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, database := range loaded.Databases {
+		if database.Selected {
+			t.Fatalf("selection was not cleared: %+v", loaded.Databases)
+		}
+	}
+	if len(loaded.Databases) != 2 || len(loaded.DataFiles) != 3 {
+		t.Fatalf("catalog rows were lost: databases=%d data_files=%d", len(loaded.Databases), len(loaded.DataFiles))
+	}
+}
+
 func TestInteractiveOutputDirDefaultsToDedicatedSubdirectory(t *testing.T) {
 	session := newInteractiveSession()
 	currentDir, err := os.Getwd()

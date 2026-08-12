@@ -43,7 +43,6 @@ storage page plan、数据页和 LOB 解析器。整个过程不生成中间 DBF
 sudo ./dmdul
 
 DMDUL> set asm_disk /dev/dmasm/ext4a,/dev/dmasm/ext4b,/dev/dmasm/norm4a,/dev/dmasm/norm4b,/dev/dmasm/ext32a;
-DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
 DMDUL> list asmfile;
 DMDUL> list datafile;
 DMDUL> bootstrap;
@@ -59,7 +58,7 @@ VMware `monolithicFlat` 的 `*-flat.vmdk` 就是成员盘的原始字节，可�
 
 ```text
 DMDUL> set asm_disk C:\snapshot\ext4a-flat.vmdk,C:\snapshot\ext4b-flat.vmdk,C:\snapshot\norm4a-flat.vmdk,C:\snapshot\norm4b-flat.vmdk,C:\snapshot\ext32a-flat.vmdk;
-DMDUL> set system +NORM4/data/MIRRORDB/SYSTEM.DBF;
+DMDUL> list asmfile;
 DMDUL> list datafile;
 DMDUL> bootstrap;
 ```
@@ -67,8 +66,24 @@ DMDUL> bootstrap;
 不要把 VMDK descriptor 文件本身作为成员盘。应传入 descriptor 中 `FLAT` 行引用的
 `*-flat.vmdk`。其他虚拟磁盘类型需要先确认其逻辑扇区表示方式。
 
-`asm_disk` 和 ASM 逻辑 `system` 路径会写入 `init.dul`。`list asmfile` 列出 INODE 目录，
-`list datafile` 读取每个 DBF 的第 0 页并显示 tablespace、group/file、页数和对齐状态。
+`set asm_disk` 后会立即从 INODE 目录发现 `SYSTEM.DBF`。每个候选都会显示数据库名、字符集、
+页大小、页数、簇大小、大小写标志，并按 `list datafile` 的格式列出同库全部 ASM DBF 路径。
+唯一候选会自动设为活动 `system` 并写入 `init.dul`；存在多个数据库时会同时显示全部数据库和
+各自文件集，但不会自动选择，需执行 `set system <ASM path>;`。`list asmfile` 本身不再依赖
+`set system`，可以随时列出所有已配置磁盘组的 INODE 目录和上述数据库摘要；`list datafile`
+则只显示当前活动数据库的 tablespace、group/file、页数和对齐状态。
+
+完整发现证据会落到 `dmdul_dict/asm_databases.tsv` 和 `asm_datafiles.tsv`。前者按候选记录
+数据库基本信息和 `selected` 状态，后者通过 `candidate_no` 与 `system_path` 关联每个数据库的
+全部 DBF。唯一候选为 `selected=YES`；多候选初始均为 `NO`，执行
+`set system +GROUP/path/SYSTEM.DBF;` 后只将对应候选改为 `YES`。bootstrap 替换字典目录后会
+重新写入这两张 TSV，避免 ASM 文件集证据丢失。重启或 `load parameter;` 会重新核对，切换到
+文件系统 `SYSTEM.DBF` 时保留全部 ASM 候选和文件行，仅将 `selected` 清为 `NO`。
+
+多数据库文件归属以各库 ASM `dm.ctl` 中的精确路径为主，同组同目录 DBF 作为补充；只有目录
+后缀在所有 `SYSTEM.DBF` 候选中唯一时，才允许跨磁盘组按目录补充。这样即使两个库都使用
+`data/DAMENG`，也不会把另一数据库的 MAIN 或用户表空间写进当前候选集合。`dm.ctl` 仍只是
+核对证据；缺失或损坏时不会阻断发现，而是降级为上述受限的目录/磁盘组规则。
 
 bootstrap 还会把字典中各表的 `group_id/root_file` 与实际输入的 DBF 身份逐项核对。输入
 不完整时会输出类似下面的诊断，并以 `SUCCESS_WITH_WARNINGS` 结束：

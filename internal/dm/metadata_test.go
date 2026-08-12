@@ -1,11 +1,22 @@
 package dm
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+type metadataReadTracker struct {
+	reader  *bytes.Reader
+	offsets []int64
+}
+
+func (r *metadataReadTracker) ReadAt(p []byte, off int64) (int, error) {
+	r.offsets = append(r.offsets, off)
+	return r.reader.ReadAt(p, off)
+}
 
 func TestDefaultDatabaseMetadataUsesDminitDefaults(t *testing.T) {
 	meta := DefaultDatabaseMetadata()
@@ -62,6 +73,84 @@ func TestInspectDatabaseMetadataCombinesSystemControlAndIni(t *testing.T) {
 	}
 	if meta.CaseSensitive || !meta.HasCaseSensitive {
 		t.Fatalf("case-sensitive metadata = %+v", meta)
+	}
+}
+
+func TestInspectDatabaseHeaderMetadataFromReaderUsesOnlyHeaderAndControlFlags(t *testing.T) {
+	const pageSize = uint32(8192)
+	const pageCount = uint32(7)
+	raw := make([]byte, int(pageSize*pageCount))
+	binary.LittleEndian.PutUint32(raw[systemExtentSizeOffset:], 32)
+	binary.LittleEndian.PutUint32(raw[systemPageSizeOffset:], pageSize)
+	binary.LittleEndian.PutUint32(raw[systemPageCountOffset:], pageCount)
+	raw[int(pageSize)*systemControlPage4No+systemCaseSensitiveFlagOffset] = 0
+	raw[int(pageSize)*systemControlPage4No+systemUnicodeFlagOffset] = 1
+	reader := &metadataReadTracker{reader: bytes.NewReader(raw)}
+
+	meta, err := InspectDatabaseHeaderMetadataFromReader(
+		"+DATA/DB1/SYSTEM.DBF", reader, int64(len(raw)), "auto",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.PageSize != pageSize || meta.PageCount != pageCount || meta.ExtentSize != 32 {
+		t.Fatalf("storage metadata = %+v", meta)
+	}
+	if meta.Charset != "UTF-8 (UNICODE_FLAG=1)" || meta.CaseSensitive {
+		t.Fatalf("persistent flags = %+v", meta)
+	}
+	wantOffsets := []int64{
+		0,
+		int64(pageSize)*systemControlPage4No + systemUnicodeFlagOffset,
+		int64(pageSize)*systemControlPage4No + systemCaseSensitiveFlagOffset,
+	}
+	if len(reader.offsets) != len(wantOffsets) {
+		t.Fatalf("ReadAt offsets = %v, want %v", reader.offsets, wantOffsets)
+	}
+	for index := range wantOffsets {
+		if reader.offsets[index] != wantOffsets[index] {
+			t.Fatalf("ReadAt offsets = %v, want %v", reader.offsets, wantOffsets)
+		}
+	}
+}
+
+func TestInspectControlDatabaseNameFromReader(t *testing.T) {
+	raw := make([]byte, 0x84)
+	binary.LittleEndian.PutUint32(raw, 4096)
+	copy(raw[4:], []byte("ASM_DB\x00"))
+	name, err := InspectControlDatabaseNameFromReader(bytes.NewReader(raw), int64(len(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name != "ASM_DB" {
+		t.Fatalf("database name = %q", name)
+	}
+	if _, err := InspectControlDatabaseNameFromReader(bytes.NewReader(raw[:7]), 7); err == nil {
+		t.Fatal("short dm.ctl must be rejected")
+	}
+}
+
+func TestInspectControlFileFromReaderRecoversASMDataFilePaths(t *testing.T) {
+	raw := make([]byte, 0x200)
+	binary.LittleEndian.PutUint32(raw, 4096)
+	copy(raw[4:], []byte("ASM_DB\x00"))
+	const nameOffset = 0x106
+	binary.LittleEndian.PutUint32(raw[nameOffset-6:], 5)
+	copy(raw[nameOffset:], []byte("TBS_APP\x00"))
+	copy(raw[0x120:], []byte("+APP/data/ASM_DB/TBS_APP01.DBF\x00"))
+
+	info, err := InspectControlFileFromReader(bytes.NewReader(raw), int64(len(raw)), "+DATA/data/ASM_DB/dm.ctl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.DatabaseName != "ASM_DB" || info.Path != "+DATA/data/ASM_DB/dm.ctl" || info.Size != int64(len(raw)) {
+		t.Fatalf("control info = %+v", info)
+	}
+	if len(info.Entries) != 1 || info.Entries[0].ID != 5 || info.Entries[0].Name != "TBS_APP" || len(info.Entries[0].Paths) != 1 {
+		t.Fatalf("control entries = %+v", info.Entries)
+	}
+	if info.Entries[0].Paths[0].Value != "+APP/data/ASM_DB/TBS_APP01.DBF" {
+		t.Fatalf("control path = %+v", info.Entries[0].Paths)
 	}
 }
 

@@ -1,7 +1,7 @@
 # 达梦离线恢复标准流程
 
-本文是 dmdul 的作业手册：从拿到一堆 DBF 文件，到把数据落回一个可查询的达梦实例，
-每一步该做什么、该看什么、什么情况下必须停下来。
+本文是 dmdul 的作业手册：从拿到普通文件系统 DBF 或离线 DMASM 成员裸盘，到把数据落回
+一个可查询的达梦实例。每一步都说明该做什么、该核对什么、什么情况下必须停下来。
 
 所有命令都在 dmdul 交互界面里执行（提示符 `DMDUL>`），回灌命令在操作系统 shell 里执行。
 
@@ -17,7 +17,18 @@
 3. **不要直接往生产库回灌。** 所有导出的 DDL 和数据必须先在隔离测试库验证通过。
 4. **确认这确实是最后手段。** DMRMAN 备份、归档恢复、闪回、`dexp` 逻辑导出都优先于 dmdul。
 
-## 1. 取一致性离线文件
+## 1. 获取同一时间点的离线输入
+
+dmdul 支持两条输入路径，开始前必须先确定使用哪一条：
+
+| 输入路径 | 必需输入 | `dm.ctl` 的角色 |
+| --- | --- | --- |
+| 文件系统 DBF | `SYSTEM.DBF` 和目标表涉及的全部用户表空间 DBF | 可选核对；数据文件页头和离线副本优先 |
+| DMASM 裸盘 | 承载目标数据库 DBF 的全部相关磁盘组成员盘 | 从 ASM 目录中自动发现，缺失时按受限规则降级 |
+
+不要把不同时间点、不同数据库或不同快照链的文件混在同一个恢复任务里。
+
+### 1.1 文件系统 DBF
 
 **首选：停库后复制。**
 
@@ -38,8 +49,8 @@ CHECKPOINT(100);
 cp /dmdata/DAMENG/*.DBF /dmdata/DAMENG/dm.ctl /recover/snap/
 ```
 
-checkpoint 把脏页刷盘，但复制期间仍可能有新写入落到已复制的文件上，一致性弱于停库。
-用这条路径时，务必在第 9 步做全量比对而不是抽样。
+checkpoint 把脏页刷盘，但复制期间仍可能发生新写入，因此普通逐文件复制不能构成严格的一致性
+快照。一致性弱于停库，使用这条路径时务必在第 9 步扩大比对范围。
 
 **最差（文件已损坏/实例起不来）：直接复制现有文件。** 此时一致性已经无从谈起，
 按第 3 步的 `check pages` 结果评估可恢复范围。
@@ -55,7 +66,29 @@ checkpoint 把脏页刷盘，但复制期间仍可能有新写入落到已复制
 | `dm.ini` | 否 | 页大小等参数参考 |
 | `ROLL.DBF` / `TEMP.DBF` | 否 | 回滚段/临时段，dmdul 不使用 |
 
-## 2. 建立恢复目录
+### 1.2 DMASM 成员裸盘
+
+DMDSC/DMASM 环境应停止所有可能写盘的数据库和 ASM 节点，再复制裸设备或创建存储一致性
+快照。NORMAL/HIGH 冗余并不能抵消跨时间点采集：同一个 extent 的不同副本如果来自不同时间，
+读取成功也不代表内容一致。
+
+必须满足：
+
+- 所有成员盘来自同一时间点；
+- 提供承载 SYSTEM、MAIN 和目标用户表空间 DBF 的全部相关磁盘组；
+- 尽量保留同一冗余组的全部可用成员，便于副本校验和坏副本切换；
+- Linux 使用裸设备或其只读镜像；VMware `monolithicFlat` 使用实际数据区 `*-flat.vmdk`；
+- 不要传只有描述信息的 `.vmdk` 文件，也不要混用基础盘与不同时间点的 delta 快照。
+
+dmdul 会直接恢复 DMASM 目录、INODE、AU 描述符、副本和条带映射，不要求先启动 DMASMSVR，
+也不要求先执行 `asmcmd cp`。
+
+## 2. 建立独立恢复目录并选择输入
+
+每个离线快照使用一个新的可写工作目录。`init.dul`、`control.dul`、`dul.log`、`dmdul_dict/`
+和 `output/` 都留在这个目录，避免旧字典被另一个数据库或快照误用。
+
+### 2.1 文件系统 DBF
 
 把 dmdul 可执行文件和离线文件放在同一个目录，启动后无需任何 `set` 即可 bootstrap：
 
@@ -83,12 +116,72 @@ DMDUL> set output_dir /recover/out;
 > `data_dir` 里的同名文件优先于 `dm.ctl` 记录的绝对路径。这一条很关键：与原库同机恢复时，
 > `dm.ctl` 存的是 `/dmdata/DAMENG/...`，如果跟随它就会读到线上原文件而不是你的离线副本。
 
-## 3. 预检
+### 2.2 DMASM 裸盘
 
-**先确认文件都被认出来了**，不需要先 bootstrap：
+先启动 dmdul，设置可写工作目录，再一次配置所有同一时点的成员盘：
+
+```text
+DMDUL> set data_dir /recover/asm-work;
+DMDUL> set output_dir /recover/asm-work/output;
+DMDUL> set asm_disk /snapshot/data01.raw,/snapshot/data02.raw,/snapshot/fra01.raw;
+```
+
+`set asm_disk` 会立即扫描全部磁盘组的 INODE 目录，并按数据库打印：
+
+- 数据库名、字符集、页大小、页数、簇大小和大小写敏感标志；
+- ASM `SYSTEM.DBF` 与可选 `dm.ctl` 路径；
+- SYSTEM、MAIN、ROLL、TEMP 和用户表空间 DBF 的 group/file、页数、大小、状态及 ASM 路径。
+
+只有一个 `SYSTEM.DBF` 候选时，工具自动把它设为活动 `system`。存在多个候选时不会根据
+数据库名或目录猜测，必须从输出中选择目标库：
+
+```text
+DMDUL> set system +DATA/data/DMDB/SYSTEM.DBF;
+```
+
+发现结果在 bootstrap 前就写入：
+
+| 文件 | 内容 |
+| --- | --- |
+| `dmdul_dict/asm_databases.tsv` | 每个数据库候选的身份、参数、SYSTEM/dm.ctl 路径、成员盘和 `selected` 状态 |
+| `dmdul_dict/asm_datafiles.tsv` | 以 `candidate_no + system_path` 关联的完整 DBF 集合及状态 |
+
+多库环境切换 `set system` 时，`selected` 会同步更新。重启和 `load parameter;` 会按
+`init.dul` 重新扫描成员盘并核对目录；切换到文件系统 `SYSTEM.DBF` 时，候选证据仍保留，
+但所有 ASM 候选都会改为 `selected=NO`。
+
+需要把 ASM 逻辑文件交给其他工具或保存独立证据时，可以先物化为普通 DBF：
+
+```text
+DMDUL> cp datafile /recover/dbf-copy;
+```
+
+复制并非 bootstrap/unload 的前置条件。复制完成后若改走文件系统路径，应显式切换：
+
+```text
+DMDUL> set data_dir /recover/dbf-copy;
+DMDUL> set system /recover/dbf-copy/SYSTEM.DBF;
+```
+
+## 3. 预检数据库身份与文件集
+
+文件系统输入直接列出数据文件：
 
 ```text
 DMDUL> list datafile;
+```
+
+DMASM 输入先查看全部目录和候选数据库。`list asmfile` 不要求预先设置 `system`：
+
+```text
+DMDUL> list asmfile;
+```
+
+如果有多个候选，先执行 `set system <ASM path>;`，再只查看目标数据库的文件集：
+
+```text
+DMDUL> list datafile;
+DMDUL> show parameter;
 ```
 
 逐列检查：
@@ -97,12 +190,22 @@ DMDUL> list datafile;
   （被截断，或页大小判断错了）。
 - 表空间清单和你预期的一致，没有缺文件。
 - `pages` × 页大小 = 文件实际大小。
+- group/file 身份没有异常重复，路径确实指向本次离线副本或目标 ASM 逻辑文件。
+- ASM 多库场景中，`asm_databases.tsv` 只有目标候选为 `selected=YES`，且
+  `asm_datafiles.tsv` 中每行的 `system_path` 都属于该候选。
 
-**再评估损坏程度**（文件可疑时执行，干净库可跳过）：
+数据库名相同不足以证明文件属于同一个库。至少同时核对 SYSTEM 路径、页大小、字符集、
+group/file、表空间和文件状态。任一关键文件缺失、候选未选择或身份冲突时都应停止。
+
+**再评估损坏程度**（文件系统 DBF 可疑时执行，干净库可跳过）：
 
 ```text
 DMDUL> check pages;
 ```
+
+当前 `check pages` 只扫描文件系统 `data_dir`，不直接遍历 DMASM 逻辑文件。ASM 输入如需全页
+诊断，先执行 `cp datafile <directory>;`，再切换 `data_dir` 和文件系统 `SYSTEM.DBF` 后运行。
+ASM 直读路径仍会在 `list datafile` 和 bootstrap 中核对文件头、group/file 与缺失文件。
 
 坏页坐标格式 `page(tablespace,file,page)` 与官方 dmdbchk 一致，可交叉核对。
 字典可用时还会把坏页归属到 `owner.table`，并检测 B 树叶链断裂。
@@ -116,11 +219,11 @@ DMDUL> bootstrap;
 
 这是整个流程的地基，看三处：
 
-1. `[BOOTSTRAP] phase=metadata status=OK` —— 页大小、字符集、大小写敏感必须正确。
+1. `[bootstrap] phase=metadata status=OK` —— 页大小、字符集、大小写敏感必须正确。
    字符集错了所有中文都是乱码；大小写敏感错了 DDL 里的标识符引号会错。
-2. `[BOOTSTRAP] stage=1 phase=validate name=core-catalog status=OK` —— 核心目录通过，
+2. `[bootstrap] stage=1 phase=validate name=core-catalog status=OK` —— 核心目录通过，
    说明 SYSOBJECTS/SYSINDEXES 读出来了。
-3. `[BOOTSTRAP] phase=complete status=SUCCESS mode=standard-two-stage` ——
+3. `[bootstrap] phase=complete status=SUCCESS mode=standard-two-stage` ——
    `mode` 是 `standard-two-stage` 才是正常路径；出现 fallback 模式说明字典有损，
    后续结果要加倍怀疑。
 
@@ -132,6 +235,16 @@ DMDUL> load dictionary;
 
 字典明显有错时可以手工修 `dmdul_dict/*.tsv` 再 `load dictionary`，但这是专家操作，
 改错了会让恢复结果静默错乱。
+
+ASM 模式下，bootstrap 会原子重建完整字典目录，再把 `asm_databases.tsv` 和
+`asm_datafiles.tsv` 写回新目录，因此 bootstrap 前采集的候选和文件集证据不会丢失。
+
+如果工作目录里已经有旧 `dmdul_dict`：
+
+- 要从当前 SYSTEM 重新恢复字典，先执行 `bootstrap;`；不要在此之前运行会自动加载字典的
+  `list` 或 `unload`；
+- 只有明确复用已审核字典时才跳过 bootstrap 并执行 `load dictionary;`；
+- 自动加载会核对 SYSTEM 路径、页大小和页数，但最稳妥的做法仍是每个快照使用独立工作目录。
 
 ## 5. 盘点对象
 
@@ -169,7 +282,9 @@ DMDUL> describe <owner>.<table>;
 
 ```text
 DMDUL> unload table <owner>.<table>;     -- 单表
+DMDUL> unload object <owner>;            -- 用户拥有的对象 DDL
 DMDUL> unload user <owner>;              -- 用户级
+DMDUL> unload schema <schema>;           -- 模式级
 DMDUL> unload database;                  -- 整库
 DMDUL> recover table <owner>.<table>;    -- DELETE/DROP/TRUNCATE 后的残留数据
 ```
@@ -292,6 +407,10 @@ FROM <src_owner>.<table> a, RECOVER_V.<table> b WHERE a.id = b.id;
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
+| `set asm_disk` 没有发现 SYSTEM 候选 | 成员盘不完整、传入 VMDK descriptor、磁盘组不可识别或权限不足 | 核对全部同一时点成员盘；VMware 改用 `*-flat.vmdk` |
+| ASM 显示多个数据库，bootstrap 无法继续 | 目标数据库尚未选择 | 核对每个候选文件集后执行 `set system +GROUP/.../SYSTEM.DBF;` |
+| ASM 候选里混入另一数据库的 DBF | 旧版本按相同目录后缀跨库归属 | 使用 v0.7.2+ 重新扫描，核对两张 ASM TSV 和各库 `dm.ctl` 路径 |
+| 启动后显示了旧库对象 | 同一工作目录残留了以前的完整 `dmdul_dict`，命令触发自动加载 | 为当前快照换独立目录，或在任何 `list`/`unload` 前先执行 `bootstrap;` |
 | 全部中文乱码 | 字符集判断错 | `set charset gb18030;` 后重新 bootstrap |
 | `check pages` 报 0 坏页但数据明显有问题 | 读到了线上原文件而不是离线副本 | 确认 `list datafile` 里的 path 指向恢复目录 |
 | DDL 建表失败：模式不存在 | 多模式用户，`CREATE SCHEMA` 被跳过或漏了 `/` | 用 v0.6.3+ 重新导出 DDL |

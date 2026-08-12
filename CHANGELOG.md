@@ -12,7 +12,37 @@ v主版本.次版本.修订版本
 
 ------
 
-## 未发布
+## v0.7.2 - DMASM Multi-Database Discovery
+
+### Added
+
+- `set asm_disk` 现在直接扫描全部已配置磁盘组的 INODE 目录并发现 `SYSTEM.DBF`。每个候选
+  都按数据库分组显示数据库名、字符集、页大小、页数、簇大小、大小写标志，以及与该库对应的
+  ASM 数据文件路径表；同一磁盘集合包含多个数据库时会全部展示。
+- 唯一的 `SYSTEM.DBF` 候选自动设为活动 `system` 并持久化到 `init.dul`；存在多个数据库时
+  只展示和核对，不自动猜测活动数据库，仍要求用户执行 `set system <ASM path>;`。
+- ASM 数据库发现结果会持久化到 `dmdul_dict/asm_databases.tsv` 和
+  `dmdul_dict/asm_datafiles.tsv`。前者保存候选数据库身份、参数与当前选择状态，后者按候选关联
+  保存每个数据库的完整 DBF 集合；启动、`load parameter`、`set system` 切换和 bootstrap
+  字典重建都会同步刷新。切换到文件系统 `SYSTEM.DBF` 时仅清除 ASM `selected` 标记，不删除候选证据。
+
+### Changed
+
+- `list asmfile` 不再要求先执行 `set system`，可在 bootstrap 前独立列出 ASM 文件目录和
+  `SYSTEM.DBF` 候选；`list datafile` 也会在唯一候选尚未选择时自动完成选择。
+- 多库 ASM 数据文件归属优先采用各库 `dm.ctl` 中的精确 ASM 路径；目录后缀仅在唯一候选时
+  跨磁盘组回退，避免两个数据库使用相同 `data/DAMENG` 目录时串库；`dm.ctl` 缺失或损坏时
+  按受限目录/磁盘组规则安全降级，不会阻断裸盘发现。
+
+### Documentation
+
+- README 推荐恢复流程和标准恢复作业手册改为“文件系统 DBF / DMASM 成员裸盘”双入口，补充
+  一致性快照、唯一/多候选选择、ASM 目录证据、旧字典隔离、预检和 bootstrap 顺序。
+
+### Tests
+
+- 新增 ASM SYSTEM 候选自动选择与多候选拒绝猜测、候选数据库/数据文件 TSV 原子持久化、
+  bootstrap 字典目录替换后目录证据保留、文件系统切换清除选择状态，以及多库同目录隔离测试。
 
 ------
 

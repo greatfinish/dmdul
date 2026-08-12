@@ -172,6 +172,35 @@ func TestRebuildDictionaryFilesArchivesPreviousDirectory(t *testing.T) {
 	}
 }
 
+func TestRebuildDictionaryFilesReplacesASMCatalogOnlyDirectoryWithoutBackup(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DefaultDictionaryDirName)
+	catalog := &ASMCatalog{
+		Databases: []ASMCatalogDatabase{{
+			CandidateNo: 1, Selected: true, DatabaseName: "ASM_DB",
+			SystemPath: "+DATA/ASM_DB/SYSTEM.DBF", PageSize: 8192, Status: "OK",
+		}},
+	}
+	if _, err := WriteASMCatalogFiles(dir, catalog); err != nil {
+		t.Fatalf("write ASM-only catalog: %v", err)
+	}
+	result, backupDir, err := RebuildDictionaryFiles(dir, &DictionaryInfo{
+		Source: "SYSTEM.DBF", SystemPath: "+DATA/ASM_DB/SYSTEM.DBF",
+		ObjectCount: 1, Users: []DictionaryUser{{ID: 1, Name: "APP"}},
+	})
+	if err != nil {
+		t.Fatalf("rebuild dictionary over ASM-only catalog: %v", err)
+	}
+	if result.Dir != dir || backupDir != "" {
+		t.Fatalf("result=%+v backup=%q, want no backup for catalog-only directory", result, backupDir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "meta.tsv")); err != nil {
+		t.Fatalf("rebuilt dictionary missing meta.tsv: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ASMDatabaseCatalogFileName)); !os.IsNotExist(err) {
+		t.Fatalf("ASM catalog should be refreshed explicitly after rebuild: %v", err)
+	}
+}
+
 func TestLoadDictionaryFilesAcceptsUTF8BOMHeaders(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), DefaultDictionaryDirName)
 	if err := os.MkdirAll(dir, 0755); err != nil {
