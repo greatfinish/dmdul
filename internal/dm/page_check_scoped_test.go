@@ -39,6 +39,44 @@ func TestPageAttributionByStorageAndSegment(t *testing.T) {
 	}
 }
 
+func TestPageAttributionEvidenceAndAmbiguity(t *testing.T) {
+	dict := &DictionaryInfo{Tables: []DictionaryTable{
+		{ID: 10, Owner: "APP", Name: "T1", Tablespace: "MAIN", StorageID: 100,
+			AssistIDs: []uint32{101, 999}, GroupID: 4, HeaderFile: 0, HeaderBlock: 16, Blocks: 16, Bytes: 131072},
+		{ID: 11, Owner: "APP", Name: "T2", Tablespace: "MAIN", StorageID: 200,
+			AssistIDs: []uint32{999}, GroupID: 4, HeaderFile: 0, HeaderBlock: 64, Blocks: 16, Bytes: 131072},
+	}}
+	a := newPageAttribution(dict)
+
+	primary := BadPage{GroupID: 4, FileID: 0, PageNo: 20, StorageID: 100}
+	a.apply(&primary)
+	if primary.ObjectType != PageObjectTable || primary.Attribution != PageAttributionStorageID ||
+		primary.AttributionConfidence != PageAttributionHigh || primary.TableID != 10 {
+		t.Fatalf("unexpected primary attribution: %+v", primary)
+	}
+
+	assist := BadPage{GroupID: 4, FileID: 0, PageNo: 200, StorageID: 101}
+	a.apply(&assist)
+	if assist.ObjectType != PageObjectTableAssist || assist.Attribution != PageAttributionAssistStorageID ||
+		assist.ObjectStorageID != 101 {
+		t.Fatalf("unexpected assist attribution: %+v", assist)
+	}
+
+	segment := BadPage{GroupID: 4, FileID: 0, PageNo: 22, StorageID: 0}
+	a.apply(&segment)
+	if segment.ObjectType != PageObjectTable || segment.Attribution != PageAttributionSegmentRange ||
+		segment.AttributionConfidence != PageAttributionMedium {
+		t.Fatalf("unexpected segment attribution: %+v", segment)
+	}
+
+	ambiguous := BadPage{GroupID: 9, FileID: 0, PageNo: 1, StorageID: 999}
+	a.apply(&ambiguous)
+	if ambiguous.Owner != "" || ambiguous.UnattributedReason != "ambiguous_storage_id" ||
+		ambiguous.AttributionConfidence != PageAttributionNo {
+		t.Fatalf("ambiguous storage must remain unattributed: %+v", ambiguous)
+	}
+}
+
 func TestIsLeafChainBreakReasonExcludesRootIssues(t *testing.T) {
 	rootIssues := []string{
 		"storage root metadata is incomplete",

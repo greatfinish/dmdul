@@ -53,7 +53,7 @@ checkpoint 把脏页刷盘，但复制期间仍可能发生新写入，因此普
 快照。一致性弱于停库，使用这条路径时务必在第 9 步扩大比对范围。
 
 **最差（文件已损坏/实例起不来）：直接复制现有文件。** 此时一致性已经无从谈起，
-按第 3 步的 `check pages` 结果评估可恢复范围。
+先看 bootstrap 自动 SYSTEM 预检，再按第 4 步的第二阶段 `check pages` 评估可恢复范围。
 
 必须复制的文件：
 
@@ -197,19 +197,8 @@ DMDUL> show parameter;
 数据库名相同不足以证明文件属于同一个库。至少同时核对 SYSTEM 路径、页大小、字符集、
 group/file、表空间和文件状态。任一关键文件缺失、候选未选择或身份冲突时都应停止。
 
-**再评估损坏程度**（文件系统 DBF 可疑时执行，干净库可跳过）：
-
-```text
-DMDUL> check pages;
-```
-
-当前 `check pages` 只扫描文件系统 `data_dir`，不直接遍历 DMASM 逻辑文件。ASM 输入如需全页
-诊断，先执行 `cp datafile <directory>;`，再切换 `data_dir` 和文件系统 `SYSTEM.DBF` 后运行。
-ASM 直读路径仍会在 `list datafile` 和 bootstrap 中核对文件头、group/file 与缺失文件。
-
-坏页坐标格式 `page(tablespace,file,page)` 与官方 dmdbchk 一致，可交叉核对。
-字典可用时还会把坏页归属到 `owner.table`，并检测 B 树叶链断裂。
-坏页落在业务表上就意味着那张表会有数据丢失，提前知道比事后发现好。
+不需要在这里额外执行 `check pages SYSTEM.DBF;`。下一步的 bootstrap 会自动完成同等的
+SYSTEM 纯物理预检，避免用户重复输入命令。
 
 ## 4. bootstrap 重建字典
 
@@ -217,15 +206,33 @@ ASM 直读路径仍会在 `list datafile` 和 bootstrap 中核对文件头、gro
 DMDUL> bootstrap;
 ```
 
-这是整个流程的地基，看三处：
+这是整个流程的地基，看四处：
 
 1. `[bootstrap] phase=metadata status=OK` —— 页大小、字符集、大小写敏感必须正确。
    字符集错了所有中文都是乱码；大小写敏感错了 DDL 里的标识符引号会错。
-2. `[bootstrap] stage=1 phase=validate name=core-catalog status=OK` —— 核心目录通过，
+2. `[bootstrap] phase=precheck name=SYSTEM.DBF status=OK mode=physical-only` —— bootstrap
+   已在读取字典前扫描完整 SYSTEM.DBF。它检查文件对齐、页头、PAGE_CHECK 和数据页结构，
+   同时支持文件系统和 DMASM 逻辑 SYSTEM 文件。
+3. `[bootstrap] stage=1 phase=validate name=core-catalog status=OK` —— 核心目录通过，
    说明 SYSOBJECTS/SYSINDEXES 读出来了。
-3. `[bootstrap] phase=complete status=SUCCESS mode=standard-two-stage` ——
+4. `[bootstrap] phase=complete status=SUCCESS mode=standard-two-stage` ——
    `mode` 是 `standard-two-stage` 才是正常路径；出现 fallback 模式说明字典有损，
    后续结果要加倍怀疑。
+
+SYSTEM 预检发现坏页时不会立即终止恢复。bootstrap 会继续尝试解析可读字典，并以
+`SUCCESS_WITH_WARNINGS` 结束；控制台同时提示执行第二阶段 `check pages;`。
+
+根据第一阶段结果选择下一步：
+
+| bootstrap 结果 | 后续操作 |
+| --- | --- |
+| SYSTEM 预检和字典恢复均正常，且只恢复少量明确表 | 检查 `dmdul_dict` 和 `describe` 结果后可以直接卸载 |
+| SYSTEM 预检出现告警，但字典仍可恢复 | 先审核字典，再执行全库或指定 DBF 的 `check pages` |
+| 字典进入 fallback、文件缺失或身份冲突 | 不直接开始整库卸载；先补齐文件并执行 `check pages` 收集物理证据 |
+| bootstrap 无法建立字典 | 可执行无归属的纯物理 `check pages`；修复或人工重建字典后再做对象归属 |
+
+这里的顺序是硬性约束：从当前快照恢复对象归属时，必须先 `bootstrap` 或显式
+`load dictionary`，再执行第二阶段对象归属检查。纯物理扫描本身不受此限制。
 
 字典落盘在 `dmdul_dict/`，是纯文本 TSV。后续会话可以直接：
 
@@ -245,6 +252,44 @@ ASM 模式下，bootstrap 会原子重建完整字典目录，再把 `asm_databa
   `list` 或 `unload`；
 - 只有明确复用已审核字典时才跳过 bootstrap 并执行 `load dictionary;`；
 - 自动加载会核对 SYSTEM 路径、页大小和页数，但最稳妥的做法仍是每个快照使用独立工作目录。
+
+### 第二阶段：按需检查全部数据文件
+
+以下任一条件成立时，在 bootstrap 成功后执行：
+
+- SYSTEM 自动预检出现 `WARNING`；
+- bootstrap 使用 fallback 或报告缺失数据文件；
+- 要恢复整个数据库、用户或模式；
+- DBF 来源、存储介质或一致性存在疑问；
+- 需要形成完整坏页审计证据。
+
+```text
+DMDUL> check pages;
+```
+
+针对少量明确表的恢复，可只检查相关 DBF：
+
+```text
+DMDUL> check pages MAIN.DBF,TBS_APP01.DBF;
+```
+
+独立 `check pages` 只使用当前会话由 `bootstrap` 建立或用户显式 `load dictionary` 加载的字典，
+不会隐式加载目录中残留的 `dmdul_dict`。没有字典时仍执行完整物理检查，但所有坏页标记为
+`UNATTRIBUTED`。
+
+当前全库 `check pages` 只扫描文件系统 `data_dir`，不直接遍历全部 DMASM 逻辑 DBF。ASM 输入
+需要第二阶段全库诊断时，先执行 `cp datafile <directory>;`，再切换到复制目录后运行。
+
+坏页坐标格式 `page(tablespace,file,page)` 与官方 dmdbchk 一致。命令完成后生成：
+
+| 文件 | 用途 |
+| --- | --- |
+| `output/check_summary.md` | 扫描总量、三类损坏、归属率、受影响对象/表和损坏字节比例 |
+| `output/check_bad_pages.tsv` | 全量坏页坐标、绝对字节偏移、storage_id、对象归属和损坏证据 |
+| `output/check_affected_objects.tsv` | 按物理 storage 聚合坏页数量、损坏类型及已知表段头命中数，便于确定恢复顺序 |
+
+终端每文件最多保留 4096 条坏页明细，TSV 和聚合统计仍覆盖全部坏页。`TABLE_ASSIST` 只证明
+辅助 storage 隶属于父表，不猜测 INDEX、LOB、分区或其他具体类型。
 
 ## 5. 盘点对象
 

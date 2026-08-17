@@ -12,6 +12,45 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.7.3 - Two-Stage Page Diagnostics
+
+### Added
+
+- `bootstrap` 在字典读取前自动执行 SYSTEM.DBF 纯物理页预检，覆盖文件对齐、页头、
+  PAGE_CHECK 和行页结构，并同时支持文件系统文件与 DMASM 逻辑 SYSTEM 文件。发现损坏时继续
+  尝试字典恢复，以 `SUCCESS_WITH_WARNINGS` 结束并提示执行第二阶段全库 `check pages;`。
+- `check pages` 成功后在 `output` 目录生成 `check_summary.md`、全量
+  `check_bad_pages.tsv` 和 `check_affected_objects.tsv`。报告包含绝对字节偏移、三类损坏、
+  已归属/未归属页、受影响物理对象和表、已知表段头命中数、损坏字节比例、归属依据及置信度。
+- 新增 `TABLE`、`TABLE_ASSIST`、`UNATTRIBUTED` 保守对象分类。主/辅助 storage_id 归属为
+  `HIGH`，唯一段范围回退为 `MEDIUM`；字典证据不足时不猜测 INDEX、LOB 或分区类型。
+- 新增全量坏页同步回调。终端仍按每文件 4096 条限制保留内存明细，TSV 明细和影响统计不受
+  该限制，适合大规模损坏文件。
+
+### Fixed
+
+- 独立 `check pages` 不再隐式加载目录中残留的 `dmdul_dict`。对象归属只采用当前会话经
+  `bootstrap` 或显式 `load dictionary` 建立的字典，避免跨快照错误归属。
+- 修复坏页超过每文件明细上限后 `HEADER_INVALID`、`CHECKSUM_FAIL`、
+  `STRUCTURE_INVALID` 分类计数被低估的问题。分类计数现在与坏页总数一样按全量页面累加。
+- 同一 storage_id 被多个字典对象声明或多个段范围重叠时，不再静默归属到首个对象；报告会
+  标记 `ambiguous_storage_id` 或 `ambiguous_segment_range`。
+
+### Tests
+
+- 新增全量回调数量、明细截断后精确分类/影响统计、主 storage/辅助 storage/段范围归属、
+  歧义拒绝，以及三份报告重复覆盖生成测试。
+- 新增 bootstrap 在字典恢复前执行 SYSTEM 物理预检、DMASM 逻辑 ReaderAt 预检，以及独立
+  `check pages` 不自动加载残留字典的回归测试。
+
+### Documentation
+
+- README、标准恢复流程和 PAGE_CHECK 实验文档补充坏页影响报告、字段含义、内存边界和证据限制。
+- 明确两阶段恢复顺序：`bootstrap` 自动完成必需的 SYSTEM.DBF 纯物理预检；只有预检告警、
+  整库/用户/模式恢复、介质可疑或需要审计报告时，才继续执行第二阶段全库 `check pages`。
+
+------
+
 ## v0.7.2 - DMASM Multi-Database Discovery
 
 ### Added

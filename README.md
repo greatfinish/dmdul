@@ -20,7 +20,7 @@
 - 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
   AU 映射、副本数组和条带数据。
 
-**v0.7.2 主题：DMASM Multi-Database Discovery**
+**v0.7.3 主题：Two-Stage Page Diagnostics**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -179,12 +179,17 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
   和 Long Row 页链。`STORAGE(USING LONG ROW)` 宽行的行外 VARCHAR/CHAR 列无论溢出到
   长行（0x22）页还是常规 LOB（0x20）页都能正确读出；DDL 也会还原 `USING LONG ROW`
   存储子句，配合 DMP 通道可直接由 `dimp` 导回。
-- **页损坏诊断**：`check pages` 离线只读扫描数据文件，分文件大小、页头自描述、
-  数据页结构三层证据定位坏页；即使 `PAGE_CHECK=0` 无校验和也能发现页头错乱、
+- **页损坏诊断**：`check pages` 离线只读扫描数据文件，按文件完整性、页头自描述、
+  PAGE_CHECK 校验和、数据页结构四层证据定位坏页；即使 `PAGE_CHECK=0` 无校验和也能发现页头错乱、
   清零页和行长自相矛盾的结构损坏。坏页坐标 `page(tablespace,file,page)` 与官方
   dmdbchk 对齐，实测四种注入损坏 4/4 检出、干净库零误报。字典可用时进一步把坏页
   归属到 `owner.table`（storage_id 清零页经段范围回退归属）、检测 B 树叶链断链/成环、
-  并做字典自一致性检查（重复 ID、悬空列、孤儿 owner）；bootstrap 流程零改动。
+  并做字典自一致性检查（重复 ID、悬空列、孤儿 owner）。每次检查在 `output` 目录生成
+  `check_summary.md`、全量 `check_bad_pages.tsv` 和 `check_affected_objects.tsv`，汇总
+  已归属/未归属坏页、受影响对象和表、损坏字节比例及归属置信度；终端明细上限不影响
+  报告统计。`bootstrap` 已内置 SYSTEM.DBF 纯物理预检，文件系统和 DMASM 逻辑文件都可直接
+  检查；只有告警、整库恢复或需要完整影响报告时才再执行全库 `check pages`。辅助 storage
+  只标记为 `TABLE_ASSIST`，不会在证据不足时猜成 INDEX 或 LOB。
 - **残留数据救援**：表定义仍可获得时，`recover table` 可尝试读取 DELETE slot、无 slot
   物理行以及 `DROP` / `TRUNCATE` 后尚未覆盖的残留页；孤儿 storage 仅允许单目标表恢复，
   并使用多行一致性校验和显式物理来源证据降低误归属风险。
@@ -851,16 +856,16 @@ SQL 通过 `disql` 或能够处理相应语句长度的客户端执行。至少�
                 核对数据库身份、文件状态与 group/file
                              |
                              v
-            check pages（文件系统 DBF 可疑时执行）
-                             |
-                             v
-                         bootstrap
+             bootstrap（自动物理预检 SYSTEM.DBF）
                              |
                              v
               检查 dmdul_dict；必要时修订 TSV
                              |
                              v
                 load dictionary（仅修订后需要）
+                             |
+                             v
+        check pages（预检告警、整库恢复或审计时执行）
                              |
                              v
             unload object / table / user / schema / database
@@ -878,6 +883,23 @@ SQL 通过 `disql` 或能够处理相应语句长度的客户端执行。至少�
                              v
                       隔离测试库验证
 ```
+
+### 两阶段页检查
+
+页检查分成自动预检和按需全库检查。用户不需要在 `bootstrap;` 前额外执行
+`check pages SYSTEM.DBF;`。
+
+| 阶段 | 入口 | 检查范围 | 是否依赖字典 | 执行条件 |
+| --- | --- | --- | --- | --- |
+| 第一阶段 | `bootstrap;` 自动执行 | 完整 `SYSTEM.DBF` | 否 | 每次从当前离线快照重建字典时必做，由工具自动完成 |
+| 第二阶段 | `check pages;` | `data_dir` 中的全部或指定 DBF | 物理检查不依赖；对象归属依赖当前会话字典 | SYSTEM 预检告警、整库/用户/模式恢复、介质可疑或需要审计报告时执行 |
+
+第一阶段发现坏页时，bootstrap 不会仅因预检告警立即退出。它会继续读取仍然可用的系统字典，
+最终以 `SUCCESS_WITH_WARNINGS` 结束并提示执行第二阶段检查。若字典无法建立，`check pages;`
+仍能完成纯物理扫描，但坏页只能标记为 `UNATTRIBUTED`。
+
+因此，标准顺序固定为：先 `bootstrap;`，再检查生成的字典；满足第二阶段触发条件时执行
+`check pages;`，最后开始 unload。不要把旧目录中的 `dmdul_dict` 当作当前快照的归属依据。
 
 文件系统 DBF 放在同一恢复目录时，最短流程如下：
 
@@ -909,8 +931,15 @@ DMDUL> bootstrap;
 `asm_datafiles.tsv`。不要只按数据库名判断候选，应同时核对 `system_path`、页大小、字符集、
 group/file、表空间和文件状态。需要把 ASM 逻辑文件交给其他工具时，可先执行
 `cp datafile <directory>;`，再按文件系统 DBF 流程恢复；直接 bootstrap/unload 不依赖复制。
-当前 `check pages` 只扫描文件系统 `data_dir`，若要对 ASM 中的全部 DBF 做逐页诊断，也应先
-`cp datafile`，切换到复制目录后再执行。
+bootstrap 内置的 SYSTEM 物理预检可直接读取 ASM 逻辑文件。独立 `check pages` 仍只扫描文件系统
+`data_dir`；若要对 ASM 中的全部 DBF 做第二阶段逐页诊断，应先 `cp datafile`，切换到复制目录
+后再执行。
+
+执行第二阶段检查后重点阅读 `output/check_summary.md`。需要逐页复核时使用
+`output/check_bad_pages.tsv`；需要按对象安排恢复优先级时使用
+`output/check_affected_objects.tsv`。三份报告每次覆盖更新，`dul.log` 同时记录报告路径。
+独立检查只使用本会话经 `bootstrap` 或显式 `load dictionary` 建立的字典，不会隐式套用目录中
+残留的旧字典。
 
 建议每个离线快照使用独立工作目录。准备重新扫描时直接执行 `bootstrap;`，不要先让 `list`
 或 `unload` 自动加载旧的完整字典。bootstrap 会原子重建字典目录，并在 ASM 模式下恢复候选
@@ -1079,7 +1108,7 @@ unload object <owner|all>;
 unload user <owner>;
 unload database;
 recover table <owner.table_name>;
-check pages [<dbf-name>[,<dbf-name>...]];
+check pages [<dbf-name>[,<dbf-name>...]] [control];
 set data_format sql;
 set data_format fldr;
 set data_format dmp;
@@ -1250,6 +1279,7 @@ dul.log
 | v0.7.0 | DMASM 非镜像/镜像裸盘读取、多磁盘组、NORMAL/HIGH 副本与条带、ASM page plan 直读 |
 | v0.7.1 | ASM 逻辑文件流式复制、整套 DBF 物化、SHA-256 证据与安全目标预检 |
 | v0.7.2 | DMASM 多数据库自动发现、唯一候选自动选择、候选 DBF 集合持久化与多库隔离 |
+| v0.7.3 | bootstrap 自动 SYSTEM 物理预检、全量坏页报告、对象影响归属与残留字典隔离 |
 | v0.7.x | DMASM REDO、超 65535-AU 单文件、更多 DM8 build 与条带组合验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 

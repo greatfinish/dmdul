@@ -268,14 +268,21 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 	if pageSize == 0 {
 		pageSize = dm.DefaultPageSize
 	}
-	// Attach the dictionary when available so bad pages are attributed to
-	// owner.table and the leaf-chain and consistency checks run. It is loaded
-	// best-effort: a missing dictionary just falls back to the physical scan.
+	if err := s.ensureOutputDir(); err != nil {
+		return err
+	}
+	reportWriter, err := newPageCheckReportWriter(s.effectiveOutputDir(), pageSize)
+	if err != nil {
+		return fmt.Errorf("create page-check report: %w", err)
+	}
+	defer reportWriter.abort()
+	// Only use a dictionary explicitly established in this session by
+	// bootstrap or load dictionary. Silently loading a leftover directory here
+	// could attach correct physical damage to objects from another snapshot.
 	dict := s.dictionary
 	if dict == nil {
-		if loaded, err := s.tryLoadDictionaryForCheck(); err == nil {
-			dict = loaded
-		}
+		fmt.Fprintln(stdout, "dictionary: not loaded (physical scan only; run bootstrap or load dictionary for object attribution)")
+		s.log("[CHECK] dictionary=UNAVAILABLE mode=physical-only")
 	}
 	result, err := dm.CheckPages(dm.PageCheckOptions{
 		SystemPath:         s.systemPath,
@@ -288,19 +295,28 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 		FileFilter:         fileFilter,
 		Dictionary:         dict,
 		FollowControlPaths: followControl,
+		OnBadPage:          reportWriter.writeBadPage,
 	})
 	if err != nil {
 		return err
 	}
+	reportPaths, err := reportWriter.finalize(result, pageCheckReportContext{
+		SystemPath:         s.systemPath,
+		DataDir:            s.effectiveDataDir(),
+		FileFilter:         fileFilter,
+		FollowControlPaths: followControl,
+		GeneratedAt:        time.Now(),
+	})
+	if err != nil {
+		return fmt.Errorf("write page-check report: %w", err)
+	}
 	s.printPageCheckResult(result, stdout)
+	fmt.Fprintf(stdout, "summary report: %s\n", reportPaths.Summary)
+	fmt.Fprintf(stdout, "bad page detail: %s\n", reportPaths.BadPages)
+	fmt.Fprintf(stdout, "affected objects: %s\n", reportPaths.AffectedObjects)
+	s.log(fmt.Sprintf("[CHECK] summary_report=%s bad_pages_report=%s affected_objects_report=%s",
+		reportPaths.Summary, reportPaths.BadPages, reportPaths.AffectedObjects))
 	return nil
-}
-
-// tryLoadDictionaryForCheck loads the on-disk dictionary without failing the
-// check when none exists.
-func (s *interactiveSession) tryLoadDictionaryForCheck() (*dm.DictionaryInfo, error) {
-	dict, _, err := dm.LoadDictionaryFiles(s.effectiveDictionaryDir())
-	return dict, err
 }
 
 func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, stdout io.Writer) {
@@ -325,12 +341,15 @@ func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, st
 			fmt.Fprintf(stdout, "    file: %s\n", file.SizeDetail)
 		}
 		for _, bad := range file.Bad {
-			owner := ""
+			object := ""
 			if bad.Owner != "" || bad.Table != "" {
-				owner = fmt.Sprintf(" table=%s.%s", bad.Owner, bad.Table)
+				object = fmt.Sprintf(" object=%s.%s/%s via=%s confidence=%s",
+					bad.Owner, bad.Table, bad.ObjectType, bad.Attribution, bad.AttributionConfidence)
+			} else if bad.UnattributedReason != "" {
+				object = fmt.Sprintf(" object=UNATTRIBUTED reason=%s", bad.UnattributedReason)
 			}
 			fmt.Fprintf(stdout, "    page(%d,%d,%d) %s storage_id=%d%s: %s\n",
-				bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, owner, bad.Detail)
+				bad.GroupID, bad.FileID, bad.PageNo, bad.Kind, bad.StorageID, object, bad.Detail)
 		}
 		if file.ReportTruncated {
 			fmt.Fprintf(stdout, "    ... bad-page list truncated; %d total in this file\n", file.BadPages)
@@ -360,13 +379,20 @@ func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, st
 		fmt.Fprintf(stdout, "  structure invalid: %d\n", result.Corruption[dm.PageCorruptionStructure])
 	}
 	if result.DictionaryUsed {
+		fmt.Fprintf(stdout, "dictionary: loaded (%s)\n", defaultIfBlank(result.DictionarySource, "current session"))
+		fmt.Fprintf(stdout, "attributed bad pages: %d\n", result.AttributedBadPages)
+		fmt.Fprintf(stdout, "unattributed bad pages: %d\n", result.UnattributedBadPages)
+		fmt.Fprintf(stdout, "affected objects: %d\n", len(result.AffectedObjects))
+		fmt.Fprintf(stdout, "affected tables: %d / %d\n", result.AffectedTables, result.TotalTables)
 		fmt.Fprintf(stdout, "leaf chain issues: %d\n", len(result.ChainIssues))
 		fmt.Fprintf(stdout, "dictionary issues: %d\n", len(result.DictIssues))
 	}
-	s.log(fmt.Sprintf("[CHECK] files=%d pages=%d empty=%d bad=%d header=%d checksum=%d structure=%d chain=%d dict=%d",
+	s.log(fmt.Sprintf("[CHECK] files=%d pages=%d empty=%d bad=%d header=%d checksum=%d structure=%d attributed=%d unattributed=%d affected_objects=%d affected_tables=%d/%d chain=%d dict=%d",
 		result.FilesChecked, result.PagesChecked, result.PagesEmpty, result.BadPagesTotal,
 		result.Corruption[dm.PageCorruptionHeader], result.Corruption[dm.PageCorruptionChecksum],
-		result.Corruption[dm.PageCorruptionStructure], len(result.ChainIssues), len(result.DictIssues)))
+		result.Corruption[dm.PageCorruptionStructure], result.AttributedBadPages, result.UnattributedBadPages,
+		len(result.AffectedObjects), result.AffectedTables, result.TotalTables,
+		len(result.ChainIssues), len(result.DictIssues)))
 	for _, bad := range result.SortedBadPages() {
 		table := ""
 		if bad.Owner != "" || bad.Table != "" {
@@ -1218,7 +1244,8 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 		metadata.PageSize, metadata.PageSizeSource, metadata.ExtentSize, metadata.ExtentSizeSource,
 		metadata.PageCount, metadata.PageCountSource, metadata.Charset, metadata.CharsetSource,
 		metadata.CharsetFlag, caseSensitiveLog, metadata.CaseSensitiveSource))
-	fileWarnings := false
+	systemPrecheckWarning := s.runBootstrapSystemPrecheck(stdout, systemPath, dataFiles, metadata.PageSize)
+	fileWarnings := systemPrecheckWarning
 	for index, file := range dataFiles {
 		var line string
 		var warning bool
@@ -1338,7 +1365,98 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "tab privileges loaded: %d\n", dict.TabPrivilegeCount)
 	fmt.Fprintf(stdout, "partitions loaded: %d\n", dict.PartitionCount)
 	fmt.Fprintf(stdout, "partition keys loaded: %d\n", dict.PartitionKeyCount)
+	if systemPrecheckWarning {
+		fmt.Fprintln(stdout, "next action: run check pages; for full data-file scanning and object attribution")
+	}
 	return nil
+}
+
+// runBootstrapSystemPrecheck performs the dictionary-independent first stage
+// automatically. Damage is evidence, not a reason to abandon recovery: the
+// bootstrap continues and its final status becomes SUCCESS_WITH_WARNINGS.
+func (s *interactiveSession) runBootstrapSystemPrecheck(stdout io.Writer, systemPath string, dataFiles []dm.OfflineDataFile, pageSize uint32) bool {
+	if pageSize == 0 {
+		s.emitBootstrapLine(stdout, "[bootstrap] phase=precheck name=SYSTEM.DBF status=WARNING mode=physical-only reason=\"page size unavailable; physical precheck skipped\"")
+		return true
+	}
+	source := s.bootstrapSystemDataSource(systemPath, dataFiles)
+	result, err := dm.CheckPhysicalPageSource(source, dm.PageCheckOptions{
+		PageSize:      pageSize,
+		PageCheckMode: s.pageCheckMode,
+		PageHashName:  s.pageHashName,
+		MaxReported:   32,
+	})
+	if err != nil {
+		s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=precheck name=SYSTEM.DBF status=WARNING mode=physical-only reason=%q", err.Error()))
+		return true
+	}
+	status := "OK"
+	warning := false
+	fileInvalid := false
+	fileDetail := ""
+	if len(result.Files) > 0 {
+		fileInvalid = result.Files[0].SizeInvalid
+		fileDetail = result.Files[0].SizeDetail
+	}
+	if fileInvalid || result.BadPagesTotal > 0 {
+		status = "WARNING"
+		warning = true
+	}
+	s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=precheck name=SYSTEM.DBF status=%s mode=physical-only page_check=%d pages=%d empty=%d bad=%d header=%d checksum=%d structure=%d file_invalid=%t detail=%q",
+		status, result.PageCheckMode, result.PagesChecked, result.PagesEmpty, result.BadPagesTotal,
+		result.Corruption[dm.PageCorruptionHeader], result.Corruption[dm.PageCorruptionChecksum],
+		result.Corruption[dm.PageCorruptionStructure], fileInvalid, fileDetail))
+	if len(result.Files) > 0 {
+		for _, bad := range result.Files[0].Bad {
+			s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=precheck name=SYSTEM.DBF-page status=WARNING coordinate=%q corruption=%s storage_id=%d detail=%q",
+				fmt.Sprintf("page(%d,%d,%d)", bad.GroupID, bad.FileID, bad.PageNo), bad.Kind, bad.StorageID, bad.Detail))
+		}
+		if result.Files[0].ReportTruncated {
+			s.emitBootstrapLine(stdout, fmt.Sprintf("[bootstrap] phase=precheck name=SYSTEM.DBF-page status=WARNING detail=%q",
+				fmt.Sprintf("bad-page detail truncated at 32 entries; total=%d", result.BadPagesTotal)))
+		}
+	}
+	return warning
+}
+
+func (s *interactiveSession) bootstrapSystemDataSource(systemPath string, dataFiles []dm.OfflineDataFile) dm.OfflineDataSource {
+	source := dm.OfflineDataSource{GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: systemPath, Reader: s.activeSystemReader()}
+	if dm.IsASMPath(systemPath) {
+		for _, candidate := range s.asmDataSources {
+			if sameASMPath(candidate.Path, systemPath) {
+				return candidate
+			}
+		}
+		return source
+	}
+	for _, candidate := range dataFiles {
+		if sameFilesystemDataPath(candidate.Path, systemPath) {
+			source.GroupID = candidate.GroupID
+			source.FileID = candidate.FileID
+			source.Tablespace = defaultIfBlank(candidate.Tablespace, "SYSTEM")
+			source.Path = candidate.Path
+			return source
+		}
+	}
+	for _, candidate := range dataFiles {
+		if candidate.GroupID == 0 && candidate.FileID == 0 {
+			source.GroupID = candidate.GroupID
+			source.FileID = candidate.FileID
+			source.Tablespace = defaultIfBlank(candidate.Tablespace, "SYSTEM")
+			source.Path = candidate.Path
+			return source
+		}
+	}
+	return source
+}
+
+func sameFilesystemDataPath(left, right string) bool {
+	leftPath, leftErr := filepath.Abs(filepath.Clean(left))
+	rightPath, rightErr := filepath.Abs(filepath.Clean(right))
+	if leftErr != nil || rightErr != nil {
+		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	}
+	return strings.EqualFold(leftPath, rightPath)
 }
 
 type missingDictionaryDataFile struct {

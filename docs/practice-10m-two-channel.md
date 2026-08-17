@@ -97,8 +97,8 @@ data files: 11 (readable & page-aligned: 11), page_size=8192
 - 表空间清单跟你预期的一致，目标表所在的 `TBS_MOCK` 在列。
 - 末行 `readable & page-aligned` 的数量等于总数。
 
-文件可疑时还可以接一句 `check pages;` 做页损坏诊断，坏页坐标格式与官方 dmdbchk 一致，
-可交叉核对。本次文件干净，跳过。
+bootstrap 已自动完成 SYSTEM.DBF 物理预检。其他数据文件可疑，或需要完整对象影响报告时，
+再执行 `check pages;`；坏页坐标格式与官方 dmdbchk 一致，可交叉核对。本次文件干净，跳过。
 
 ---
 

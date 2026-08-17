@@ -1232,13 +1232,13 @@ func TestInteractiveBootstrapPersistsStructuredDiagnostics(t *testing.T) {
 		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"[bootstrap] phase=start", "phase=metadata", "phase=complete", "mode=stream-scan-fallback"} {
+		for _, want := range []string{"[bootstrap] phase=start", "phase=metadata", "phase=precheck name=SYSTEM.DBF", "phase=complete", "mode=stream-scan-fallback"} {
 			if !strings.Contains(stdout.String(), want) {
 				t.Fatalf("stdout missing %q: %s", want, stdout.String())
 			}
 		}
 		logText := readTestFile(t, filepath.Join(dir, "dul.log"))
-		for _, want := range []string{"[bootstrap] phase=start", "stage=1 phase=anchor", "phase=complete"} {
+		for _, want := range []string{"[bootstrap] phase=start", "phase=precheck name=SYSTEM.DBF", "stage=1 phase=anchor", "phase=complete"} {
 			if !strings.Contains(logText, want) {
 				t.Fatalf("dul.log missing %q: %s", want, logText)
 			}

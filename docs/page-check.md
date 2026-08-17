@@ -77,3 +77,38 @@ Go 标准库没有当前项目可直接使用的 SM3 实现，因此 `SM3/OPENSS
 标准两阶段 bootstrap 都恢复 `1063` 个对象，随后对 `SYSDBA.PC_T` 生成一个计划页、直接读取一个页、
 无 fallback，三条数据全部导出且字段值与在线插入值一致。这既验证了 HASH 尾部处理，也验证了
 模式 0 不会被结构推断误判成 HASH 页。
+
+## check pages 影响报告
+
+`check pages` 不只验证 PAGE_CHECK。扫描顺序是页头自描述、PAGE_CHECK 校验和、行页结构，
+每页只记录最基础的首个失败原因：`HEADER_INVALID`、`CHECKSUM_FAIL` 或
+`STRUCTURE_INVALID`。文件大小不是页大小整数倍时另记为 `FILE_INVALID`。
+
+扫描器保留两套输出路径：
+
+1. 终端和 `dul.log` 保留每文件最多 4096 条坏页，适合快速观察且内存有界。
+2. `check_bad_pages.tsv` 通过同步回调逐行写盘，覆盖全部坏页。损坏分类计数和对象影响也在
+   扫描过程中聚合，因此不受 4096 条上限影响。
+
+字典归属按证据强度执行：
+
+| 依据 | 类型 | 置信度 | 说明 |
+| --- | --- | --- | --- |
+| 主 `storage_id` | `TABLE` | `HIGH` | 页头 storage 与表主 storage 唯一匹配 |
+| 辅助 `storage_id` | `TABLE_ASSIST` | `HIGH` | 能证明父表，不能继续猜测 INDEX/LOB/分区类型 |
+| 唯一段范围 | `TABLE` | `MEDIUM` | storage_id 被清零或未知时，用 group/file/page 范围回退 |
+| 无匹配或存在歧义 | `UNATTRIBUTED` | `NONE` | 保留具体原因，不解释为空闲页 |
+
+每次成功检查会覆盖生成 `output/check_summary.md`、`output/check_bad_pages.tsv` 和
+`output/check_affected_objects.tsv`。汇总报告可与官方 `dmdbchk` 交叉核对，但不能替代官方工具。
+
+## 与 bootstrap 的执行顺序
+
+`bootstrap` 在读取系统字典前自动执行一次完整 SYSTEM.DBF 纯物理预检。该预检使用统一页检查
+内核，但不加载任何字典，因此不会受到旧 `dmdul_dict` 影响；文件系统 SYSTEM 和 DMASM 逻辑
+SYSTEM 使用相同规则。
+
+预检发现损坏时，bootstrap 继续尝试恢复尚可读取的字典，最终状态标记为
+`SUCCESS_WITH_WARNINGS`。只有需要扫描全部数据文件并分析对象影响时，才在 bootstrap 后运行
+独立 `check pages;`。独立检查只采用当前会话已经 bootstrap 或显式加载的字典，不会自动加载
+目录残留字典。

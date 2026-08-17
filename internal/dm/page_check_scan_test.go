@@ -1,6 +1,7 @@
 package dm
 
 import (
+	"bytes"
 	"encoding/binary"
 	"os"
 	"path/filepath"
@@ -156,6 +157,89 @@ func TestCheckPagesReportsFileSizeAndBadPages(t *testing.T) {
 	bad := result.SortedBadPages()
 	if len(bad) != 1 || bad[0].PageNo != 1 || bad[0].Kind != PageCorruptionHeader {
 		t.Fatalf("unexpected bad page: %+v", bad)
+	}
+}
+
+func TestCheckPagesStreamsAllBadPagesAndKeepsExactImpactCounts(t *testing.T) {
+	dir := t.TempDir()
+	raw := make([]byte, 5*8192)
+	for pageNo := 0; pageNo < 5; pageNo++ {
+		page := raw[pageNo*8192 : (pageNo+1)*8192]
+		buildHealthyRowPage(page, 8192, 12, 0, uint32(pageNo), 33555845, 10)
+		if pageNo > 0 {
+			binary.LittleEndian.PutUint32(page[4:], 0xDEADBEEF)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "MAIN.DBF"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	dict := &DictionaryInfo{Tables: []DictionaryTable{{
+		ID: 42, Owner: "APP", Name: "T_BAD", Tablespace: "MAIN", GroupID: 12,
+		HeaderFile: 0, HeaderBlock: 1, Blocks: 4, Bytes: uint64(len(raw)), StorageID: 33555845,
+	}}}
+	streamed := 0
+	result, err := CheckPages(PageCheckOptions{
+		DataDir: dir, PageSize: 8192, MaxReported: 1, Dictionary: dict,
+		OnBadPage: func(bad BadPage) error {
+			streamed++
+			if bad.Owner != "APP" || bad.Table != "T_BAD" || bad.Attribution != PageAttributionStorageID {
+				t.Fatalf("callback received unattributed page: %+v", bad)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("CheckPages failed: %v", err)
+	}
+	if streamed != 4 || result.BadPagesTotal != 4 || result.Corruption[PageCorruptionHeader] != 4 {
+		t.Fatalf("full counts must ignore retained-detail cap: streamed=%d result=%+v", streamed, result)
+	}
+	if len(result.Files) != 1 || len(result.Files[0].Bad) != 1 || !result.Files[0].ReportTruncated {
+		t.Fatalf("console detail cap not applied as expected: %+v", result.Files)
+	}
+	if result.AttributedBadPages != 4 || result.UnattributedBadPages != 0 ||
+		result.AffectedTables != 1 || result.TotalTables != 1 || len(result.AffectedObjects) != 1 {
+		t.Fatalf("unexpected impact summary: %+v", result)
+	}
+	object := result.AffectedObjects[0]
+	if object.BadPages != 4 || object.SegmentHeaderBadPages != 1 || object.HeaderInvalid != 4 || object.StorageID != 33555845 ||
+		object.Attribution != string(PageAttributionStorageID) {
+		t.Fatalf("unexpected affected object: %+v", object)
+	}
+	if result.AffectedTableBytes != uint64(len(raw)) || result.TotalTableBytes != uint64(len(raw)) {
+		t.Fatalf("unexpected table-byte totals: affected=%d total=%d", result.AffectedTableBytes, result.TotalTableBytes)
+	}
+}
+
+func TestCheckPhysicalPageSourceSupportsLogicalReader(t *testing.T) {
+	raw := make([]byte, 3*8192)
+	for pageNo := 0; pageNo < 3; pageNo++ {
+		page := raw[pageNo*8192 : (pageNo+1)*8192]
+		buildHealthyRowPage(page, 8192, 0, 0, uint32(pageNo), 500, 5)
+	}
+	binary.LittleEndian.PutUint32(raw[2*8192+4:], 999)
+	streamed := 0
+	result, err := CheckPhysicalPageSource(OfflineDataSource{
+		GroupID: 0, FileID: 0, Tablespace: "SYSTEM", Path: "+DATA/DMDB/SYSTEM.DBF",
+		Reader: fixedSizeReaderAt{ReaderAt: bytes.NewReader(raw), size: int64(len(raw))},
+	}, PageCheckOptions{
+		PageSize: 8192,
+		OnBadPage: func(bad BadPage) error {
+			streamed++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("CheckPhysicalPageSource failed: %v", err)
+	}
+	if result.DictionaryUsed || result.FilesChecked != 1 || result.PagesChecked != 3 ||
+		result.BadPagesTotal != 1 || result.Corruption[PageCorruptionHeader] != 1 || streamed != 1 {
+		t.Fatalf("unexpected physical source result: streamed=%d result=%+v", streamed, result)
+	}
+	bad := result.SortedBadPages()
+	if len(bad) != 1 || bad[0].Path != "+DATA/DMDB/SYSTEM.DBF" ||
+		bad[0].UnattributedReason != "dictionary_not_loaded" {
+		t.Fatalf("unexpected logical-source bad page: %+v", bad)
 	}
 }
 

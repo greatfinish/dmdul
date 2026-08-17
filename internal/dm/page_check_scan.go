@@ -65,19 +65,92 @@ type PageCheckOptions struct {
 	// files are located by scanning DataDir and reading page headers; control
 	// metadata is still used only for tablespace names.
 	FollowControlPaths bool
+	// OnBadPage receives every corrupt page after dictionary attribution. It is
+	// called synchronously while scanning, so callers can stream a complete
+	// detail report without retaining every bad page in memory. Returning an
+	// error stops the scan.
+	OnBadPage func(BadPage) error
 }
+
+// PageObjectType is the strongest object class the recovered dictionary can
+// prove for a page. TABLE_ASSIST deliberately does not claim INDEX or LOB:
+// the durable dictionary currently maps assist storage to its parent table,
+// but does not yet preserve a complete physical index/LOB object catalogue.
+type PageObjectType string
+
+const (
+	PageObjectTable        PageObjectType = "TABLE"
+	PageObjectTableAssist  PageObjectType = "TABLE_ASSIST"
+	PageObjectUnattributed PageObjectType = "UNATTRIBUTED"
+)
+
+// PageAttributionMethod records the evidence used to map a bad page.
+type PageAttributionMethod string
+
+const (
+	PageAttributionStorageID       PageAttributionMethod = "storage_id"
+	PageAttributionAssistStorageID PageAttributionMethod = "assist_storage_id"
+	PageAttributionSegmentRange    PageAttributionMethod = "segment_range"
+	PageAttributionNone            PageAttributionMethod = "none"
+)
+
+// PageAttributionConfidence makes the strength of object attribution
+// explicit in reports. A page-owned storage id is stronger than a segment
+// range fallback, while ambiguous/unmapped pages have no attribution.
+type PageAttributionConfidence string
+
+const (
+	PageAttributionHigh   PageAttributionConfidence = "HIGH"
+	PageAttributionMedium PageAttributionConfidence = "MEDIUM"
+	PageAttributionNo     PageAttributionConfidence = "NONE"
+)
 
 // BadPage locates and classifies one corrupt page. GroupID doubles as the
 // tablespace id in dmdbchk's page(tablespace, file, page) coordinate.
 type BadPage struct {
-	GroupID   uint32
-	FileID    int16
-	PageNo    uint32
-	StorageID uint32
-	Owner     string // attributed table owner, when a dictionary is available
-	Table     string // attributed table name, when a dictionary is available
-	Kind      PageCorruptionKind
-	Detail    string
+	Path                  string
+	Tablespace            string
+	GroupID               uint32
+	FileID                int16
+	PageNo                uint32
+	StorageID             uint32
+	Owner                 string // attributed table owner, when known
+	Table                 string // attributed parent table, when known
+	TableID               uint32
+	ObjectType            PageObjectType
+	ObjectStorageID       uint32
+	ObjectGroupID         uint32
+	ObjectHeaderFile      int16
+	ObjectHeaderBlock     uint32
+	Attribution           PageAttributionMethod
+	AttributionConfidence PageAttributionConfidence
+	UnattributedReason    string
+	SegmentBytes          uint64
+	Kind                  PageCorruptionKind
+	Detail                string
+}
+
+// PageAffectedObject aggregates corrupt pages for one physical storage object.
+// TABLE_ASSIST rows identify the parent table and assist storage id without
+// guessing whether the storage is an index, LOB, partition, or another helper.
+type PageAffectedObject struct {
+	Owner                 string
+	Table                 string
+	TableID               uint32
+	ObjectType            PageObjectType
+	StorageID             uint32
+	GroupID               uint32
+	Tablespace            string
+	HeaderFile            int16
+	HeaderBlock           uint32
+	Attribution           string
+	AttributionConfidence PageAttributionConfidence
+	BadPages              int
+	SegmentHeaderBadPages int
+	HeaderInvalid         int
+	ChecksumFail          int
+	StructureInvalid      int
+	SegmentBytes          uint64
 }
 
 // ChainIssue records a broken or cyclic B-tree leaf chain for one table
@@ -109,6 +182,7 @@ type PageCheckFileResult struct {
 	PagesChecked    int
 	PagesEmpty      int
 	BadPages        int
+	Corruption      map[PageCorruptionKind]int
 	SizeInvalid     bool
 	SizeDetail      string
 	Bad             []BadPage
@@ -117,18 +191,27 @@ type PageCheckFileResult struct {
 
 // PageCheckResult is the whole-scan report.
 type PageCheckResult struct {
-	PageSize       uint32
-	PageCheckMode  uint32
-	PageHashName   string
-	DictionaryUsed bool
-	Files          []PageCheckFileResult
-	FilesChecked   int
-	PagesChecked   int
-	PagesEmpty     int
-	BadPagesTotal  int
-	Corruption     map[PageCorruptionKind]int
-	ChainIssues    []ChainIssue
-	DictIssues     []DictIssue
+	PageSize             uint32
+	PageCheckMode        uint32
+	PageHashName         string
+	DictionaryUsed       bool
+	DictionarySource     string
+	Files                []PageCheckFileResult
+	FilesChecked         int
+	PagesChecked         int
+	PagesEmpty           int
+	BadPagesTotal        int
+	Corruption           map[PageCorruptionKind]int
+	AttributedBadPages   int
+	UnattributedBadPages int
+	UnattributedReasons  map[string]int
+	AffectedObjects      []PageAffectedObject
+	AffectedTables       int
+	TotalTables          int
+	AffectedTableBytes   uint64
+	TotalTableBytes      uint64
+	ChainIssues          []ChainIssue
+	DictIssues           []DictIssue
 }
 
 const defaultMaxReportedBadPages = 4096
@@ -180,31 +263,36 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 	var attribution *pageAttribution
 	if opts.Dictionary != nil {
 		result.DictionaryUsed = true
+		result.DictionarySource = opts.Dictionary.Source
 		attribution = newPageAttribution(opts.Dictionary)
 	}
+	impact := newPageImpactAccumulator(opts.Dictionary)
 
 	for fi := range files {
 		file := files[fi]
 		if file.path == "" || !filter.allows(file.path) {
 			continue
 		}
-		fileResult := checkOneDataFile(file, pageSize, opts, maxReported)
-		if attribution != nil {
-			for bi := range fileResult.Bad {
-				owner, table := attribution.attribute(&fileResult.Bad[bi])
-				fileResult.Bad[bi].Owner = owner
-				fileResult.Bad[bi].Table = table
+		fileResult, scanErr := checkOneDataFile(file, pageSize, opts, maxReported, attribution, func(bad BadPage) error {
+			impact.add(bad)
+			if opts.OnBadPage != nil {
+				return opts.OnBadPage(bad)
 			}
+			return nil
+		})
+		if scanErr != nil {
+			return nil, scanErr
 		}
 		result.Files = append(result.Files, fileResult)
 		result.FilesChecked++
 		result.PagesChecked += fileResult.PagesChecked
 		result.PagesEmpty += fileResult.PagesEmpty
 		result.BadPagesTotal += fileResult.BadPages
-		for _, bad := range fileResult.Bad {
-			result.Corruption[bad.Kind]++
+		for kind, count := range fileResult.Corruption {
+			result.Corruption[kind] += count
 		}
 	}
+	impact.apply(result)
 
 	if opts.Dictionary != nil {
 		result.ChainIssues = checkLeafChains(opts.Dictionary, files, pageSize)
@@ -213,56 +301,169 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 	return result, nil
 }
 
-func checkOneDataFile(file dataFileRef, pageSize uint32, opts PageCheckOptions, maxReported int) PageCheckFileResult {
-	res := PageCheckFileResult{
-		Path:       file.path,
-		GroupID:    file.key.groupID,
-		FileID:     file.key.fileID,
-		Tablespace: file.tablespaceName,
+// CheckPhysicalPageSource checks one filesystem or logical data file without
+// using a recovered dictionary. Bootstrap uses it to validate SYSTEM.DBF
+// before attempting catalog recovery; callers can still stream every bad page
+// through PageCheckOptions.OnBadPage.
+func CheckPhysicalPageSource(source OfflineDataSource, opts PageCheckOptions) (*PageCheckResult, error) {
+	pageSize := opts.PageSize
+	if pageSize == 0 {
+		pageSize = 8192
 	}
+	if !validPageSize(pageSize) {
+		return nil, fmt.Errorf("invalid page size %d", pageSize)
+	}
+	maxReported := opts.MaxReported
+	if maxReported <= 0 {
+		maxReported = defaultMaxReportedBadPages
+	}
+	if source.Reader == nil && strings.TrimSpace(source.Path) == "" {
+		return nil, fmt.Errorf("page source has no reader or path")
+	}
+	file := dataFileRef{
+		key:            dataFileKey{groupID: source.GroupID, fileID: source.FileID},
+		tablespaceName: source.Tablespace,
+		path:           source.Path,
+	}
+	impact := newPageImpactAccumulator(nil)
+	onBadPage := func(bad BadPage) error {
+		impact.add(bad)
+		if opts.OnBadPage != nil {
+			return opts.OnBadPage(bad)
+		}
+		return nil
+	}
+	var fileResult PageCheckFileResult
+	var err error
+	if source.Reader != nil {
+		fileResult, err = checkOneDataReader(file, source.Reader, pageSize, opts, maxReported, nil, onBadPage)
+	} else {
+		fileResult, err = checkOneDataFile(file, pageSize, opts, maxReported, nil, onBadPage)
+	}
+	if err != nil {
+		return nil, err
+	}
+	result := &PageCheckResult{
+		PageSize:      pageSize,
+		PageCheckMode: opts.PageCheckMode,
+		PageHashName:  opts.PageHashName,
+		Files:         []PageCheckFileResult{fileResult},
+		FilesChecked:  1,
+		PagesChecked:  fileResult.PagesChecked,
+		PagesEmpty:    fileResult.PagesEmpty,
+		BadPagesTotal: fileResult.BadPages,
+		Corruption:    make(map[PageCorruptionKind]int),
+	}
+	for kind, count := range fileResult.Corruption {
+		result.Corruption[kind] = count
+	}
+	impact.apply(result)
+	return result, nil
+}
+
+func checkOneDataFile(file dataFileRef, pageSize uint32, opts PageCheckOptions, maxReported int, attribution *pageAttribution, onBadPage func(BadPage) error) (PageCheckFileResult, error) {
+	res := newPageCheckFileResult(file)
 	size, sizeErr := fileSizeBytes(file.path)
 	if sizeErr != nil {
 		res.SizeInvalid = true
 		res.SizeDetail = sizeErr.Error()
-		return res
+		return res, nil
+	}
+	return checkOnePageSource(res, size, pageSize, opts, maxReported, attribution, onBadPage,
+		func(visit func(page []byte, pageNo uint32) error) (int, error) {
+			return forEachDataFilePage(file.path, pageSize, visit)
+		})
+}
+
+func checkOneDataReader(file dataFileRef, reader SizedReaderAt, pageSize uint32, opts PageCheckOptions, maxReported int, attribution *pageAttribution, onBadPage func(BadPage) error) (PageCheckFileResult, error) {
+	res := newPageCheckFileResult(file)
+	if reader == nil {
+		res.SizeInvalid = true
+		res.SizeDetail = "data file reader is nil"
+		return res, nil
+	}
+	return checkOnePageSource(res, reader.Size(), pageSize, opts, maxReported, attribution, onBadPage,
+		func(visit func(page []byte, pageNo uint32) error) (int, error) {
+			return forEachSizedReaderPage(reader, pageSize, visit)
+		})
+}
+
+func newPageCheckFileResult(file dataFileRef) PageCheckFileResult {
+	return PageCheckFileResult{
+		Path:       file.path,
+		GroupID:    file.key.groupID,
+		FileID:     file.key.fileID,
+		Tablespace: file.tablespaceName,
+		Corruption: make(map[PageCorruptionKind]int),
+	}
+}
+
+func checkOnePageSource(res PageCheckFileResult, size int64, pageSize uint32, opts PageCheckOptions, maxReported int, attribution *pageAttribution, onBadPage func(BadPage) error, forEach func(func(page []byte, pageNo uint32) error) (int, error)) (PageCheckFileResult, error) {
+	if size < 0 {
+		res.SizeInvalid = true
+		res.SizeDetail = fmt.Sprintf("invalid negative file size %d", size)
+		return res, nil
 	}
 	if size%int64(pageSize) != 0 {
 		res.SizeInvalid = true
 		res.SizeDetail = fmt.Sprintf("file size %d is not a multiple of page size %d (truncated or wrong page size)", size, pageSize)
 	}
 
-	pagesScanned, scanErr := forEachDataFilePage(file.path, pageSize, func(page []byte, pageNo uint32) error {
+	key := dataFileKey{groupID: res.GroupID, fileID: res.FileID}
+	var sinkErr error
+	pagesScanned, scanErr := forEach(func(page []byte, pageNo uint32) error {
 		res.PagesChecked++
 		if isEmptyDMPage(page) {
 			res.PagesEmpty++
 			return nil
 		}
-		kind, detail, ok := classifyPageCorruption(page, file.key, pageNo, pageSize, opts)
+		kind, detail, ok := classifyPageCorruption(page, key, pageNo, pageSize, opts)
 		if ok {
 			return nil
 		}
 		res.BadPages++
+		res.Corruption[kind]++
+		bad := BadPage{
+			Path:                  res.Path,
+			Tablespace:            res.Tablespace,
+			GroupID:               res.GroupID,
+			FileID:                res.FileID,
+			PageNo:                pageNo,
+			StorageID:             dataPageStorageID(page),
+			ObjectType:            PageObjectUnattributed,
+			Attribution:           PageAttributionNone,
+			AttributionConfidence: PageAttributionNo,
+			Kind:                  kind,
+			Detail:                detail,
+		}
+		if attribution != nil {
+			attribution.apply(&bad)
+		} else {
+			bad.UnattributedReason = "dictionary_not_loaded"
+		}
+		if onBadPage != nil {
+			if err := onBadPage(bad); err != nil {
+				sinkErr = err
+				return err
+			}
+		}
 		if len(res.Bad) < maxReported {
-			res.Bad = append(res.Bad, BadPage{
-				GroupID:   file.key.groupID,
-				FileID:    file.key.fileID,
-				PageNo:    pageNo,
-				StorageID: dataPageStorageID(page),
-				Kind:      kind,
-				Detail:    detail,
-			})
+			res.Bad = append(res.Bad, bad)
 		} else {
 			res.ReportTruncated = true
 		}
 		return nil
 	})
+	if sinkErr != nil {
+		return res, sinkErr
+	}
 	if scanErr != nil {
 		res.SizeInvalid = true
 		if res.SizeDetail == "" {
 			res.SizeDetail = fmt.Sprintf("read failed after %d pages: %v", pagesScanned, scanErr)
 		}
 	}
-	return res
+	return res, nil
 }
 
 // classifyPageCorruption returns (kind, detail, ok=false) for a corrupt page,

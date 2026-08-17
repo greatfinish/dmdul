@@ -15,72 +15,188 @@ import (
 // own storage id, then by falling back to the table segment page range for
 // pages whose storage id was wiped (e.g. zeroed pages).
 type pageAttribution struct {
-	byStorage map[uint32]string    // storage/assist id -> "OWNER.TABLE"
-	segments  []attributionSegment // segment ranges for fallback
+	byStorage map[uint32][]pageObjectIdentity
+	segments  []attributionSegment
+}
+
+type pageObjectIdentity struct {
+	owner           string
+	table           string
+	tableID         uint32
+	objectType      PageObjectType
+	objectStorageID uint32
+	groupID         uint32
+	method          PageAttributionMethod
+	confidence      PageAttributionConfidence
+	tablespace      string
+	headerFile      int16
+	headerBlock     uint32
+	segmentBytes    uint64
 }
 
 type attributionSegment struct {
-	owner     string
-	table     string
+	identity  pageObjectIdentity
 	groupID   uint32
 	fileID    int16
-	startPage uint32
-	endPage   uint32 // exclusive
+	startPage uint64
+	endPage   uint64
 }
 
 func newPageAttribution(dict *DictionaryInfo) *pageAttribution {
-	a := &pageAttribution{byStorage: make(map[uint32]string)}
+	a := &pageAttribution{byStorage: make(map[uint32][]pageObjectIdentity)}
 	for _, table := range dict.Tables {
-		label := table.Owner + "." + table.Name
+		primary := pageObjectIdentity{
+			owner:           table.Owner,
+			table:           table.Name,
+			tableID:         table.ID,
+			objectType:      PageObjectTable,
+			objectStorageID: table.StorageID,
+			groupID:         table.GroupID,
+			method:          PageAttributionStorageID,
+			confidence:      PageAttributionHigh,
+			tablespace:      table.Tablespace,
+			headerFile:      table.HeaderFile,
+			headerBlock:     table.HeaderBlock,
+			segmentBytes:    table.Bytes,
+		}
 		if table.StorageID != 0 {
-			a.byStorage[table.StorageID] = label
+			a.addStorageIdentity(table.StorageID, primary)
 		}
 		for _, assist := range table.AssistIDs {
-			if assist != 0 {
-				if _, exists := a.byStorage[assist]; !exists {
-					a.byStorage[assist] = label
-				}
+			if assist == 0 || assist == table.StorageID {
+				continue
 			}
+			a.addStorageIdentity(assist, pageObjectIdentity{
+				owner:           table.Owner,
+				table:           table.Name,
+				tableID:         table.ID,
+				objectType:      PageObjectTableAssist,
+				objectStorageID: assist,
+				groupID:         table.GroupID,
+				method:          PageAttributionAssistStorageID,
+				confidence:      PageAttributionHigh,
+				tablespace:      table.Tablespace,
+				headerFile:      -1,
+			})
 		}
 		if table.Blocks > 0 && table.HeaderFile >= 0 {
+			segmentIdentity := primary
+			segmentIdentity.method = PageAttributionSegmentRange
+			segmentIdentity.confidence = PageAttributionMedium
 			a.segments = append(a.segments, attributionSegment{
-				owner:     table.Owner,
-				table:     table.Name,
+				identity:  segmentIdentity,
 				groupID:   table.GroupID,
 				fileID:    table.HeaderFile,
-				startPage: table.HeaderBlock,
-				endPage:   table.HeaderBlock + table.Blocks,
+				startPage: uint64(table.HeaderBlock),
+				endPage:   uint64(table.HeaderBlock) + uint64(table.Blocks),
 			})
 		}
 	}
 	return a
 }
 
+func (a *pageAttribution) addStorageIdentity(storageID uint32, identity pageObjectIdentity) {
+	for _, existing := range a.byStorage[storageID] {
+		if existing.tableID == identity.tableID && existing.objectType == identity.objectType &&
+			existing.objectStorageID == identity.objectStorageID {
+			return
+		}
+	}
+	a.byStorage[storageID] = append(a.byStorage[storageID], identity)
+}
+
 func (a *pageAttribution) attribute(bad *BadPage) (owner string, table string) {
 	if a == nil {
 		return "", ""
 	}
+	copy := *bad
+	a.apply(&copy)
+	return copy.Owner, copy.Table
+}
+
+func (a *pageAttribution) apply(bad *BadPage) {
+	if a == nil || bad == nil {
+		return
+	}
+	bad.Owner = ""
+	bad.Table = ""
+	bad.TableID = 0
+	bad.ObjectType = PageObjectUnattributed
+	bad.ObjectStorageID = 0
+	bad.ObjectGroupID = 0
+	bad.ObjectHeaderFile = -1
+	bad.ObjectHeaderBlock = 0
+	bad.Attribution = PageAttributionNone
+	bad.AttributionConfidence = PageAttributionNo
+	bad.UnattributedReason = ""
+	bad.SegmentBytes = 0
 	if bad.StorageID != 0 {
-		if label, ok := a.byStorage[bad.StorageID]; ok {
-			return splitOwnerTable(label)
+		identities := a.byStorage[bad.StorageID]
+		if len(identities) == 1 {
+			applyPageObjectIdentity(bad, identities[0])
+			return
+		}
+		if len(identities) > 1 {
+			if identity, ok := a.uniqueSegmentIdentity(bad); ok {
+				applyPageObjectIdentity(bad, identity)
+				return
+			}
+			bad.UnattributedReason = "ambiguous_storage_id"
+			return
 		}
 	}
-	// Segment-range fallback for pages whose storage id is unreadable.
+	if identity, ok := a.uniqueSegmentIdentity(bad); ok {
+		applyPageObjectIdentity(bad, identity)
+		return
+	}
+	if a.segmentMatchCount(bad) > 1 {
+		bad.UnattributedReason = "ambiguous_segment_range"
+	} else if bad.StorageID != 0 {
+		bad.UnattributedReason = "unknown_storage_id"
+	} else {
+		bad.UnattributedReason = "outside_known_segments"
+	}
+}
+
+func (a *pageAttribution) uniqueSegmentIdentity(bad *BadPage) (pageObjectIdentity, bool) {
+	var matched pageObjectIdentity
+	count := 0
 	for i := range a.segments {
 		seg := &a.segments[i]
 		if seg.groupID == bad.GroupID && seg.fileID == bad.FileID &&
-			bad.PageNo >= seg.startPage && bad.PageNo < seg.endPage {
-			return seg.owner, seg.table
+			uint64(bad.PageNo) >= seg.startPage && uint64(bad.PageNo) < seg.endPage {
+			matched = seg.identity
+			count++
 		}
 	}
-	return "", ""
+	return matched, count == 1
 }
 
-func splitOwnerTable(label string) (string, string) {
-	if i := strings.IndexByte(label, '.'); i >= 0 {
-		return label[:i], label[i+1:]
+func (a *pageAttribution) segmentMatchCount(bad *BadPage) int {
+	count := 0
+	for i := range a.segments {
+		seg := &a.segments[i]
+		if seg.groupID == bad.GroupID && seg.fileID == bad.FileID &&
+			uint64(bad.PageNo) >= seg.startPage && uint64(bad.PageNo) < seg.endPage {
+			count++
+		}
 	}
-	return "", label
+	return count
+}
+
+func applyPageObjectIdentity(bad *BadPage, identity pageObjectIdentity) {
+	bad.Owner = identity.owner
+	bad.Table = identity.table
+	bad.TableID = identity.tableID
+	bad.ObjectType = identity.objectType
+	bad.ObjectStorageID = identity.objectStorageID
+	bad.ObjectGroupID = identity.groupID
+	bad.ObjectHeaderFile = identity.headerFile
+	bad.ObjectHeaderBlock = identity.headerBlock
+	bad.Attribution = identity.method
+	bad.AttributionConfidence = identity.confidence
+	bad.UnattributedReason = ""
+	bad.SegmentBytes = identity.segmentBytes
 }
 
 // checkLeafChains walks each table's B-tree leaf chain and reports breaks or
