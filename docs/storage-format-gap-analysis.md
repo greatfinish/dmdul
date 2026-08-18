@@ -116,7 +116,7 @@ DDL 生成也需要同步收敛：时间精度建议限制在 `1..6`，带时区
 2. 从当前活动行 locator 出发追页链，禁止全文件扫描所有 LOB 页；
 3. SQL/CSV 输出中先写外置文件引用，后续再实现 row archive。
 
-### 5. HUGE TABLE 必须显式识别并诊断
+### 5. HUGE TABLE 已落地受限恢复路径
 
 总结中 HUGE 表特别重要：
 
@@ -125,11 +125,18 @@ DDL 生成也需要同步收敛：时间精度建议限制在 `1..6`，带时区
 - `QUERY HIGH` 会进入 `HMAIN/SCH.../TAB.../COL*.dta` 列存文件和压缩 section；
 - 不能把 `$RAUX` 部分行误认为完整恢复。
 
-当前 DMDUL 尚未看到 HUGE 专门处理。短期建议：
+当前 DMDUL 已完成第一阶段专门处理：
 
-- bootstrap 识别 `$AUX/$RAUX/$DAUX/$UAUX` 辅助对象并写入字典；
-- unload 遇到 HUGE 主表时默认报告 `unsupported huge table`；
-- 如果未来实现 `$RAUX` 代理恢复，必须输出严格模式诊断，避免把部分恢复当完整恢复。
+- bootstrap 识别 HUGE 主表及 `$AUX/$RAUX/$DAUX/$UAUX`，并把 SECTION、FILESIZE、
+  WITH DELTA 和辅助表 ID 写入磁盘字典；
+- DDL 使用 `CREATE HUGE TABLE`，恢复已经验证的表级存储参数；
+- unload 从 `$AUX` 定位 HFS 列 section，并合并 `$RAUX` 尾部行、`$DAUX` 删除范围和
+  `$UAUX` 更新值，而不是把 RAUX 当成完整表；
+- HFS 列文件按 section 流式读取，SQL 与 DMP 实机回灌双向 `MINUS` 为 0；
+- 压缩、加密、可空定长列及未验证类型会明确失败，不做启发式猜测。
+
+后续缺口是压缩 section、更多定长类型、多个 HFS path、HFS 校验和和 DMASM 裸盘 HFS
+映射。详细证据与边界见 [DM8 HUGE 列存储表离线恢复](huge-tables.md)。
 
 ### 6. 无 SYS 字典的 storage_scan 救援模式尚未落地
 
@@ -168,5 +175,5 @@ DDL 生成也需要同步收敛：时间精度建议限制在 `1..6`，带时区
 3. **P1：行外 LOB 和 Long Row locator/page chain**。
 4. **P1：bootstrap 标准表下载化**，降低大 SYSTEM.DBF 的扫描成本和误识别风险。
 5. **P1：storage_scan 救援模式**，支持 SYSTEM.DBF 不可用时先保全 raw 行。
-6. **P2：HUGE TABLE 诊断与 `$RAUX` 代理实验**。
+6. **P2：HUGE 压缩 section、更多标量类型、多 HFS path 与 HFS 校验和**。
 7. **P2：row archive 输出格式**，用于跨机器重装载和 LOB payload 一体化保存。

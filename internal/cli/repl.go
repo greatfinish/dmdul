@@ -655,6 +655,15 @@ func (s *interactiveSession) printTableDescription(stdout io.Writer, table dm.Di
 		attrs += ", TEMPORARY"
 	}
 	fmt.Fprintf(stdout, "  storage= %s, bytes= %d\n", attrs, table.Bytes)
+	if table.Huge {
+		delta := "WITHOUT DELTA"
+		if table.HugeWithDelta {
+			delta = "WITH DELTA"
+		}
+		fmt.Fprintf(stdout, "  huge= SECTION(%d), FILESIZE(%d MiB), %s, aux_ids= %d/%d/%d/%d\n",
+			table.HugeSectionRows, table.HugeFileSizeMB, delta,
+			table.HugeAuxTableID, table.HugeRAuxTableID, table.HugeDAuxTableID, table.HugeUAuxTableID)
+	}
 	if len(table.AssistIDs) > 0 {
 		fmt.Fprintf(stdout, "  assist_ids= %v\n", table.AssistIDs)
 	}
@@ -2690,7 +2699,15 @@ func (s *interactiveSession) printDataExportDiagnostics(stdout io.Writer, result
 	fmt.Fprintf(stdout, "planned pages: %d\n", result.PlannedPages)
 	fmt.Fprintf(stdout, "direct pages read: %d\n", result.DirectPagesRead)
 	fmt.Fprintf(stdout, "fallback pages scanned: %d\n", result.FallbackPagesScanned)
+	if result.HugeTableCount > 0 {
+		fmt.Fprintf(stdout, "HUGE tables selected: %d\n", result.HugeTableCount)
+		fmt.Fprintf(stdout, "HUGE sections read: %d\n", result.HugeSectionsRead)
+		fmt.Fprintf(stdout, "HUGE HFS files read: %d\n", result.HugeFilesRead)
+	}
 	s.log(fmt.Sprintf("[UNLOAD] planned_pages=%d direct_pages_read=%d fallback_pages_scanned=%d", result.PlannedPages, result.DirectPagesRead, result.FallbackPagesScanned))
+	if result.HugeTableCount > 0 {
+		s.log(fmt.Sprintf("[UNLOAD] huge_tables=%d huge_sections_read=%d huge_hfs_files_read=%d", result.HugeTableCount, result.HugeSectionsRead, result.HugeFilesRead))
+	}
 	if len(result.FallbackReasons) == 0 {
 		fmt.Fprintln(stdout, "fallback reason: none")
 		s.log("[UNLOAD] fallback_reason=none")

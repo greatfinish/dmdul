@@ -470,7 +470,7 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo, schemaCount int) err
 		}
 	}
 	rows := [][]string{
-		{"format_version", "2"},
+		{"format_version", "3"},
 		{"source", dict.Source},
 		{"system_path", dict.SystemPath},
 		{"control_path", dict.ControlPath},
@@ -546,9 +546,17 @@ func writeDictionaryTables(path string, tables []DictionaryTable) error {
 			formatInt16Field(table.RootFile),
 			formatUint32Field(table.RootPage),
 			formatUint32ListField(table.AssistIDs),
+			formatBoolField(table.Huge),
+			formatBoolField(table.HugeWithDelta),
+			formatUint32Field(table.HugeSectionRows),
+			formatUint32Field(table.HugeFileSizeMB),
+			formatUint32Field(table.HugeAuxTableID),
+			formatUint32Field(table.HugeRAuxTableID),
+			formatUint32Field(table.HugeDAuxTableID),
+			formatUint32Field(table.HugeUAuxTableID),
 		})
 	}
-	return writeTSV(path, []string{"table_id", "owner", "table_name", "column_count", "tablespace", "group_id", "header_file", "header_block", "bytes", "blocks", "extents", "temporary", "storage", "partitioned", "storage_id", "root_file", "root_page", "assist_ids"}, rows)
+	return writeTSV(path, []string{"table_id", "owner", "table_name", "column_count", "tablespace", "group_id", "header_file", "header_block", "bytes", "blocks", "extents", "temporary", "storage", "partitioned", "storage_id", "root_file", "root_page", "assist_ids", "huge", "huge_with_delta", "huge_section_rows", "huge_file_size_mb", "huge_aux_table_id", "huge_raux_table_id", "huge_daux_table_id", "huge_uaux_table_id"}, rows)
 }
 
 func writeDictionaryColumns(path string, columns []DictionaryColumn) error {
@@ -795,6 +803,16 @@ func readDictionaryTables(path string) ([]DictionaryTable, error) {
 				table.RootFile = parseOptionalInt16Field(rec[15], -1)
 				table.RootPage = parseUint32Field(rec[16])
 				table.AssistIDs = parseUint32ListField(rec[17])
+			}
+			if len(rec) >= 26 {
+				table.Huge = parseBoolField(rec[18])
+				table.HugeWithDelta = parseBoolField(rec[19])
+				table.HugeSectionRows = parseUint32Field(rec[20])
+				table.HugeFileSizeMB = parseUint32Field(rec[21])
+				table.HugeAuxTableID = parseUint32Field(rec[22])
+				table.HugeRAuxTableID = parseUint32Field(rec[23])
+				table.HugeDAuxTableID = parseUint32Field(rec[24])
+				table.HugeUAuxTableID = parseUint32Field(rec[25])
 			}
 			tables = append(tables, table)
 			continue

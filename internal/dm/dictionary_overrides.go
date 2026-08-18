@@ -92,6 +92,16 @@ func applyDictionaryTableOverrides(dict *DictionaryInfo, tables map[uint32]dicti
 }
 
 func applyDictionaryTableFlags(obj dictionaryObject, table DictionaryTable) dictionaryObject {
+	if table.Huge {
+		obj.Info1 |= tableHugeInfo1Flag
+		obj.HugeTableFlag = true
+		obj.HugeAuxID = table.HugeAuxTableID
+		obj.HugeRAuxID = table.HugeRAuxTableID
+		obj.HugeDAuxID = table.HugeDAuxTableID
+		obj.HugeUAuxID = table.HugeUAuxTableID
+		obj.HugeWithDeltaFlag = table.HugeWithDelta
+		obj.Info3 = applyHugeStorageSettings(obj.Info3, table.HugeSectionRows, table.HugeFileSizeMB)
+	}
 	switch strings.ToUpper(strings.TrimSpace(table.Storage)) {
 	case heapStorageOrg:
 		obj.Info1 |= 0x10
@@ -104,6 +114,30 @@ func applyDictionaryTableFlags(obj dictionaryObject, table DictionaryTable) dict
 		obj.Info3 &^= tableTemporaryInfo3Flag | tableTemporarySessionInfo3Flag
 	}
 	return obj
+}
+
+func applyHugeStorageSettings(info3 uint64, sectionRows uint32, fileSizeMB uint32) uint64 {
+	if exponent, ok := powerOfTwoExponent(sectionRows, 10, 20); ok {
+		info3 &^= uint64(0x1F) << 24
+		info3 |= uint64(exponent) << 24
+	}
+	if exponent, ok := powerOfTwoExponent(fileSizeMB, 4, 20); ok {
+		info3 &^= uint64(0xFF) << 40
+		info3 |= uint64(exponent) << 40
+	}
+	return info3
+}
+
+func powerOfTwoExponent(value uint32, minExponent uint8, maxExponent uint8) (uint8, bool) {
+	if value == 0 || value&(value-1) != 0 {
+		return 0, false
+	}
+	var exponent uint8
+	for value > 1 {
+		value >>= 1
+		exponent++
+	}
+	return exponent, exponent >= minExponent && exponent <= maxExponent
 }
 
 func applyDictionaryTableStorage(dictionaryTables map[uint32]DictionaryTable, tableStorage map[uint32]indexDef, tablespaces map[uint32]string) {

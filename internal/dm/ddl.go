@@ -29,11 +29,18 @@ const (
 	tableIOTInfo1Mask              = 0xFFFF0
 	tableTemporaryInfo3Flag        = 0x40
 	tableTemporarySessionInfo3Flag = 0x10000
+	// tableHugeInfo1Flag is present on a HUGE table and its HFS transaction
+	// auxiliaries ($AUX/$RAUX/$DAUX/$UAUX). Verified against DM8 HUGE tables
+	// with different SECTION and FILESIZE settings.
+	tableHugeInfo1Flag = uint32(0x200000)
 	// tableLongRowInfo3Flag is bit 50 of SYSOBJECTS.INFO3, set for tables
 	// created with STORAGE(USING LONG ROW). Verified by diffing minimal
 	// plain vs USING LONG ROW tables: only this bit changes.
 	tableLongRowInfo3Flag            = uint64(1) << 50
 	longRowStorageOrg                = "USING LONG ROW"
+	hugeStorageOrg                   = "HUGE"
+	defaultHugeSectionRows           = uint32(65536)
+	defaultHugeFileSizeMB            = uint32(64)
 	tableTemporaryDeleteRowsClause   = "ON COMMIT DELETE ROWS"
 	tableTemporaryPreserveRowsClause = "ON COMMIT PRESERVE ROWS"
 	sysObjectsInfo1Offset            = 0x1F
@@ -131,22 +138,28 @@ type ddlLocation struct {
 }
 
 type dictionaryObject struct {
-	ID          uint32
-	SchemaID    uint32
-	Owner       string
-	ParentID    int32
-	Info1       uint32
-	Info2       uint32
-	Info3       uint64
-	Info4       int64
-	Payload     []byte
-	Valid       string
-	Name        string
-	Type        string
-	Subtype     string
-	TargetOwner string
-	TargetName  string
-	Location    ddlLocation
+	ID                uint32
+	SchemaID          uint32
+	Owner             string
+	ParentID          int32
+	Info1             uint32
+	Info2             uint32
+	Info3             uint64
+	Info4             int64
+	Payload           []byte
+	Valid             string
+	Name              string
+	Type              string
+	Subtype           string
+	TargetOwner       string
+	TargetName        string
+	Location          ddlLocation
+	HugeAuxID         uint32
+	HugeRAuxID        uint32
+	HugeDAuxID        uint32
+	HugeUAuxID        uint32
+	HugeTableFlag     bool
+	HugeWithDeltaFlag bool
 }
 
 func (obj dictionaryObject) isIOTTable() bool {
@@ -171,7 +184,85 @@ func (obj dictionaryObject) isLongRowTable() bool {
 	return obj.Info3&tableLongRowInfo3Flag != 0
 }
 
+func (obj dictionaryObject) isHugeObject() bool {
+	return obj.Info1&tableHugeInfo1Flag != 0
+}
+
+func (obj dictionaryObject) isHugeInternalTable() bool {
+	return obj.isHugeObject() && isHugeInternalTableName(obj.Name)
+}
+
+func (obj dictionaryObject) isHugeMainCandidate() bool {
+	return obj.isHugeObject() && !obj.isHugeInternalTable()
+}
+
+func (obj dictionaryObject) isHugeTable() bool {
+	return obj.isHugeMainCandidate() && (obj.HugeTableFlag || obj.HugeAuxID != 0)
+}
+
+func (obj dictionaryObject) hugeWithDelta() bool {
+	return obj.HugeWithDeltaFlag || obj.HugeRAuxID != 0 || obj.HugeDAuxID != 0 || obj.HugeUAuxID != 0
+}
+
+func (obj dictionaryObject) hugeSectionRows() uint32 {
+	exponent := uint32((obj.Info3 >> 24) & 0x1F)
+	if exponent < 10 || exponent > 20 {
+		return defaultHugeSectionRows
+	}
+	return uint32(1) << exponent
+}
+
+func (obj dictionaryObject) hugeFileSizeMB() uint32 {
+	exponent := uint32((obj.Info3 >> 40) & 0xFF)
+	if exponent < 4 || exponent > 20 {
+		return defaultHugeFileSizeMB
+	}
+	return uint32(1) << exponent
+}
+
+func isHugeInternalTableName(name string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	for _, suffix := range []string{"$RAUX", "$DAUX", "$UAUX", "$AUX"} {
+		if strings.HasSuffix(upper, suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func linkHugeTableObjects(tables map[uint32]dictionaryObject) {
+	byOwnerName := make(map[string]uint32, len(tables))
+	for id, table := range tables {
+		key := strings.ToUpper(strings.TrimSpace(table.Owner)) + "\x00" + strings.ToUpper(strings.TrimSpace(table.Name))
+		byOwnerName[key] = id
+	}
+	for id, table := range tables {
+		if !table.isHugeMainCandidate() {
+			continue
+		}
+		prefix := strings.ToUpper(strings.TrimSpace(table.Owner)) + "\x00" + strings.ToUpper(strings.TrimSpace(table.Name))
+		table.HugeAuxID = byOwnerName[prefix+"$AUX"]
+		table.HugeRAuxID = byOwnerName[prefix+"$RAUX"]
+		table.HugeDAuxID = byOwnerName[prefix+"$DAUX"]
+		table.HugeUAuxID = byOwnerName[prefix+"$UAUX"]
+		table.HugeTableFlag = table.HugeAuxID != 0
+		table.HugeWithDeltaFlag = table.HugeRAuxID != 0 || table.HugeDAuxID != 0 || table.HugeUAuxID != 0
+		tables[id] = table
+	}
+}
+
+func removeHugeInternalTables(tables map[uint32]dictionaryObject) {
+	for id, table := range tables {
+		if table.isHugeInternalTable() {
+			delete(tables, id)
+		}
+	}
+}
+
 func (obj dictionaryObject) tableStorageOrganization() string {
+	if obj.isHugeTable() {
+		return hugeStorageOrg
+	}
 	org := heapStorageOrg
 	if obj.isIOTTable() {
 		org = defaultStorageOrg
@@ -322,6 +413,8 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 			roles[obj.ID] = obj
 		}
 	}
+	linkHugeTableObjects(tables)
+	removeHugeInternalTables(tables)
 	applyDictionaryUserOverrides(opts.Dictionary, users)
 	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, tablespaces)
 
@@ -819,9 +912,17 @@ func parseDDLColumnRow(page []byte, rowOff int, pageNo uint32, slotNo uint16, sl
 	if !ok {
 		return columnDef{}, false
 	}
+	typeMarkerOff := next
 	dataType, next, ok := readDDLShortString(page, next, decoder, false)
 	if !ok {
 		return columnDef{}, false
+	}
+	if typeMarkerOff < len(page) && page[typeMarkerOff] >= 0x80 && page[typeMarkerOff] <= 0xBF {
+		rawLength := int(page[typeMarkerOff] - 0x80)
+		rawStart := typeMarkerOff + 1
+		if rawStart+rawLength <= len(page) {
+			dataType = repairCatalogDataType(page[rawStart:rawStart+rawLength], dataType)
+		}
 	}
 	if !isSafeShortText(name) || !isSafeShortText(dataType) {
 		return columnDef{}, false
@@ -859,6 +960,26 @@ func parseDDLIndexRow(page []byte, slotOff int, pageSize uint32) (indexDef, bool
 			continue
 		}
 		keyNum := binary.LittleEndian.Uint16(page[base+23:])
+		if keyNum == 0 {
+			// KEYINFO is nullable. DM can omit the trailing NULL value entirely
+			// for a keyless table-data storage row, so there is no short-string
+			// marker at base+31. Requiring 0x80 here used to drop ordinary heap
+			// and HUGE $RAUX storage roots and force full-file fallbacks.
+			return indexDef{
+				ID:          binary.LittleEndian.Uint32(page[base:]),
+				IsUnique:    string([]byte{isUnique}),
+				GroupID:     binary.LittleEndian.Uint16(page[base+5:]),
+				RootFile:    int16(binary.LittleEndian.Uint16(page[base+7:])),
+				RootPage:    int32(binary.LittleEndian.Uint32(page[base+9:])),
+				Type:        idxType,
+				XType:       binary.LittleEndian.Uint32(page[base+15:]),
+				Flag:        binary.LittleEndian.Uint32(page[base+19:]),
+				KeyNum:      keyNum,
+				InitExtents: binary.LittleEndian.Uint16(page[base+25:]),
+				BatchAlloc:  binary.LittleEndian.Uint16(page[base+27:]),
+				MinExtents:  binary.LittleEndian.Uint16(page[base+29:]),
+			}, true
+		}
 		keyMarker := page[base+31]
 		if keyMarker < 0x80 || keyMarker > 0xBF {
 			continue
@@ -869,7 +990,7 @@ func parseDDLIndexRow(page []byte, slotOff int, pageSize uint32) (indexDef, bool
 		if keyEnd > int(pageSize) {
 			continue
 		}
-		if keyNum*3 != uint16(keyLen) && !(keyNum == 0 && keyLen == 0) {
+		if keyNum*3 != uint16(keyLen) {
 			continue
 		}
 		keyInfo := append([]byte(nil), page[keyStart:keyEnd]...)
@@ -1239,6 +1360,18 @@ func tableStorageByID(tables map[uint32]dictionaryObject, indexObjects map[uint3
 		}
 		result[tableID] = idx
 	}
+	// HUGE main and transaction auxiliary tables can have SYSINDEXES storage
+	// rows without a matching TABOBJ/INDEX object. Their table-data storage id
+	// follows the regular 0x02000000|table_id rule, so retain that exact catalog
+	// row instead of guessing a root or scanning a data file.
+	for tableID, table := range tables {
+		if !table.isHugeObject() {
+			continue
+		}
+		if idx, ok := indexes[tableDataAssistID(tableID)]; ok && idx.Flag&1 != 0 && idx.KeyNum == 0 {
+			result[tableID] = idx
+		}
+	}
 	return result
 }
 
@@ -1574,7 +1707,9 @@ func renderCreateTables(out *strings.Builder, tables map[uint32]dictionaryObject
 			continue
 		}
 		createKind := "CREATE TABLE"
-		if table.isTemporaryTable() {
+		if table.isHugeTable() {
+			createKind = "CREATE HUGE TABLE"
+		} else if table.isTemporaryTable() {
 			createKind = "CREATE GLOBAL TEMPORARY TABLE"
 		}
 		out.WriteString(fmt.Sprintf("%s %s.%s (\n", createKind, quoteIdent(table.Owner), quoteIdent(table.Name)))
@@ -1599,11 +1734,29 @@ func renderCreateTables(out *strings.Builder, tables map[uint32]dictionaryObject
 		if partitionClause != "" && !table.isTemporaryTable() {
 			out.WriteString(partitionClause)
 		}
-		if storage, ok := tableStorage[tableID]; ok && !table.isTemporaryTable() && partitionClause == "" {
+		if table.isHugeTable() {
+			groupID := uint32(table.Info2 & 0xFFFF)
+			if storage, ok := tableStorage[tableID]; ok && storage.GroupID != 0 {
+				groupID = uint32(storage.GroupID)
+			}
+			out.WriteString(hugeStorageClause(table, groupID, tablespaces))
+		} else if storage, ok := tableStorage[tableID]; ok && !table.isTemporaryTable() && partitionClause == "" {
 			out.WriteString(storageClause(uint32(storage.GroupID), tablespaces, table.tableStorageOrganization()))
 		}
 		out.WriteString(";\n\n")
 	}
+}
+
+func hugeStorageClause(table dictionaryObject, groupID uint32, tablespaces map[uint32]string) string {
+	delta := "WITHOUT DELTA"
+	if table.hugeWithDelta() {
+		delta = "WITH DELTA"
+	}
+	clause := fmt.Sprintf("\nSTORAGE(SECTION(%d), FILESIZE(%d), %s", table.hugeSectionRows(), table.hugeFileSizeMB(), delta)
+	if tablespace := strings.TrimSpace(tablespaces[groupID]); tablespace != "" {
+		clause += ", ON " + quoteIdent(tablespace)
+	}
+	return clause + ")"
 }
 
 func renderPartitionClause(tableID uint32, parts []PartitionInfo, keyColIDs []uint16, columnsByTableColID map[tableColKey]columnDef) string {

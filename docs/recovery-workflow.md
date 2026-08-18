@@ -23,7 +23,7 @@ dmdul 支持两条输入路径，开始前必须先确定使用哪一条：
 
 | 输入路径 | 必需输入 | `dm.ctl` 的角色 |
 | --- | --- | --- |
-| 文件系统 DBF | `SYSTEM.DBF` 和目标表涉及的全部用户表空间 DBF | 可选核对；数据文件页头和离线副本优先 |
+| 文件系统 DBF/HFS | `SYSTEM.DBF`、目标表空间 DBF；目标含 HUGE 表时还要完整 HFS 根目录 | 可选核对；数据文件页头和离线副本优先 |
 | DMASM 裸盘 | 承载目标数据库 DBF 的全部相关磁盘组成员盘 | 从 ASM 目录中自动发现，缺失时按受限规则降级 |
 
 不要把不同时间点、不同数据库或不同快照链的文件混在同一个恢复任务里。
@@ -36,6 +36,8 @@ dmdul 支持两条输入路径，开始前必须先确定使用哪一条：
 DmServiceDMSERVER stop
 mkdir -p /recover/snap
 cp /dmdata/DAMENG/*.DBF /dmdata/DAMENG/dm.ctl /recover/snap/
+# 目标包含 HUGE 表时，还要复制对应混合表空间的完整 HFS 根，例如：
+cp -a /dmdata/DAMENG/HMAIN /recover/snap/
 DmServiceDMSERVER start
 ```
 
@@ -47,6 +49,7 @@ CHECKPOINT(100);
 
 ```bash
 cp /dmdata/DAMENG/*.DBF /dmdata/DAMENG/dm.ctl /recover/snap/
+cp -a /dmdata/DAMENG/HMAIN /recover/snap/  # 仅在目标包含 HUGE 表时需要
 ```
 
 checkpoint 把脏页刷盘，但复制期间仍可能发生新写入，因此普通逐文件复制不能构成严格的一致性
@@ -62,6 +65,7 @@ checkpoint 把脏页刷盘，但复制期间仍可能发生新写入，因此普
 | `SYSTEM.DBF` | 是 | 系统表空间，字典的唯一来源 |
 | 业务表空间 `*.DBF` | 是 | 表数据本体 |
 | `MAIN.DBF` | 是 | 默认表空间，多数用户表在这里 |
+| `HMAIN/` 或其他 HFS 根 | 视情况 | HUGE 列数据；必须与 SYSTEM/MAIN DBF 来自同一快照 |
 | `dm.ctl` | 否 | 表空间名与文件映射参考；缺失时按页头自识别 |
 | `dm.ini` | 否 | 页大小等参数参考 |
 | `ROLL.DBF` / `TEMP.DBF` | 否 | 回滚段/临时段，dmdul 不使用 |
@@ -82,6 +86,9 @@ DMDSC/DMASM 环境应停止所有可能写盘的数据库和 ASM 节点，再复
 
 dmdul 会直接恢复 DMASM 目录、INODE、AU 描述符、副本和条带映射，不要求先启动 DMASMSVR，
 也不要求先执行 `asmcmd cp`。
+
+当前 DMASM 逻辑 Reader 只覆盖 DBF。若目标包含 HUGE 表，还必须另行提供对应的 HFS 文件
+目录；DMASM 成员裸盘中的 HFS 文件映射尚未接入 HUGE 解析器。
 
 ## 2. 建立独立恢复目录并选择输入
 
@@ -115,6 +122,11 @@ DMDUL> set output_dir /recover/out;
 
 > `data_dir` 里的同名文件优先于 `dm.ctl` 记录的绝对路径。这一条很关键：与原库同机恢复时，
 > `dm.ctl` 存的是 `/dmdata/DAMENG/...`，如果跟随它就会读到线上原文件而不是你的离线副本。
+
+目标包含 HUGE 表时，把 `HMAIN/` 或其他 HFS 根放在 `data_dir` 下。`bootstrap` 会把 HUGE
+主表和事务辅助对象写入磁盘字典；`describe owner.table;` 可核对 SECTION、FILESIZE、
+WITH DELTA 和四个辅助表 ID。完整支持边界见
+[DM8 HUGE 列存储表离线恢复](huge-tables.md)。
 
 ### 2.2 DMASM 裸盘
 

@@ -130,6 +130,41 @@ func TestWriteAndLoadDictionaryFiles(t *testing.T) {
 	}
 }
 
+func TestDictionaryFilesPreserveHugeTableMetadata(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), DefaultDictionaryDirName)
+	dict := &DictionaryInfo{
+		Source: "SYSTEM.DBF",
+		Users:  []DictionaryUser{{ID: 1, Name: "SYSDBA"}},
+		Tables: []DictionaryTable{{
+			ID: 1063, Owner: "SYSDBA", Name: "HUGE_TX", ColumnCount: 2,
+			Tablespace: "MAIN", GroupID: 4, Storage: hugeStorageOrg,
+			Huge: true, HugeWithDelta: true, HugeSectionRows: 1024, HugeFileSizeMB: 16,
+			HugeAuxTableID: 1064, HugeRAuxTableID: 1065, HugeDAuxTableID: 1066, HugeUAuxTableID: 1067,
+		}},
+		Columns: []DictionaryColumn{
+			{TableID: 1063, TableOwner: "SYSDBA", TableName: "HUGE_TX", ColID: 0, Name: "ID", DataType: "INT", Nullable: "N"},
+			{TableID: 1063, TableOwner: "SYSDBA", TableName: "HUGE_TX", ColID: 1, Name: "VAL", DataType: "VARCHAR", Length: 20, Nullable: "Y"},
+		},
+	}
+	if _, err := WriteDictionaryFiles(dir, dict); err != nil {
+		t.Fatalf("WriteDictionaryFiles: %v", err)
+	}
+	loaded, _, err := LoadDictionaryFiles(dir)
+	if err != nil {
+		t.Fatalf("LoadDictionaryFiles: %v", err)
+	}
+	if len(loaded.Tables) != 1 {
+		t.Fatalf("loaded tables=%d, want 1", len(loaded.Tables))
+	}
+	table := loaded.Tables[0]
+	if !table.Huge || !table.HugeWithDelta || table.Storage != hugeStorageOrg || table.HugeSectionRows != 1024 || table.HugeFileSizeMB != 16 {
+		t.Fatalf("HUGE settings were not preserved: %+v", table)
+	}
+	if table.HugeAuxTableID != 1064 || table.HugeRAuxTableID != 1065 || table.HugeDAuxTableID != 1066 || table.HugeUAuxTableID != 1067 {
+		t.Fatalf("HUGE auxiliary ids were not preserved: %+v", table)
+	}
+}
+
 func TestRebuildDictionaryFilesArchivesPreviousDirectory(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), DefaultDictionaryDirName)
 	oldDict := &DictionaryInfo{

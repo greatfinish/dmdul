@@ -12,6 +12,53 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.8.0 - HUGE Column-Store Recovery
+
+### Added
+
+- bootstrap 识别 HUGE 主表及 `$AUX/$RAUX/$DAUX/$UAUX` 内部对象；磁盘字典
+  `tables.tsv` 升级到格式 3，持久化 HUGE 标志、SECTION、FILESIZE、WITH DELTA 和四个
+  辅助表 ID，同时继续兼容旧格式字典。
+- DDL 生成 `CREATE HUGE TABLE`，恢复 SECTION、FILESIZE、WITH/WITHOUT DELTA 和目标
+  混合表空间；`describe` 增加 HUGE 存储参数与辅助对象定位信息。
+- 数据卸载通过 `$AUX` 定位 HFS 列 section，按 section 流式读取列文件，并合并 `$RAUX`
+  尾部行、`$DAUX` 删除范围和 `$UAUX` 更新值。统一逻辑行可输出 SQL、dmfldr 或 DMP。
+- 卸载日志增加 HUGE 表数、读取 section 数和 HFS 文件数。
+
+### Fixed
+
+- `SYSINDEXES.KEYNUM=0` 且可空 `KEYINFO` 物理省略时，不再丢失 keyless table-data storage
+  root；这同时减少普通堆存储和 HUGE RAUX 的全文件 fallback。
+- 同一 HUGE 辅助对象残留多个历史 storage root 时选择最新目录 ID，避免 ALTER/重建后读取
+  旧 `$AUX` 或 `$RAUX` 页面。
+- 系统字段类型名跨页保护边界损坏时，按原始短字符串长度和仍完好的 ASCII 位置做确定性修复，
+  不再把 `VARCHAR` 等类型写成乱码。
+
+### Safety
+
+- 在写出第一行前预检目标表全部 section。压缩 `CPR_FLAG != N`、加密
+  `ENC_FLAG != N`、未验证的可空定长列或类型会明确失败，不生成部分成功的逻辑数据。
+- 校验 HFS section 的 4 KiB 对齐、magic、`N_LEN`、文件边界、列行数一致性和变长 offset 表。
+- `$UAUX` 改用紧凑 `(row_id,col_id)` 键，限制唯一更新数和累计值字节；单 section 变长列
+  offset 表也设置 256 MiB 上限，避免损坏元数据或超大 delta 导致内存失控。
+
+### Tests
+
+- 新增 HUGE 对象链接、keyless SYSINDEXES、类型名修复、DDL、字典 TSV 往返、最新辅助
+  storage 选择，以及合成 HFS `INT/VARCHAR/NULL` section 单元测试。
+- ARM64 DM8 一致性快照实测 HFS 主 section 与 RAUX/DAUX/UAUX 合并；SQL 回灌双向
+  `MINUS=0`。表级 DMP 经官方 `dimp REMAP_SCHEMA` 导入 1499 行，与同快照 SQL 回灌表
+  双向 `MINUS=0`。压缩 DECIMAL 样本按预期在输出前拒绝。
+- 补充 RAUX-only 100 行和两个完整 HFS section 加 RAUX 的 2500 行实机样本；SQL 回灌
+  双向 `MINUS=0`。RAUX-only 表经 dmfldr 装载 100 行、0 拒绝，双向 `MINUS=0`。
+
+### Documentation
+
+- 新增 `docs/huge-tables.md`，README、标准恢复流程、存储格式差距分析和路线图同步说明
+  HUGE/HFS 文件准备、实现路径、验证证据与当前安全边界。
+
+------
+
 ## v0.7.3 - Two-Stage Page Diagnostics
 
 ### Added

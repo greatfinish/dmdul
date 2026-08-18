@@ -45,5 +45,6 @@ table data from database files when the database instance cannot start normally.
    - Add resumable exports.
    - Add explicit raw `storage_scan` recovery mode for cases where SYSTEM.DBF or
      key SYS dictionaries are unavailable.
-   - Detect unsupported HUGE TABLE / column-store layouts and report diagnostics
-     instead of silently producing partial data.
+   - Extend the bounded HUGE TABLE path beyond uncompressed `INT/VARCHAR/CHAR`:
+     compression, more fixed-width types, multiple HFS paths, HFS checksums, and
+     raw-DMASM HFS files. Unsupported layouts must keep failing before output.

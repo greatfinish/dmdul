@@ -86,6 +86,9 @@ type DataExportResult struct {
 	RecoverySources      []DataRecoverySource
 	OutputFormat         string
 	TimeFractionLoss     int
+	HugeTableCount       int
+	HugeSectionsRead     int
+	HugeFilesRead        int
 	// OversizedSQLStatements counts generated SQL INSERT statements longer
 	// than disql's 160 KiB input buffer; disql aborts such statements with
 	// "input too long", silently losing the row on import.
@@ -169,6 +172,7 @@ type dataTableInfo struct {
 	recoveryGroupID uint32
 	segment         tableSegment
 	segmentKnown    bool
+	huge            bool
 	// sqlInsertPrefix caches `INSERT INTO "O"."T" ("c1", ...) VALUES (` so
 	// the per-row SQL renderer does not rebuild and re-quote the identical
 	// column list for every row.
@@ -855,7 +859,9 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			indexObjects[obj.ID] = obj
 		}
 	}
+	linkHugeTableObjects(tables)
 	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, nil)
+	hugeAuxTableIDs := selectedHugeAuxTableIDs(tables, ownerMatcher, tableMatcher, excludeMatcher)
 
 	columnsByTable := make(map[uint32][]columnDef)
 	columnCount := 0
@@ -868,11 +874,14 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		if !ok || !ownerMatcher.allowed(table.Owner) {
 			return
 		}
-		if !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) {
+		selectedUserTable := !table.isHugeInternalTable() && tableMatcher.allowed(table.Owner, table.Name) && !excludeMatcher.allowed(table.Owner, table.Name)
+		if !selectedUserTable && !hugeAuxTableIDs[col.TableID] {
 			return
 		}
 		columnsByTable[col.TableID] = append(columnsByTable[col.TableID], col)
-		columnCount++
+		if selectedUserTable {
+			columnCount++
+		}
 	}); err != nil {
 		return nil, err
 	}
@@ -882,12 +891,26 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		})
 	}
 	if dictColumnsByTable, _, dictColumnCount, ok := dictionaryColumnMaps(opts.Dictionary, dictionaryTables, tables, ownerMatcher, tableMatcher, excludeMatcher); ok {
-		columnsByTable = dictColumnsByTable
+		for tableID, columns := range dictColumnsByTable {
+			columnsByTable[tableID] = columns
+		}
 		columnCount = dictColumnCount
 	}
+	ensureHugeAuxColumnDefinitions(tables, columnsByTable)
 
 	indexes := make(map[uint32]indexDef)
-	if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
+	if catalog, fallbackReason := loadStandardBootstrapCatalog(stream, decoder, nil); fallbackReason == "" && len(catalog.indexes) > 0 {
+		for id, index := range catalog.indexes {
+			indexes[id] = index
+		}
+		for id, obj := range catalog.objects {
+			if obj.Type != "TABOBJ" || obj.Subtype != "INDEX" {
+				continue
+			}
+			obj.Owner = resolveSchemaName(obj.SchemaID, schemaNames)
+			indexObjects[id] = obj
+		}
+	} else if err := stream.forEachDictionaryRow(func(page []byte, pageNo uint32, slotNo uint16, slotOff uint16) {
 		idx, ok := parseDDLIndexRow(page, int(slotOff), pageSize)
 		if ok {
 			indexes[idx.ID] = idx
@@ -904,6 +927,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	}
 	applyDictionaryPartitionOverrides(opts.Dictionary, dictionaryTables, tables, ownerMatcher, partitionsByTable, nil)
 	dataStorageByTable := tableStorageByID(tables, indexObjects, indexes, nil)
+	ensureHugeAuxStorageMappings(tables, indexes, assistByParentID, dataStorageByTable)
 	secondaryIndexStorageIDs := secondaryIndexStorageIDSet(indexObjects, indexes)
 	var dataFiles []dataFileRef
 	if len(opts.DataSources) > 0 {
@@ -920,11 +944,12 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	dataFilePages := newDataFilePageCache(dataFiles, pageSize)
 	lobReader := &dmLOBReader{cache: dataFilePages}
 	selectedTables := make(map[uint32]dataTableInfo)
+	hugeTables := make(map[uint32]dataTableInfo)
 	storageUnits := make(map[uint32]dataTableInfo)
 	assistByID := make(map[uint32][]dataTableInfo)
 	planFailureReasons := make(map[uint32][]string)
 	for tableID, table := range tables {
-		if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) {
+		if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) || table.isHugeInternalTable() {
 			continue
 		}
 		if table.isTemporaryTable() || len(columnsByTable[tableID]) == 0 {
@@ -942,8 +967,13 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			segmentKnown:    hasSegmentRange(opts.Dictionary, tableID),
 			sqlInsertPrefix: sqlInsertPrefixForTable(table, columnsByTable[tableID]),
 			fldrDialect:     fldrDialectForColumns(columnsByTable[tableID]),
+			huge:            table.isHugeTable(),
 		}
 		selectedTables[tableID] = baseInfo
+		if baseInfo.huge {
+			hugeTables[tableID] = baseInfo
+			continue
+		}
 		storageUnits[tableID] = baseInfo
 		for _, storage := range assistByParentID[tableID] {
 			if baseInfo.dataStorageID != 0 && storage.ID != baseInfo.dataStorageID {
@@ -1021,6 +1051,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		AssistIndexCount: len(assistByID),
 		DataFileCount:    0,
 		PlannedPages:     len(plannedRefs),
+		HugeTableCount:   len(hugeTables),
 	}
 	rowStats := initDataTableRowStats(selectedTables)
 	if (outputFormat == "fldr" || outputFormat == "dmp") && opts.TableOutputPath == nil && len(selectedTables) > 1 {
@@ -1038,6 +1069,61 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		}
 	}()
 
+	hugeContext := hugeDataExportContext{
+		dataDir:        dataDir,
+		tables:         tables,
+		columnsByTable: columnsByTable,
+		storageByTable: dataStorageByTable,
+		dataFiles:      dataFiles,
+		pageCache:      dataFilePages,
+		pageSize:       pageSize,
+		decoder:        decoder,
+		outputFormat:   outputFormat,
+		dmpCharset:     dmpConfig.charset,
+		maxRows:        opts.MaxRows,
+	}
+	for _, tableID := range sortedDataTableIDs(hugeTables) {
+		info := hugeTables[tableID]
+		stats, exportErr := exportHugeTableData(hugeContext, info, output, rowStats[tableID], result)
+		result.HugeSectionsRead += stats.sectionsRead
+		result.HugeFilesRead += stats.filesRead
+		if exportErr == nil {
+			continue
+		}
+		if len(selectedTables) == 1 {
+			return nil, fmt.Errorf("export HUGE table %s.%s: %w", info.table.Owner, info.table.Name, exportErr)
+		}
+		result.RowsFailed++
+		if rowStats[tableID] != nil {
+			rowStats[tableID].RowsFailed++
+		}
+		result.FallbackReasons = append(result.FallbackReasons,
+			fmt.Sprintf("HUGE table %s.%s was not exported: %v", info.table.Owner, info.table.Name, exportErr))
+	}
+
+	ordinaryTableCount := len(selectedTables) - len(hugeTables)
+	if ordinaryTableCount == 0 {
+		result.TableRowCounts = finalizeDataTableRowStats(rowStats)
+		for _, item := range result.TableRowCounts {
+			if item.RowsLocated > 0 {
+				result.TablesWithRows++
+			} else {
+				result.TablesWithoutRows++
+			}
+		}
+		result.TableOutputs = output.tableOutputs()
+		result.OversizedSQLStatements = output.oversizedSQLRows
+		result.OversizedSQLTables = sortedOversizedSQLTables(output.oversizedSQLTableIDs)
+		if (outputFormat == "fldr" || outputFormat == "dmp") && opts.TableOutputPath == nil && result.RowsExported == 0 {
+			result.OutputPath = ""
+		}
+		if err := output.close(); err != nil {
+			return nil, fmt.Errorf("finalize %s data output: %w", outputFormat, err)
+		}
+		outputClosed = true
+		return result, nil
+	}
+
 	if len(assistByID) == 0 || len(dataFiles) == 0 {
 		if len(assistByID) == 0 {
 			result.FallbackReasons = append(result.FallbackReasons, "no table data storage mapping is available for the selected tables")
@@ -1046,7 +1132,13 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			result.FallbackReasons = append(result.FallbackReasons, "no user data files are available; selected tables were not scanned")
 		}
 		result.TableRowCounts = finalizeDataTableRowStats(rowStats)
-		result.TablesWithoutRows = len(result.TableRowCounts)
+		for _, item := range result.TableRowCounts {
+			if item.RowsLocated > 0 {
+				result.TablesWithRows++
+			} else {
+				result.TablesWithoutRows++
+			}
+		}
 		result.TableOutputs = output.tableOutputs()
 		if (outputFormat == "fldr" || outputFormat == "dmp") && opts.TableOutputPath == nil {
 			result.OutputPath = ""
@@ -1058,12 +1150,15 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		return result, nil
 	}
 
-	stop := false
+	stop := opts.MaxRows > 0 && result.RowsLocated >= opts.MaxRows
 	var pendingPartialRows []pendingPartialDataRow
 	touchedFiles := make(map[dataFileKey]bool)
 	processedDirectPages := make(map[dataPageRef]bool)
 	failedPlanUnits := make(map[uint32]bool)
 	fallbackReasonSeen := make(map[string]bool)
+	for _, reason := range result.FallbackReasons {
+		fallbackReasonSeen[reason] = true
+	}
 	recoverySources := make(map[dataRecoverySourceKey]*DataRecoverySource)
 	addFallbackReason := func(reason string) {
 		reason = strings.TrimSpace(reason)

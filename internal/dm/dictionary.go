@@ -95,24 +95,32 @@ type DictionarySchema struct {
 }
 
 type DictionaryTable struct {
-	ID          uint32
-	Owner       string
-	Name        string
-	ColumnCount int
-	Tablespace  string
-	GroupID     uint32
-	HeaderFile  int16
-	HeaderBlock uint32
-	Bytes       uint64
-	Blocks      uint32
-	Extents     uint32
-	Temporary   bool
-	Storage     string
-	Partitioned bool
-	StorageID   uint32
-	RootFile    int16
-	RootPage    uint32
-	AssistIDs   []uint32
+	ID              uint32
+	Owner           string
+	Name            string
+	ColumnCount     int
+	Tablespace      string
+	GroupID         uint32
+	HeaderFile      int16
+	HeaderBlock     uint32
+	Bytes           uint64
+	Blocks          uint32
+	Extents         uint32
+	Temporary       bool
+	Storage         string
+	Partitioned     bool
+	StorageID       uint32
+	RootFile        int16
+	RootPage        uint32
+	AssistIDs       []uint32
+	Huge            bool
+	HugeWithDelta   bool
+	HugeSectionRows uint32
+	HugeFileSizeMB  uint32
+	HugeAuxTableID  uint32
+	HugeRAuxTableID uint32
+	HugeDAuxTableID uint32
+	HugeUAuxTableID uint32
 }
 
 type DictionaryColumn struct {
@@ -309,6 +317,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			roleObjects[obj.ID] = obj
 		}
 	}
+	linkHugeTableObjects(tables)
 	schemaList := dictionarySchemasFromObjects(objects, userObjects, ownerMatcher)
 	schemaOwners := make(map[string]string, len(schemaList))
 	for _, schema := range schemaList {
@@ -316,6 +325,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	}
 
 	columnsByTable := make(map[uint32]int)
+	allColumnDefsByTable := make(map[uint32][]columnDef)
 	var columnList []DictionaryColumn
 	columnCount := 0
 	parsedColumnRows := 0
@@ -327,6 +337,10 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		parsedColumnRows++
 		table, ok := tables[col.TableID]
 		if !ok || !ownerMatcher.allowed(table.Owner) {
+			return
+		}
+		allColumnDefsByTable[col.TableID] = append(allColumnDefsByTable[col.TableID], col)
+		if table.isHugeInternalTable() {
 			return
 		}
 		columnsByTable[col.TableID]++
@@ -358,6 +372,17 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		catalog.recordTableRows("SYSCOLUMNS", parsedColumnRows, false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
 	} else {
 		catalog.recordTableRows("SYSCOLUMNS", parsedColumnRows, true, "")
+	}
+	repairHugeMainColumnsFromRAux(tables, allColumnDefsByTable)
+	for i := range columnList {
+		for _, recovered := range allColumnDefsByTable[columnList[i].TableID] {
+			if recovered.ColID == columnList[i].ColID {
+				columnList[i].DataType = recovered.DataType
+				columnList[i].Length = recovered.Length
+				columnList[i].Scale = recovered.Scale
+				break
+			}
+		}
 	}
 
 	indexes := catalog.indexes
@@ -475,7 +500,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		userNamesByName[strings.ToUpper(user.Name)] = user
 	}
 	for id, table := range tables {
-		if !ownerMatcher.allowed(table.Owner) || columnsByTable[id] == 0 {
+		if !ownerMatcher.allowed(table.Owner) || table.isHugeInternalTable() || columnsByTable[id] == 0 {
 			continue
 		}
 		var groupID uint32
@@ -484,21 +509,33 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			groupID = uint32(storage.GroupID)
 			tablespace = tablespaces[groupID]
 		}
+		if table.isHugeTable() && groupID == 0 {
+			groupID = table.Info2 & 0xFFFF
+			tablespace = tablespaces[groupID]
+		}
 		storageID, rootFile, rootPage, assistIDs := dictionaryTableStorageSnapshot(id, tableStorage, assistByParentID)
 		tableList = append(tableList, DictionaryTable{
-			ID:          table.ID,
-			Owner:       table.Owner,
-			Name:        table.Name,
-			ColumnCount: columnsByTable[id],
-			Tablespace:  tablespace,
-			GroupID:     groupID,
-			Temporary:   table.isTemporaryTable(),
-			Storage:     table.tableStorageOrganization(),
-			Partitioned: len(partitionsByTable[id]) > 0,
-			StorageID:   storageID,
-			RootFile:    rootFile,
-			RootPage:    rootPage,
-			AssistIDs:   assistIDs,
+			ID:              table.ID,
+			Owner:           table.Owner,
+			Name:            table.Name,
+			ColumnCount:     columnsByTable[id],
+			Tablespace:      tablespace,
+			GroupID:         groupID,
+			Temporary:       table.isTemporaryTable(),
+			Storage:         table.tableStorageOrganization(),
+			Partitioned:     len(partitionsByTable[id]) > 0,
+			StorageID:       storageID,
+			RootFile:        rootFile,
+			RootPage:        rootPage,
+			AssistIDs:       assistIDs,
+			Huge:            table.isHugeTable(),
+			HugeWithDelta:   table.hugeWithDelta(),
+			HugeSectionRows: table.hugeSectionRows(),
+			HugeFileSizeMB:  table.hugeFileSizeMB(),
+			HugeAuxTableID:  table.HugeAuxID,
+			HugeRAuxTableID: table.HugeRAuxID,
+			HugeDAuxTableID: table.HugeDAuxID,
+			HugeUAuxTableID: table.HugeUAuxID,
 		})
 		if _, knownSchema := schemaOwners[strings.ToUpper(table.Owner)]; !knownSchema {
 			if _, ok := userNamesByName[strings.ToUpper(table.Owner)]; !ok {
