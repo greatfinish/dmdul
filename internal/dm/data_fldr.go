@@ -210,7 +210,7 @@ func fldrBadFilePath(dataPath string) string {
 
 // WriteFldrControlFile emits the dmfldr control file that loads dataPath back
 // into owner.table.
-func WriteFldrControlFile(controlPath string, dataPath string, owner string, table string, columns []columnDef, charset string) error {
+func WriteFldrControlFile(controlPath string, dataPath string, owner string, table string, columns []columnDef) error {
 	if strings.TrimSpace(controlPath) == "" {
 		return nil
 	}
@@ -246,9 +246,10 @@ func WriteFldrControlFile(controlPath string, dataPath string, owner string, tab
 	// be represented; with it, NULL is the explicit sentinel instead.
 	out.WriteString("\tNULL_MODE = TRUE\n")
 	out.WriteString(fmt.Sprintf("\tNULL_STR = '%s'\n", strings.ReplaceAll(fldrNullString, `\`, `\\`)))
-	if code := fldrCharacterCode(charset); code != "" {
-		out.WriteString(fmt.Sprintf("\tCHARACTER_CODE = '%s'\n", code))
-	}
+	// Rows are rendered from Go strings and serialized as UTF-8 regardless of
+	// the recovered database charset. CHARACTER_CODE describes this input file,
+	// not the target database; dmfldr converts it while loading GB18030/EUC-KR.
+	out.WriteString("\tCHARACTER_CODE = 'UTF-8'\n")
 	out.WriteString(")\n")
 	out.WriteString("LOAD DATA\n")
 	out.WriteString(fmt.Sprintf("INFILE '%s' STR X '%s'\n", filepath.Base(dataPath), dialect.rowTermHex))
@@ -266,18 +267,4 @@ func WriteFldrControlFile(controlPath string, dataPath string, owner string, tab
 	out.WriteString(strings.Join(clauses, ",\n"))
 	out.WriteString("\n)\n")
 	return os.WriteFile(controlPath, []byte(out.String()), 0644)
-}
-
-// fldrCharacterCode maps a recovered charset name to dmfldr's CHARACTER_CODE.
-func fldrCharacterCode(charset string) string {
-	switch strings.ToUpper(strings.TrimSpace(charset)) {
-	case "UTF-8", "UTF8":
-		return "UTF-8"
-	case "GB18030", "GBK", "GB2312":
-		return "GBK"
-	case "EUC-KR", "EUCKR":
-		return "EUC-KR"
-	default:
-		return ""
-	}
 }

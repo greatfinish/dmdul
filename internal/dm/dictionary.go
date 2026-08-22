@@ -340,7 +340,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 			return
 		}
 		allColumnDefsByTable[col.TableID] = append(allColumnDefsByTable[col.TableID], col)
-		if table.isHugeInternalTable() {
+		if table.isSystemManagedInternalTable() {
 			return
 		}
 		columnsByTable[col.TableID]++
@@ -500,7 +500,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		userNamesByName[strings.ToUpper(user.Name)] = user
 	}
 	for id, table := range tables {
-		if !ownerMatcher.allowed(table.Owner) || table.isHugeInternalTable() || columnsByTable[id] == 0 {
+		if !ownerMatcher.allowed(table.Owner) || table.isSystemManagedInternalTable() || columnsByTable[id] == 0 {
 			continue
 		}
 		var groupID uint32

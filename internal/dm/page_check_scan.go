@@ -525,7 +525,18 @@ func classifyPageCorruption(page []byte, key dataFileKey, pageNo uint32, pageSiz
 
 	// Structure layer: only row/data pages carry a slot directory to validate.
 	if kind == dmPageKindRowData || kind == dmPageKindRowOverflow {
-		if detail, ok := checkRowPageStructure(page, pageSize); !ok {
+		structurePage := append([]byte(nil), page...)
+		// PAGE_CHECK validates the physical bytes above. Row structure must be
+		// checked after restoring sector-boundary protection words, otherwise
+		// valid SYSTEM pages report offsets such as 0x1FFF/0x5FFC and apparent
+		// row overlaps. SYSTEM dictionary pages use the broader restoration path
+		// already used by bootstrap; user pages keep the conservative detector.
+		if key.groupID == 0 {
+			restorePageProtectionBytes(structurePage, pageSize)
+		} else {
+			restoreUserDataPageProtectionBytes(structurePage, pageSize)
+		}
+		if detail, ok := checkRowPageStructure(structurePage, pageSize); !ok {
 			return PageCorruptionStructure, detail, false
 		}
 	}
@@ -598,6 +609,9 @@ func checkRowPageStructure(page []byte, pageSize uint32) (string, bool) {
 	// (e.g. smashed header bytes) produces an overflow or overlap here.
 	type rowSpan struct{ start, end int }
 	spans := make([]rowSpan, 0, nSlot)
+	liveRows := 0
+	firstInvalid := ""
+	seenOffsets := make(map[uint16]bool, nSlot)
 	for slotNo := uint16(1); slotNo <= nSlot; slotNo++ {
 		pos := slotArrayStart + int(slotNo-1)*2
 		rowOff := binary.LittleEndian.Uint16(page[pos:])
@@ -605,13 +619,29 @@ func checkRowPageStructure(page []byte, pageSize uint32) (string, bool) {
 			continue
 		}
 		if rowOff < dmMinSlotOffset || uint32(rowOff) >= uint32(freeEnd) {
-			return fmt.Sprintf("slot %d offset 0x%X outside used area [0x%X, 0x%X)", slotNo, rowOff, dmMinSlotOffset, freeEnd), false
+			if firstInvalid == "" {
+				firstInvalid = fmt.Sprintf("slot %d offset 0x%X outside used area [0x%X, 0x%X)", slotNo, rowOff, dmMinSlotOffset, freeEnd)
+			}
+			continue
+		}
+		if seenOffsets[rowOff] {
+			if firstInvalid == "" {
+				firstInvalid = fmt.Sprintf("slot %d duplicates row offset 0x%X", slotNo, rowOff)
+			}
+			continue
 		}
 		header, ok := decodeDataRowHeader(page, rowOff, pageSize, freeEnd)
 		if !ok {
-			return fmt.Sprintf("slot %d row header at 0x%X is undecodable (rec length inconsistent with page used space)", slotNo, rowOff), false
+			if firstInvalid == "" {
+				firstInvalid = fmt.Sprintf("slot %d row header at 0x%X is undecodable (rec length inconsistent with page used space)", slotNo, rowOff)
+			}
+			continue
 		}
+		seenOffsets[rowOff] = true
 		spans = append(spans, rowSpan{start: int(rowOff), end: int(rowOff) + int(header.length)})
+		if !header.deleted {
+			liveRows++
+		}
 	}
 	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
 	for i := 1; i < len(spans); i++ {
@@ -621,6 +651,16 @@ func checkRowPageStructure(page []byte, pageSize uint32) (string, bool) {
 	}
 	if n := len(spans); n > 0 && spans[n-1].end > int(freeEnd) {
 		return fmt.Sprintf("last row ends at 0x%X beyond free-space end 0x%X", spans[n-1].end, freeEnd), false
+	}
+	// nSlot includes reusable/deleted entries whose encoded slot words are not
+	// row offsets. They are legitimate when the remaining decodable live rows
+	// exactly satisfy nRec. A damaged live slot, by contrast, leaves the page
+	// short of nRec and is still reported with its physical detail.
+	if liveRows != int(nRec) {
+		if firstInvalid != "" {
+			return fmt.Sprintf("%s; decoded live rows=%d expected=%d", firstInvalid, liveRows, nRec), false
+		}
+		return fmt.Sprintf("decoded live rows=%d does not match record count %d", liveRows, nRec), false
 	}
 	return "", true
 }

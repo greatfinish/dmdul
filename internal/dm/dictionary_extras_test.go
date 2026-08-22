@@ -52,6 +52,35 @@ func TestScanRawRoutineTextsIgnoresEndSemicolonInsideString(t *testing.T) {
 	}
 }
 
+func TestScanDictionaryRoutinesRepairsPackageSpecMisreadAsBody(t *testing.T) {
+	const objectID = uint32(77)
+	spec := "CREATE OR REPLACE PACKAGE APP.PKG_TEST AS\n    PROCEDURE RUN;\nEND;"
+	body := "CREATE OR REPLACE PACKAGE BODY APP.PKG_TEST AS\n    PROCEDURE RUN AS BEGIN NULL; END;\nEND;"
+	objects := map[uint32]dictionaryObject{
+		objectID: {ID: objectID, Type: "SCHOBJ", Subtype: "PKG", Owner: "APP", Name: "PKG_TEST", Valid: "Y"},
+	}
+	// A protected dictionary row can make sequence zero point at the longer
+	// package body. Raw text recovery still carries the correctly typed spec.
+	texts := map[uint32]map[uint32]string{
+		objectID: {0: body, 1: body},
+	}
+	rawTexts := map[string]string{
+		routineKey("APP", "PKG_TEST", "PACKAGE"):      spec,
+		routineKey("APP", "PKG_TEST", "PACKAGE BODY"): body,
+	}
+
+	routines := scanDictionaryRoutines(objects, texts, rawTexts, newOwnerMatcher("all"))
+	if len(routines) != 2 {
+		t.Fatalf("routine count = %d, want 2: %+v", len(routines), routines)
+	}
+	if routines[0].ObjectType != "PACKAGE" || routines[0].SQL != spec {
+		t.Fatalf("package spec was not repaired: %+v", routines[0])
+	}
+	if routines[1].ObjectType != "PACKAGE BODY" || routines[1].SQL != body {
+		t.Fatalf("package body changed unexpectedly: %+v", routines[1])
+	}
+}
+
 func TestSequenceIsPrivilegeTarget(t *testing.T) {
 	obj := dictionaryObject{Type: "SCHOBJ", Subtype: "SEQ", Owner: "APP", Name: "SEQ_T"}
 	if !isTabPrivilegeTarget(obj) {
@@ -71,6 +100,17 @@ func TestKnownGeneratedSYSDBARoutineIsFiltered(t *testing.T) {
 	}
 	if isKnownGeneratedSYSDBARoutine("APP", "SP_DB_BAKSET_REMOVE_BATCH") {
 		t.Fatalf("same name under a normal owner should not be filtered")
+	}
+}
+
+func TestVectorMaintenanceTriggerNamesAreFiltered(t *testing.T) {
+	for _, name := range []string{"TRIG_HNSW$IDX_VECTOR", "TRIG_IVFFLAT$IDX_VECTOR"} {
+		if !isVectorGeneratedTriggerName(name) {
+			t.Fatalf("%s should be recognized as a generated vector trigger", name)
+		}
+	}
+	if isVectorGeneratedTriggerName("TRG_VECTOR_AUDIT") {
+		t.Fatal("ordinary user trigger was classified as generated")
 	}
 }
 

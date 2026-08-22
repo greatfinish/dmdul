@@ -32,6 +32,83 @@ func TestDataFilePageReaderUsesLogicalReader(t *testing.T) {
 	}
 }
 
+func TestDecodeDM9VectorFormats(t *testing.T) {
+	makeRaw := func(format1, format2 byte, dimension uint16, element byte, sparse byte, data []byte) []byte {
+		payload := make([]byte, 4+len(data))
+		binary.LittleEndian.PutUint16(payload[0:2], dimension)
+		payload[2] = element
+		payload[3] = sparse
+		copy(payload[4:], data)
+		raw := make([]byte, 13+len(payload))
+		raw[0], raw[1], raw[2] = 0x01, format1, format2
+		binary.LittleEndian.PutUint32(raw[9:13], uint32(len(payload)))
+		copy(raw[13:], payload)
+		return raw
+	}
+	float32s := func(values ...float32) []byte {
+		raw := make([]byte, len(values)*4)
+		for i, value := range values {
+			binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(value))
+		}
+		return raw
+	}
+	float64s := func(values ...float64) []byte {
+		raw := make([]byte, len(values)*8)
+		for i, value := range values {
+			binary.LittleEndian.PutUint64(raw[i*8:], math.Float64bits(value))
+		}
+		return raw
+	}
+
+	tests := []struct {
+		name string
+		col  columnDef
+		raw  []byte
+		want string
+	}{
+		{name: "current float32", col: columnDef{DataType: "VECTOR", Length: 3}, raw: makeRaw(0x13, 0x04, 3, 1, 0, float32s(1.25, -2.5, 3.75)), want: "[1.25,-2.5,3.75]"},
+		{name: "legacy float64", col: columnDef{DataType: "VECTOR", Length: 3}, raw: makeRaw(0xF4, 0x03, 3, 2, 0, float64s(100.125, -200.25, 300.5)), want: "[100.125,-200.25,300.5]"},
+		{name: "int8", col: columnDef{DataType: "VECTOR", Length: 4}, raw: makeRaw(0x1B, 0x04, 4, 3, 0, []byte{1, 0xFE, 3, 0xFC}), want: "[1,-2,3,-4]"},
+		{name: "binary", col: columnDef{DataType: "VECTOR", Length: 8}, raw: makeRaw(0x1B, 0x04, 8, 4, 0, []byte{5}), want: "[5]"},
+		{name: "sparse", col: columnDef{DataType: "VECTOR", Length: 5}, raw: makeRaw(0x1B, 0x04, 5, 1, 1, append([]byte{2, 0, 0, 0, 2, 0}, float32s(1, 3)...)), want: "[5,[0,2],[1,3]]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := decodeDMVector(tc.raw, tc.col)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.text != tc.want {
+				t.Fatalf("VECTOR text = %q, want %q", got.text, tc.want)
+			}
+			if !bytes.Equal(got.raw, tc.raw) {
+				t.Fatal("VECTOR raw payload was not preserved")
+			}
+		})
+	}
+}
+
+func TestRestoreLOBPageProtectionBytesWithoutSlotDirectory(t *testing.T) {
+	const pageSize = uint32(32768)
+	page := make([]byte, pageSize)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindLOBData)
+	tailStart := int(pageSize) - pageTailReservedLen(pageSize)
+	for sector := 1; sector < int(pageSize)/systemSectorSize; sector++ {
+		backup := []byte{byte('A' + sector), byte('a' + sector), byte('0' + sector), byte(sector)}
+		copy(page[tailStart+(sector-1)*4:], backup)
+		copy(page[sector*systemSectorSize-4:], []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	}
+
+	restoreUserDataPageProtectionBytes(page, pageSize)
+	for sector := 1; sector < int(pageSize)/systemSectorSize; sector++ {
+		want := page[tailStart+(sector-1)*4 : tailStart+sector*4]
+		got := page[sector*systemSectorSize-4 : sector*systemSectorSize]
+		if !bytes.Equal(got, want) {
+			t.Fatalf("sector %d boundary = %X, want backup %X", sector, got, want)
+		}
+	}
+}
+
 func TestSplitDataOutputRouterLimitsOpenFilesAndReopensForAppend(t *testing.T) {
 	dir := t.TempDir()
 	tables := make(map[uint32]dataTableInfo)
@@ -601,6 +678,43 @@ func TestBuildStoragePagePlanWalksLeafChainFromRoot(t *testing.T) {
 	}
 	if !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 16}] || !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: 17}] {
 		t.Fatalf("unexpected page plan: %+v", plan)
+	}
+}
+
+func TestBuildStoragePagePlanFollowsAllNoBranchChains(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MAIN.DBF")
+	raw := make([]byte, 64*8192)
+	root := raw[16*8192 : 17*8192]
+	putTestDMPageHeader(root, 4, 0, 16, dmPageKindBTreeLeaf, 1042)
+	binary.LittleEndian.PutUint16(root[dataPageSlotCountOff:], 2)
+	putTestDMPageRef(root, dataRowAreaStart+4, 0, 20)
+	putTestDMPageRef(root, dataRowAreaStart+16, 0, 24)
+
+	putTestDMPageHeader(raw[20*8192:21*8192], 4, 0, 20, dmPageKindBTreeLeaf, 1042)
+	putTestDMPageRef(raw[20*8192:21*8192], dmPageNextRefOff, 0, 21)
+	putTestDMPageHeader(raw[21*8192:22*8192], 4, 0, 21, dmPageKindBTreeLeaf, 1042)
+	putTestDMNullPageRef(raw[21*8192:22*8192], dmPageNextRefOff)
+	putTestDMPageHeader(raw[24*8192:25*8192], 4, 0, 24, dmPageKindBTreeLeaf, 1042)
+	putTestDMPageRef(raw[24*8192:25*8192], dmPageNextRefOff, 0, 25)
+	putTestDMPageHeader(raw[25*8192:26*8192], 4, 0, 25, dmPageKindBTreeLeaf, 1042)
+	putTestDMNullPageRef(raw[25*8192:26*8192], dmPageNextRefOff)
+	if err := os.WriteFile(path, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cache := newDataFilePageCache([]dataFileRef{{key: dataFileKey{groupID: 4, fileID: 0}, path: path}}, 8192)
+	plan, reason := buildStoragePagePlanDetailed(indexDef{ID: 1042, GroupID: 4, RootFile: 0, RootPage: 16, XType: dmIndexXTypeNoBranch}, cache)
+	if reason != "" {
+		t.Fatalf("page plan reason = %q", reason)
+	}
+	if len(plan) != 4 {
+		t.Fatalf("expected 4 planned heap pages, got %d: %+v", len(plan), plan)
+	}
+	for _, pageNo := range []uint32{20, 21, 24, 25} {
+		if !plan[dataPageRef{key: dataFileKey{groupID: 4, fileID: 0}, pageNo: pageNo}] {
+			t.Fatalf("heap page %d is missing from plan: %+v", pageNo, plan)
+		}
 	}
 }
 
@@ -1889,6 +2003,21 @@ func testInlineLOBEnvelope(seq byte, payload []byte) []byte {
 	binary.LittleEndian.PutUint32(raw[9:13], uint32(len(payload)))
 	copy(raw[13:], payload)
 	return raw
+}
+
+func TestUnwrapInlineLOBPayloadForNonUnicodeCharset(t *testing.T) {
+	want := []byte("DM9 TEXT")
+	raw := testInlineLOBEnvelope(1, want)
+	raw[1] = 0xF9
+	raw[2] = 0x03
+
+	got, ok := unwrapInlineLOBPayload(raw)
+	if !ok {
+		t.Fatal("GB18030/EUC-KR inline text LOB envelope was not recognized")
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("inline text payload = %q, want %q", got, want)
+	}
 }
 
 func makeTestLOBLocator(lobID uint32, byteLen uint32, groupID uint32, firstPage uint32) []byte {

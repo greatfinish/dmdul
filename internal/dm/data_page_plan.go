@@ -17,6 +17,7 @@ const (
 	maxBTreeDescentDepth       = 64
 	maxLeafChainWalkMultiplier = 2
 	maxCachedDataFilePages     = 256
+	dmIndexXTypeNoBranch       = 0x20
 )
 
 type dataFilePageCache struct {
@@ -275,6 +276,9 @@ func buildStoragePagePlanDetailed(storage indexDef, cache *dataFilePageCache) (m
 	if dataPageStorageID(rootPage) != storage.ID {
 		return nil, fmt.Sprintf("root page storage_id=%d, expected %d", dataPageStorageID(rootPage), storage.ID)
 	}
+	if storage.XType&dmIndexXTypeNoBranch != 0 {
+		return buildNoBranchPagePlanDetailed(storage, cache, root, rootPage)
+	}
 	switch dataPageKind(rootPage) {
 	case dmPageKindBTreeLeaf:
 		plan, complete, reason := walkLeafChainDetailed(cache, root, storage.ID)
@@ -295,6 +299,69 @@ func buildStoragePagePlanDetailed(storage indexDef, cache *dataFilePageCache) (m
 	default:
 		return nil, fmt.Sprintf("unsupported root page kind 0x%X", dataPageKind(rootPage))
 	}
+}
+
+func buildNoBranchPagePlanDetailed(storage indexDef, cache *dataFilePageCache, root dataPageRef, rootPage []byte) (map[dataPageRef]bool, string) {
+	if dataPageKind(rootPage) != dmPageKindBTreeLeaf {
+		return nil, fmt.Sprintf("unsupported NOBRANCH root page kind 0x%X", dataPageKind(rootPage))
+	}
+	anchors := noBranchChildPageRefs(rootPage, root, storage.ID, cache)
+	if len(anchors) == 0 {
+		// A newly created or single-page heap can keep rows on the dictionary
+		// root itself. Only accept it as a leaf when it has live records.
+		if len(rootPage) >= dataPageRecordCountOff+2 && binary.LittleEndian.Uint16(rootPage[dataPageRecordCountOff:]) > 0 {
+			return map[dataPageRef]bool{root: true}, ""
+		}
+		return nil, "NOBRANCH root has no validated data-chain reference"
+	}
+	plan := make(map[dataPageRef]bool)
+	for _, anchor := range anchors {
+		chain, complete, reason := walkLeafChainDetailed(cache, anchor, storage.ID)
+		if !complete {
+			return nil, reason
+		}
+		for ref := range chain {
+			plan[ref] = true
+		}
+	}
+	return plan, ""
+}
+
+func noBranchChildPageRefs(page []byte, root dataPageRef, storageID uint32, cache *dataFilePageCache) []dataPageRef {
+	if len(page) < dataPageSlotCountOff+2 {
+		return nil
+	}
+	branchCount := int(binary.LittleEndian.Uint16(page[dataPageSlotCountOff:]))
+	if branchCount <= 0 || branchCount >= 2048 {
+		return nil
+	}
+	// NOBRANCH roots use 12-byte branch descriptors starting at the ordinary
+	// row-area boundary. The six-byte file/page reference begins four bytes
+	// into each descriptor. Scan the bounded descriptor area and only retain
+	// references whose target page identity and storage id both validate.
+	end := dataRowAreaStart + branchCount*12
+	if end > len(page) {
+		end = len(page)
+	}
+	seen := make(map[dataPageRef]bool)
+	var refs []dataPageRef
+	for off := dataRowAreaStart + 4; off+6 <= end; off += 2 {
+		fileID, pageNo, ok := readDMPageRef(page, off)
+		if !ok || pageNo == 0 {
+			continue
+		}
+		ref := dataPageRef{key: dataFileKey{groupID: root.key.groupID, fileID: fileID}, pageNo: pageNo}
+		if ref == root || seen[ref] {
+			continue
+		}
+		child, ok := cache.readPage(ref)
+		if !ok || !pageHeaderMatchesRef(child, ref) || dataPageKind(child) != dmPageKindBTreeLeaf || dataPageStorageID(child) != storageID {
+			continue
+		}
+		seen[ref] = true
+		refs = append(refs, ref)
+	}
+	return refs
 }
 
 func descendLeftmostLeafDetailed(cache *dataFilePageCache, start dataPageRef, storageID uint32) (dataPageRef, string, bool) {

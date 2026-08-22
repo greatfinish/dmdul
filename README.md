@@ -8,7 +8,7 @@
 
 **达梦数据库离线恢复与数据抽取工具**
 
-`dmdul` 是一个使用 Go 编写的达梦数据库离线恢复与数据抽取工具。当数据库无法正常
+`dmdul` 是一个使用 Go 编写的达梦 DM8/DM9 数据库离线恢复与数据抽取工具。当数据库无法正常
 `open`、无法通过常规恢复流程启动时，它可以直接读取 `SYSTEM.DBF`、可选的 `dm.ctl`
 以及用户表空间 DBF 文件；对于列存储表，还可以组合读取混合表空间的 HFS 目录。DBF
 也可以从离线 DMASM 裸盘恢复为逻辑文件：
@@ -19,10 +19,11 @@
 - 尝试恢复 `DELETE` / `DROP` / `TRUNCATE` 后尚未被覆盖的残留数据；
 - 处理大表、分区表、行外 LOB 和 `STORAGE(USING LONG ROW)` 场景。
 - 识别 HUGE 列存储表，合并 HFS section 与 `$RAUX/$DAUX/$UAUX` 事务增量；
+- 解析 DM9 稠密、稀疏和二进制 VECTOR 列，并恢复 HNSW/IVFFLAT 用户索引；
 - 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
   AU 映射、副本数组和条带数据。
 
-**v0.8.0 主题：HUGE Column-Store Recovery**
+**v0.9.0 主题：DM9 Compatibility**
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -208,6 +209,22 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
 
 类型支持与实机验证：[DM8 数据类型支持矩阵](docs/data-types.md)
 
+DM9 适配范围与回灌证据：[DM9 兼容性验证](docs/dm9-compatibility.md)
+
+### DM8 / DM9 兼容性
+
+DM8 仍是覆盖 build 数量最多的主验证矩阵。DM9 已在
+`03151060506-20260417-322930-20218` 上完成 8/16/32 KiB 与 GB18030/UTF-8/EUC-KR 的
+3×3 冷快照验证，簇大小同时覆盖 16/32/64 页；Standard Bootstrap、DDL、SQL、dmfldr
+和 DMP 均完成实机验证。该样本的 74 张核心 `STAB` 与既有 DM8 样本结构一致，但 DM9
+仍需要 VECTOR、NOBRANCH 多分支、页保护边界、非 Unicode LOB 和程序源码选择等代码
+适配，不能因为在线数据字典视图相似就直接视为零改动兼容。
+
+首轮综合快照恢复 11335 行，45 个计划页全部直读，fallback 为 0；3×3 矩阵每组恢复并
+回装 3027 行，计划页全部直读、坏页和 fallback 均为 0。GB18030、EUC-KR、UTF-8 的
+代表性 DMP 均无警告导入且对象全部 `VALID`。可复现实验范围和已知限制见
+[DM9 兼容性验证](docs/dm9-compatibility.md)。
+
 ------
 
 ## 适用场景
@@ -253,6 +270,7 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
 | DELETE / DROP / TRUNCATE 残留页 | ✅ 初步支持 | 仅由 `recover table` 扫描，且要求原页尚未覆盖 |
 | 基础类型与 NULL metadata | ✅ 支持 | 2-bit NULL、数值、二进制、9 位时间戳、时区、13 种 INTERVAL、ROWID |
 | JSON / JSONB / BFILE | ✅ 支持 | JSONB 标量与复合结构、BFILE locator；详见类型支持矩阵 |
+| DM9 VECTOR | ✅ 已验证 | FLOAT32/FLOAT64/INT8/BINARY/SPARSE 行值，HNSW/IVFFLAT 基本 DDL；高级索引参数需复核 |
 
 ------
 
@@ -1250,18 +1268,22 @@ dul.log
 - 离线恢复结果受达梦版本、页大小、字符集、表类型、行格式和损坏程度影响。
 - 导出的 DDL、SQL、dmfldr 文本和 DMP 都必须先在隔离测试库验证。
 - DROP / TRUNCATE 残留页恢复依赖原数据页是否被覆盖，不能保证一定成功。
-- DMP 逻辑容器来自对已验证 DM8 构建的黑盒差分研究；不同 DM8 文件版本仍需先用
-  `dimp SHOW=Y`、`CTRL_INFO=4` 和隔离库回灌验证。
+- DMP 逻辑容器来自对已验证 DM8/DM9 构建的黑盒差分研究；不同数据库 build 和文件版本
+  仍需先用 `dimp SHOW=Y`、`CTRL_INFO=4` 和隔离库回灌验证。
 - 当前不生成压缩、加密或多文件 DMP，也暂不支持 TABLES 模式只选择单个表分区。
 - 已验证的 DMP 通道不能无损保存 `TIME` 小数秒，工具会对发生精度损失的行给出告警。
-- disql 单条语句输入缓冲约 160 KiB；SQL 格式导出的超大行外 LOB 行可能超过该限制，
-  导出时会给出告警，此类表建议改用 `data_format dmp` 经 `dimp` 导入。
+- DM9 `disql` 从 stdin 读取时单行上限为 2499 字节；部分 DM8 build 可接受更大的语句，
+  但不能作为跨版本保证。dmdul 按 2499 字节的可移植下限告警，宽行建议改用
+  `data_format fldr` 或 `data_format dmp`。
 - 跨字符集 DMP 不应只修改文件头，应按目标字符集重新生成。
 - 行外 LOB 和 Long Row 已有流式恢复路径，但损坏页、断链和多版本残留仍在持续验证。
 - HUGE 表恢复必须同时提供同一快照的普通 DBF 和完整 HFS 根目录。当前只验证单一 HFS path
   下未压缩、未加密 section 的 `INT/VARCHAR/CHAR`；多 HFS path、压缩/加密 section、
   可空定长列、更多标量类型、HFS section 校验和及 DMASM 裸盘 HFS 文件仍待补充。
 - 迁移行、链式行以及更多版本的复杂物理行格式仍需扩大样例覆盖。
+- DM9 VECTOR 索引目前只恢复 HNSW/IVFFLAT 组织类型，高级构建参数需要导入后复核。
+- 当前 DM9 build 的 `dminit` 仅支持 4/8/16/32 KiB 页；64 是可选簇页数，不是 64 KiB
+  数据页。dmdul 已验证 8/16/32 KiB，4 KiB 尚待补充。
 - 普通 `unload` 已是 slot-only，但 slot-only 不等于 committed-only；未提交 INSERT / DELETE
   的最终可见性仍需离线事务状态和完整 Undo PRE IMAGE 链才能准确判断。
 - 不保证恢复结果与故障前数据库在事务一致性层面完全一致。
@@ -1293,7 +1315,8 @@ dul.log
 | v0.7.2 | DMASM 多数据库自动发现、唯一候选自动选择、候选 DBF 集合持久化与多库隔离 |
 | v0.7.3 | bootstrap 自动 SYSTEM 物理预检、全量坏页报告、对象影响归属与残留字典隔离 |
 | v0.8.0 | HUGE/HFS 列存储字典与 DDL 恢复、section 流式读取及 RAUX/DAUX/UAUX 合并卸载 |
-| v0.8.x | DMASM REDO、超 65535-AU 单文件、更多 DM8 build 与条带组合验证 |
+| v0.9.0 | DM9 Standard Bootstrap、VECTOR、32 KiB 页、三种字符集与 SQL/dmfldr/DMP 回灌验证 |
+| v0.9.x | DMASM REDO、超 65535-AU 单文件、4 KiB 页、更多 DM8/DM9 build 与条带组合验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
 ------

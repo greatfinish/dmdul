@@ -334,7 +334,7 @@ func buildDMPMetadataCatalog(
 		if metadata.Owner == "" {
 			metadata.Owner = table.Owner
 		}
-		createSQL := dmpCreateTableSQL(tableID, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, tablespaces)
+		createSQL := dmpCreateTableSQL(tableID, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, constraintObjects, indexes, constraints, tablespaces)
 		if createSQL == "" {
 			return nil, fmt.Errorf("cannot render dmp table metadata for %s.%s", table.Owner, table.Name)
 		}
@@ -434,13 +434,40 @@ func dictSchemas(dict *DictionaryInfo) []DictionarySchema {
 	return dict.Schemas
 }
 
-func dmpCreateTableSQL(tableID uint32, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, tablespaces map[uint32]string) string {
+func dmpCreateTableSQL(tableID uint32, tables map[uint32]dictionaryObject, columnsByTable map[uint32][]columnDef, columnsByTableColID map[tableColKey]columnDef, tableStorage map[uint32]indexDef, partitionsByTable map[uint32][]PartitionInfo, partitionKeysByTable map[uint32][]uint16, constraintObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, constraints []constraintDef, tablespaces map[uint32]string) string {
 	table := tables[tableID]
 	matcher := newOwnerMatcher(table.Owner)
 	tableMatcher := newTableNameMatcher(table.Owner + "." + table.Name)
 	var out strings.Builder
 	renderCreateTables(&out, tables, columnsByTable, columnsByTableColID, tableStorage, partitionsByTable, partitionKeysByTable, matcher, tableMatcher, tablespaces)
-	return strings.TrimSpace(strings.TrimPrefix(out.String(), "-- Tables\n"))
+	sql := strings.TrimSpace(strings.TrimPrefix(out.String(), "-- Tables\n"))
+	primaryKey := dmpInlinePrimaryKeyClause(tableID, columnsByTableColID, constraintObjects, indexes, constraints)
+	if primaryKey == "" {
+		return sql
+	}
+	closePos := strings.Index(sql, "\n)")
+	if closePos < 0 {
+		return sql
+	}
+	return sql[:closePos] + ",\n    " + primaryKey + sql[closePos:]
+}
+
+func dmpInlinePrimaryKeyClause(tableID uint32, columns map[tableColKey]columnDef, constraintObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, constraints []constraintDef) string {
+	for _, cons := range constraints {
+		if cons.TableID != tableID || cons.Type != "P" || cons.Valid != "Y" {
+			continue
+		}
+		cols := ddlColumns(columnsFromIndex(cons.IndexID, cons.TableID, indexes, columns), false)
+		if cols == "" {
+			continue
+		}
+		name := ""
+		if obj, ok := constraintObjects[cons.ID]; ok {
+			name = recoveredConstraintNameClause(obj.Name)
+		}
+		return fmt.Sprintf("%sPRIMARY KEY (%s)", name, cols)
+	}
+	return ""
 }
 
 func dmpIndexMetadata(tableID uint32, tables map[uint32]dictionaryObject, columns map[tableColKey]columnDef, indexObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, tablespaces map[uint32]string) []DMPMetadataRecord {
@@ -450,7 +477,7 @@ func dmpIndexMetadata(tableID uint32, tables map[uint32]dictionaryObject, column
 			continue
 		}
 		idx, ok := indexes[indexID]
-		if !ok || idx.Flag&1 != 0 || idx.KeyNum == 0 || idx.Type != "BT" {
+		if !ok || idx.Flag&1 != 0 || idx.KeyNum == 0 || !isRenderableUserIndexType(idx.Type) {
 			continue
 		}
 		cols := ddlColumns(columnsFromIndex(indexID, tableID, indexes, columns), true)
@@ -458,11 +485,10 @@ func dmpIndexMetadata(tableID uint32, tables map[uint32]dictionaryObject, column
 			continue
 		}
 		table := tables[tableID]
-		unique := ""
-		if idx.IsUnique == "Y" {
-			unique = "UNIQUE "
+		sql, ok := renderCreateIndexSQL(obj, table, idx, cols, tablespaces)
+		if !ok {
+			continue
 		}
-		sql := fmt.Sprintf("CREATE %sINDEX %s ON %s.%s (%s)%s;", unique, quoteIdent(obj.Name), quoteIdent(table.Owner), quoteIdent(table.Name), cols, storageClause(uint32(idx.GroupID), tablespaces, defaultStorageOrg))
 		records = append(records, DMPMetadataRecord{RecordType: dmpRecordIndex, Name: obj.Name, SQL: sql})
 	}
 	sort.Slice(records, func(i, j int) bool { return records[i].Name < records[j].Name })
@@ -487,17 +513,18 @@ func dmpConstraintMetadata(tableID uint32, objects map[uint32]dictionaryObject, 
 		recordType := dmpRecordConstraint
 		var sql string
 		switch cons.Type {
-		case "P", "U":
+		case "P":
+			// Native dexp places primary keys inside CREATE TABLE. Besides matching
+			// that layout, this guarantees referenced keys exist before dimp applies
+			// deferred foreign-key records from other tables.
+			continue
+		case "U":
 			cols := ddlColumns(columnsFromIndex(cons.IndexID, cons.TableID, indexes, columns), false)
 			if cols == "" {
 				continue
 			}
-			kind := "PRIMARY KEY"
-			if cons.Type == "U" {
-				kind = "UNIQUE"
-				recordType = dmpRecordUnique
-			}
-			sql = fmt.Sprintf("%s%s (%s);", prefix, kind, cols)
+			recordType = dmpRecordUnique
+			sql = fmt.Sprintf("%sUNIQUE (%s);", prefix, cols)
 		case "C":
 			if cons.CheckInfo == "" {
 				continue

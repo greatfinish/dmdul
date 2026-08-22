@@ -13,6 +13,7 @@ import (
 	pathpkg "path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,8 +91,8 @@ type DataExportResult struct {
 	HugeSectionsRead     int
 	HugeFilesRead        int
 	// OversizedSQLStatements counts generated SQL INSERT statements longer
-	// than disql's 160 KiB input buffer; disql aborts such statements with
-	// "input too long", silently losing the row on import.
+	// than the portable disql stdin line limit. DM9 silently skips such input
+	// after reporting DISQL-10053, losing the row on import.
 	OversizedSQLStatements int
 	OversizedSQLTables     []string
 }
@@ -257,6 +258,13 @@ type dmBinary []byte
 type dmRowID string
 type dmJSON string
 
+type dmVectorValue struct {
+	text string
+	raw  dmBinary
+}
+
+func (v dmVectorValue) String() string { return v.text }
+
 type dmJSONValue struct {
 	value   any
 	binary  bool
@@ -344,19 +352,17 @@ type dataOutputRouter struct {
 	tableOutputsByID map[uint32]DataTableOutput
 	dmpConfig        dataDMPOutputConfig
 	dmpWritersByID   map[uint32]*DMPDataWriter
-	// charset is the recovered database character set, echoed into dmfldr
-	// control files so the loader is invoked with a matching CHARACTER_CODE.
-	charset string
 
 	oversizedSQLRows     int
 	oversizedSQLTableIDs map[uint32]string
 }
 
-// disqlMaxStatementBytes is disql's single-statement input buffer (160 KiB,
-// measured against DM8 build 2025-01-17: 163840-byte statements execute,
-// longer ones abort with "input too long"). SQL exports whose INSERT exceeds
-// this cannot be replayed through disql; DMP/dimp has no such limit.
-const disqlMaxStatementBytes = 160 << 10
+// disqlMaxStatementBytes is the conservative stdin line limit shared by SQL
+// exports. DM9 build 2026-05-25 accepts 2499 bytes and reports DISQL-10053 for
+// longer lines; some DM8 builds accept statements up to 160 KiB. The portable
+// threshold must use the lower value because dmdul cannot infer the eventual
+// import client's build. dmfldr and DMP/dimp do not have this line limit.
+const disqlMaxStatementBytes = 2499
 
 func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTables map[uint32]dataTableInfo, dmpConfigs ...dataDMPOutputConfig) (*dataOutputRouter, error) {
 	router := &dataOutputRouter{
@@ -369,7 +375,6 @@ func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTa
 		lastUsedByID:     make(map[uint32]uint64),
 		tableOutputsByID: make(map[uint32]DataTableOutput),
 		dmpWritersByID:   make(map[uint32]*DMPDataWriter),
-		charset:          opts.Charset,
 	}
 	if len(dmpConfigs) > 0 {
 		router.dmpConfig = dmpConfigs[0]
@@ -383,7 +388,7 @@ func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTa
 			_ = os.Remove(opts.OutputPath)
 			return router, nil
 		}
-		file, err := openDataOutputFile(opts.OutputPath, outputFormat, router.mainTable, router.charset)
+		file, err := openDataOutputFile(opts.OutputPath, outputFormat, router.mainTable)
 		if err != nil {
 			return nil, err
 		}
@@ -408,7 +413,7 @@ func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTa
 			_ = os.Remove(path)
 			continue
 		}
-		file, err := openDataOutputFile(path, outputFormat, table, router.charset)
+		file, err := openDataOutputFile(path, outputFormat, table)
 		if err != nil {
 			_ = router.close()
 			return nil, err
@@ -443,7 +448,7 @@ func sortedDataTableIDs(tables map[uint32]dataTableInfo) []uint32 {
 	return ids
 }
 
-func openDataOutputFile(path string, outputFormat string, table dataTableInfo, charset string) (*dataOutputFile, error) {
+func openDataOutputFile(path string, outputFormat string, table dataTableInfo) (*dataOutputFile, error) {
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("create data output directory: %w", err)
@@ -458,7 +463,7 @@ func openDataOutputFile(path string, outputFormat string, table dataTableInfo, c
 		// The data file carries rows only; the companion control file tells
 		// dmfldr how to read them, so it is written alongside on creation.
 		if err := WriteFldrControlFile(fldrControlFilePath(path), path,
-			table.table.Owner, table.table.Name, table.columns, charset); err != nil {
+			table.table.Owner, table.table.Name, table.columns); err != nil {
 			_ = out.Close()
 			return nil, err
 		}
@@ -486,7 +491,7 @@ func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile,
 		if r.main != nil {
 			return r.main, nil
 		}
-		file, err := openDataOutputFile(r.mainPath, r.format, r.mainTable, r.charset)
+		file, err := openDataOutputFile(r.mainPath, r.format, r.mainTable)
 		if err != nil {
 			return nil, err
 		}
@@ -508,7 +513,7 @@ func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile,
 	if r.initializedByID[table.table.ID] {
 		file, err = openExistingDataOutputFile(path, r.format)
 	} else {
-		file, err = openDataOutputFile(path, r.format, table, r.charset)
+		file, err = openDataOutputFile(path, r.format, table)
 	}
 	if err != nil {
 		return nil, err
@@ -874,7 +879,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 		if !ok || !ownerMatcher.allowed(table.Owner) {
 			return
 		}
-		selectedUserTable := !table.isHugeInternalTable() && tableMatcher.allowed(table.Owner, table.Name) && !excludeMatcher.allowed(table.Owner, table.Name)
+		selectedUserTable := !table.isSystemManagedInternalTable() && tableMatcher.allowed(table.Owner, table.Name) && !excludeMatcher.allowed(table.Owner, table.Name)
 		if !selectedUserTable && !hugeAuxTableIDs[col.TableID] {
 			return
 		}
@@ -949,7 +954,7 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 	assistByID := make(map[uint32][]dataTableInfo)
 	planFailureReasons := make(map[uint32][]string)
 	for tableID, table := range tables {
-		if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) || table.isHugeInternalTable() {
+		if !ownerMatcher.allowed(table.Owner) || !tableMatcher.allowed(table.Owner, table.Name) || excludeMatcher.allowed(table.Owner, table.Name) || table.isSystemManagedInternalTable() {
 			continue
 		}
 		if table.isTemporaryTable() || len(columnsByTable[tableID]) == 0 {
@@ -974,38 +979,44 @@ func ExportData(opts DataExportOptions) (*DataExportResult, error) {
 			hugeTables[tableID] = baseInfo
 			continue
 		}
-		storageUnits[tableID] = baseInfo
-		for _, storage := range assistByParentID[tableID] {
-			if baseInfo.dataStorageID != 0 && storage.ID != baseInfo.dataStorageID {
-				continue
+		// Partitioned base objects describe the logical table; rows belong to
+		// leaf partition storage objects. Treating an unresolved parent storage
+		// as another row source forces an unnecessary group/segment fallback and
+		// can duplicate rows. Build physical units only for the partitions.
+		if len(partitionsByTable[tableID]) == 0 {
+			storageUnits[tableID] = baseInfo
+			for _, storage := range assistByParentID[tableID] {
+				if baseInfo.dataStorageID != 0 && storage.ID != baseInfo.dataStorageID {
+					continue
+				}
+				var pagePlan map[dataPageRef]bool
+				var reason string
+				if !opts.RecoveryMode {
+					pagePlan, reason = buildStoragePagePlanDetailed(storage, dataFilePages)
+				}
+				addKnownDataAssistID(assistByID, baseInfo, storage.ID, storage, pagePlan)
+				if !opts.RecoveryMode && len(pagePlan) == 0 {
+					planFailureReasons[tableID] = append(planFailureReasons[tableID], formatStoragePlanFailure(baseInfo, storage.ID, reason))
+				}
 			}
-			var pagePlan map[dataPageRef]bool
-			var reason string
-			if !opts.RecoveryMode {
-				pagePlan, reason = buildStoragePagePlanDetailed(storage, dataFilePages)
+			for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
+				// Secondary index storages hold key/rowid entries, not table
+				// rows; scanning them yields garbage rows shaped like the table.
+				if assistID != baseInfo.dataStorageID && secondaryIndexStorageIDs[assistID] {
+					continue
+				}
+				addHistoricalDataAssistID(assistByID, baseInfo, assistID)
+				if opts.RecoveryMode {
+					addRecoveryDataAssistID(assistByID, baseInfo, assistID)
+				}
 			}
-			addKnownDataAssistID(assistByID, baseInfo, storage.ID, storage, pagePlan)
-			if !opts.RecoveryMode && len(pagePlan) == 0 {
-				planFailureReasons[tableID] = append(planFailureReasons[tableID], formatStoragePlanFailure(baseInfo, storage.ID, reason))
+			addHiddenIndexObjectAssistIDs(assistByID, baseInfo, tableID, indexObjects, indexes)
+			if baseInfo.dataStorageID == 0 {
+				// The 0x02000000|table_id guess can collide with unrelated live
+				// storages, so it is only worth scanning when the dictionary has
+				// no real storage id for the table.
+				addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(tableID))
 			}
-		}
-		for _, assistID := range dictionaryDataAssistIDs(dictionaryTables, tableID) {
-			// Secondary index storages hold key/rowid entries, not table
-			// rows; scanning them yields garbage rows shaped like the table.
-			if assistID != baseInfo.dataStorageID && secondaryIndexStorageIDs[assistID] {
-				continue
-			}
-			addHistoricalDataAssistID(assistByID, baseInfo, assistID)
-			if opts.RecoveryMode {
-				addRecoveryDataAssistID(assistByID, baseInfo, assistID)
-			}
-		}
-		addHiddenIndexObjectAssistIDs(assistByID, baseInfo, tableID, indexObjects, indexes)
-		if baseInfo.dataStorageID == 0 {
-			// The 0x02000000|table_id guess can collide with unrelated live
-			// storages, so it is only worth scanning when the dictionary has
-			// no real storage id for the table.
-			addUnknownDataAssistID(assistByID, baseInfo, tableDataAssistID(tableID))
 		}
 		for _, part := range partitionsByTable[tableID] {
 			partInfo := baseInfo
@@ -3130,17 +3141,25 @@ func readOutOfLineDataValue(col columnDef, row []byte, pos int, decoder textDeco
 	}
 	if isJSONDataType(col.DataType) {
 		value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
-		if err != nil {
+		if err == nil {
+			return dmJSONValue{value: value, binary: normalizeDataType(col.DataType) == "JSONB", decoder: decoder}, next, nil
+		}
+		payload, longErr := lobReader.readLongRowPayload(locator)
+		if longErr != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}
-		return dmJSONValue{value: value, binary: normalizeDataType(col.DataType) == "JSONB", decoder: decoder}, next, nil
+		return dmJSONValue{value: dmBinary(payload), binary: normalizeDataType(col.DataType) == "JSONB", decoder: decoder}, next, nil
 	}
 	if isBinaryDataType(col.DataType) {
 		value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
-		if err != nil {
+		if err == nil {
+			return value, next, nil
+		}
+		payload, longErr := lobReader.readLongRowPayload(locator)
+		if longErr != nil {
 			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
 		}
-		return value, next, nil
+		return dmBinary(payload), next, nil
 	}
 	if isCharacterLOBDataType(col.DataType) {
 		if value, err := lobReader.lazyLOBValue(locator, dmPageKindLOBData, true, decoder); err == nil {
@@ -3393,7 +3412,11 @@ func isZeroFixedValue(value any) bool {
 
 func isVariableDataType(dataType string) bool {
 	return isCharacterDataType(dataType) || isVariableBinaryDataType(dataType) || isNumberDataType(dataType) ||
-		isJSONDataType(dataType) || normalizeDataType(dataType) == "BFILE"
+		isJSONDataType(dataType) || isVectorDataType(dataType) || normalizeDataType(dataType) == "BFILE"
+}
+
+func isVectorDataType(dataType string) bool {
+	return normalizeDataType(dataType) == "VECTOR"
 }
 
 func isCharacterDataType(dataType string) bool {
@@ -3718,6 +3741,17 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 	if isJSONDataType(col.DataType) {
 		return readJSONDataValue(col, row, pos, decoder, lobReader)
 	}
+	if isVectorDataType(col.DataType) {
+		raw, next, err := readShortDataBytes(row, pos)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+		value, err := decodeDMVector(raw, col)
+		if err != nil {
+			return nil, pos, fmt.Errorf("%s: %w", col.Name, err)
+		}
+		return value, next, nil
+	}
 	if isNumberDataType(col.DataType) {
 		value, next, err := readDMNumber(row, pos)
 		if err != nil {
@@ -3737,10 +3771,14 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 				return nil, pos, fmt.Errorf("%s: out-of-line binary LOB locator cannot be resolved without data files", col.Name)
 			}
 			lazy, lazyErr := lobReader.lazyLOBValue(locator, dmPageKindLOBData, false, decoder)
-			if lazyErr != nil {
+			if lazyErr == nil {
+				return lazy, next, nil
+			}
+			payload, longErr := lobReader.readLongRowPayload(locator)
+			if longErr != nil {
 				return nil, pos, fmt.Errorf("%s: %w", col.Name, lazyErr)
 			}
-			return lazy, next, nil
+			return dmBinary(payload), next, nil
 		}
 		return dmBinary(value), next, nil
 	}
@@ -3776,6 +3814,110 @@ func readVariableDataValue(col columnDef, row []byte, pos int, decoder textDecod
 		return nil, pos, fmt.Errorf("%s: decoded varchar contains invalid characters marker=0x%02X raw=%s", col.Name, marker, strings.ToUpper(hex.EncodeToString(raw)))
 	}
 	return value, next, nil
+}
+
+func decodeDMVector(raw []byte, col columnDef) (dmVectorValue, error) {
+	// The two format/version bytes after 0x01 differ between DM9 builds and
+	// between rows created before/after an upgrade (observed 0xF4,0x03 and
+	// 0x13,0x04 in one database). The length, dimension and element fields are
+	// stable, so validate those structural fields instead of pinning a build id.
+	if len(raw) < 17 || raw[0] != 0x01 {
+		return dmVectorValue{}, fmt.Errorf("invalid VECTOR header")
+	}
+	payloadLen := int(binary.LittleEndian.Uint32(raw[9:13]))
+	if payloadLen != len(raw)-13 || payloadLen < 4 {
+		return dmVectorValue{}, fmt.Errorf("invalid VECTOR payload length %d/%d", payloadLen, len(raw)-13)
+	}
+	payload := raw[13:]
+	dimension := int(binary.LittleEndian.Uint16(payload[0:2]))
+	if dimension <= 0 {
+		return dmVectorValue{}, fmt.Errorf("invalid VECTOR dimension %d", dimension)
+	}
+	if col.Length > 0 && dimension != int(col.Length) {
+		return dmVectorValue{}, fmt.Errorf("VECTOR dimension %d, expected %d", dimension, col.Length)
+	}
+	elementKind := payload[2]
+	sparse := payload[3] != 0
+	data := payload[4:]
+
+	var text string
+	var err error
+	if sparse {
+		text, err = decodeDMSparseVector(dimension, elementKind, data)
+	} else {
+		text, err = decodeDMDenseVector(dimension, elementKind, data)
+	}
+	if err != nil {
+		return dmVectorValue{}, err
+	}
+	return dmVectorValue{text: text, raw: append(dmBinary(nil), raw...)}, nil
+}
+
+func decodeDMDenseVector(dimension int, elementKind byte, raw []byte) (string, error) {
+	values := make([]string, dimension)
+	switch elementKind {
+	case 0x01:
+		if len(raw) != dimension*4 {
+			return "", fmt.Errorf("FLOAT32 VECTOR payload length %d, expected %d", len(raw), dimension*4)
+		}
+		for i := range values {
+			bits := binary.LittleEndian.Uint32(raw[i*4:])
+			values[i] = strconv.FormatFloat(float64(math.Float32frombits(bits)), 'g', -1, 32)
+		}
+	case 0x02:
+		if len(raw) != dimension*8 {
+			return "", fmt.Errorf("FLOAT64 VECTOR payload length %d, expected %d", len(raw), dimension*8)
+		}
+		for i := range values {
+			bits := binary.LittleEndian.Uint64(raw[i*8:])
+			values[i] = strconv.FormatFloat(math.Float64frombits(bits), 'g', -1, 64)
+		}
+	case 0x03:
+		if len(raw) != dimension {
+			return "", fmt.Errorf("INT8 VECTOR payload length %d, expected %d", len(raw), dimension)
+		}
+		for i := range values {
+			values[i] = strconv.FormatInt(int64(int8(raw[i])), 10)
+		}
+	case 0x04:
+		expected := (dimension + 7) / 8
+		if len(raw) != expected {
+			return "", fmt.Errorf("BINARY VECTOR payload length %d, expected %d", len(raw), expected)
+		}
+		values = values[:len(raw)]
+		for i := range values {
+			values[i] = strconv.FormatUint(uint64(raw[i]), 10)
+		}
+	default:
+		return "", fmt.Errorf("unsupported VECTOR element kind 0x%02X", elementKind)
+	}
+	return "[" + strings.Join(values, ",") + "]", nil
+}
+
+func decodeDMSparseVector(dimension int, elementKind byte, raw []byte) (string, error) {
+	if elementKind != 0x01 {
+		return "", fmt.Errorf("unsupported sparse VECTOR element kind 0x%02X", elementKind)
+	}
+	if len(raw) < 2 {
+		return "", fmt.Errorf("sparse VECTOR count is missing")
+	}
+	count := int(binary.LittleEndian.Uint16(raw[0:2]))
+	valuesStart := 2 + count*2
+	if count > dimension || len(raw) != valuesStart+count*4 {
+		return "", fmt.Errorf("invalid sparse VECTOR count or payload length: count=%d length=%d", count, len(raw))
+	}
+	indexes := make([]string, count)
+	values := make([]string, count)
+	for i := 0; i < count; i++ {
+		index := int(binary.LittleEndian.Uint16(raw[2+i*2:]))
+		if index >= dimension {
+			return "", fmt.Errorf("sparse VECTOR index %d exceeds dimension %d", index, dimension)
+		}
+		indexes[i] = strconv.Itoa(index)
+		bits := binary.LittleEndian.Uint32(raw[valuesStart+i*4:])
+		values[i] = strconv.FormatFloat(float64(math.Float32frombits(bits)), 'g', -1, 32)
+	}
+	return fmt.Sprintf("[%d,[%s],[%s]]", dimension, strings.Join(indexes, ","), strings.Join(values, ",")), nil
 }
 
 func readJSONDataValue(col columnDef, row []byte, pos int, decoder textDecoder, lobReader *dmLOBReader) (any, int, error) {
@@ -3895,7 +4037,10 @@ func unwrapInlineLOBPayload(raw []byte) ([]byte, bool) {
 	if len(raw) < 13 {
 		return nil, false
 	}
-	if raw[0] != 0x01 || raw[2] != 0x04 {
+	// DM9 uses subtype 0x04 for Unicode databases and 0x03 for
+	// GB18030/EUC-KR inline text LOB envelopes. The remaining header and
+	// payload-length fields are identical.
+	if raw[0] != 0x01 || (raw[2] != 0x03 && raw[2] != 0x04) {
 		return nil, false
 	}
 	payloadLen := int(binary.LittleEndian.Uint32(raw[9:13]))
@@ -4716,6 +4861,8 @@ func sqlValueForDataColumn(col columnDef, value any) (string, error) {
 		return "TIME " + sqlLiteral(fmt.Sprintf("%v", value)), nil
 	case "JSON", "JSONB":
 		return "CAST(" + sqlLiteral(fmt.Sprintf("%v", value)) + " AS " + typ + ")", nil
+	case "VECTOR":
+		return sqlLiteral(fmt.Sprintf("%v", value)), nil
 	case "BFILE":
 		directory, filename, ok := strings.Cut(fmt.Sprintf("%v", value), ":")
 		if !ok {

@@ -81,7 +81,7 @@ func TestWriteFldrControlFile(t *testing.T) {
 		{Name: "NOTE", DataType: "VARCHAR(200)"},
 		{Name: "TS", DataType: "TIMESTAMP(6)"},
 	}
-	if err := WriteFldrControlFile(controlPath, dataPath, "APP", "ORDERS", columns, "UTF-8"); err != nil {
+	if err := WriteFldrControlFile(controlPath, dataPath, "APP", "ORDERS", columns); err != nil {
 		t.Fatalf("write control file: %v", err)
 	}
 	raw, err := os.ReadFile(controlPath)
@@ -118,7 +118,7 @@ func TestWriteFldrControlFileKeepsPipeForDelimiterSafeTables(t *testing.T) {
 	dataPath := filepath.Join(dir, "APP_FACTS_data.txt")
 	controlPath := fldrControlFilePath(dataPath)
 	columns := []columnDef{{Name: "ID", DataType: "BIGINT"}, {Name: "D", DataType: "DATE"}}
-	if err := WriteFldrControlFile(controlPath, dataPath, "APP", "FACTS", columns, "GBK"); err != nil {
+	if err := WriteFldrControlFile(controlPath, dataPath, "APP", "FACTS", columns); err != nil {
 		t.Fatalf("write control file: %v", err)
 	}
 	raw, err := os.ReadFile(controlPath)
@@ -129,7 +129,7 @@ func TestWriteFldrControlFileKeepsPipeForDelimiterSafeTables(t *testing.T) {
 	if !strings.Contains(body, "FIELDS '|'\n") || !strings.Contains(body, "STR X '0A'\n") {
 		t.Fatalf("delimiter-safe table should use the pipe dialect, got:\n%s", body)
 	}
-	if !strings.Contains(body, "\tCHARACTER_CODE = 'GBK'\n") {
-		t.Fatalf("control file should carry the recovered charset, got:\n%s", body)
+	if !strings.Contains(body, "\tCHARACTER_CODE = 'UTF-8'\n") {
+		t.Fatalf("control file should describe dmdul's UTF-8 data stream, got:\n%s", body)
 	}
 }

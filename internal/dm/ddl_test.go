@@ -25,6 +25,11 @@ func TestFormatColumnTypeUsesScaleForNumericAndTimeTypes(t *testing.T) {
 		{name: "raw length", dataType: "RAW", length: 32, scale: 0, want: "RAW(32)"},
 		{name: "binary float alias", dataType: "BINARY_FLOAT", length: 4, scale: 0, want: "BINARY_FLOAT"},
 		{name: "xml alias", dataType: "XMLTYPE", length: 2147483647, scale: 0, want: "XMLTYPE"},
+		{name: "vector float32", dataType: "VECTOR", length: 3, scale: 0x0115, want: "VECTOR(3, FLOAT32)"},
+		{name: "vector float64", dataType: "VECTOR", length: 3, scale: 0x0215, want: "VECTOR(3, FLOAT64)"},
+		{name: "vector int8", dataType: "VECTOR", length: 4, scale: 0x0315, want: "VECTOR(4, INT8)"},
+		{name: "vector binary", dataType: "VECTOR", length: 8, scale: 0x0415, want: "VECTOR(8, BINARY)"},
+		{name: "vector sparse", dataType: "VECTOR", length: 5, scale: 0x1115, want: "VECTOR(5, FLOAT32, SPARSE)"},
 	}
 
 	for _, tt := range tests {
@@ -314,6 +319,102 @@ func TestDictionaryObjectTableFlags(t *testing.T) {
 	tempPreserve := dictionaryObject{Info3: tableTemporaryInfo3Flag | tableTemporarySessionInfo3Flag}
 	if got := tempPreserve.temporaryCommitClause(); got != tableTemporaryPreserveRowsClause {
 		t.Fatalf("tempPreserve.temporaryCommitClause() = %q, want %q", got, tableTemporaryPreserveRowsClause)
+	}
+}
+
+func TestSystemManagedVectorObjectsAreFiltered(t *testing.T) {
+	for _, name := range []string{
+		"HNSW_GRAPH$IDX_V",
+		"HNSW_ELEMENT$IDX_V",
+		"IVFFLAT_CENTERS$IDX_V",
+		"IVFFLAT_VECTORS$IDX_V",
+	} {
+		if !isVectorInternalTableName(name) {
+			t.Fatalf("%s should be recognized as a vector internal table", name)
+		}
+		if !(dictionaryObject{Name: name}).isSystemManagedInternalTable() {
+			t.Fatalf("%s should be filtered from user objects", name)
+		}
+	}
+	if isVectorInternalTableName("APP_VECTOR_DATA") {
+		t.Fatal("ordinary user vector table was classified as internal")
+	}
+}
+
+func TestRenderDM9VectorIndexes(t *testing.T) {
+	table := dictionaryObject{Owner: "DM_TEST", Name: "T_VECTOR"}
+	obj := dictionaryObject{Name: "IDX_VECTOR"}
+	tests := []struct {
+		indexType string
+		want      string
+	}{
+		{indexType: "HS", want: `CREATE VECTOR INDEX IDX_VECTOR ON DM_TEST.T_VECTOR (EMBEDDING) ORGANIZATION NEIGHBOR GRAPH;`},
+		{indexType: "IF", want: `CREATE VECTOR INDEX IDX_VECTOR ON DM_TEST.T_VECTOR (EMBEDDING) ORGANIZATION NEIGHBOR PARTITIONS;`},
+	}
+	for _, tc := range tests {
+		got, ok := renderCreateIndexSQL(obj, table, indexDef{Type: tc.indexType}, "EMBEDDING", nil)
+		if !ok || got != tc.want {
+			t.Fatalf("renderCreateIndexSQL(%s) = %q, %v; want %q", tc.indexType, got, ok, tc.want)
+		}
+	}
+}
+
+func TestTableStorageByIDSelectsNewestCandidate(t *testing.T) {
+	tables := map[uint32]dictionaryObject{
+		1023: {ID: 1023, Info1: 0x10},
+	}
+	indexObjects := map[uint32]dictionaryObject{
+		33555455: {ID: 33555455, ParentID: 1023, Type: "TABOBJ", Subtype: "INDEX"},
+		33555495: {ID: 33555495, ParentID: 1023, Type: "TABOBJ", Subtype: "INDEX"},
+	}
+	indexes := map[uint32]indexDef{
+		33555455: {ID: 33555455, Flag: 1, KeyNum: 0, RootFile: 0, RootPage: 3392},
+		33555495: {ID: 33555495, Flag: 1, KeyNum: 0, RootFile: 0, RootPage: 3168},
+	}
+
+	got := tableStorageByID(tables, indexObjects, indexes, nil)[1023]
+	if got.ID != 33555495 || got.RootPage != 3168 {
+		t.Fatalf("selected storage = id %d root %d, want id 33555495 root 3168", got.ID, got.RootPage)
+	}
+}
+
+func TestTableStorageByIDPrefersNewestEmptyStorageAfterTruncate(t *testing.T) {
+	tables := map[uint32]dictionaryObject{
+		1023: {ID: 1023, Info1: 0x10},
+	}
+	indexObjects := map[uint32]dictionaryObject{
+		33555455: {ID: 33555455, ParentID: 1023, Type: "TABOBJ", Subtype: "INDEX"},
+		33555495: {ID: 33555495, ParentID: 1023, Type: "TABOBJ", Subtype: "INDEX"},
+	}
+	indexes := map[uint32]indexDef{
+		33555455: {ID: 33555455, Flag: 1, KeyNum: 0, RootFile: 0, RootPage: 3168},
+		33555495: {ID: 33555495, Flag: 1, KeyNum: 0, RootFile: -1, RootPage: -1},
+	}
+
+	got := tableStorageByID(tables, indexObjects, indexes, nil)[1023]
+	if got.ID != 33555495 || got.RootFile != -1 || got.RootPage != -1 {
+		t.Fatalf("selected storage = %#v, want newest empty storage 33555495", got)
+	}
+}
+
+func TestTableStorageByIDDoesNotApplyHugeFallbackWithoutAuxiliaryTable(t *testing.T) {
+	const tableID = uint32(1023)
+	tables := map[uint32]dictionaryObject{
+		tableID: {ID: tableID, Info1: tableHugeInfo1Flag},
+	}
+	currentID := uint32(33555495)
+	derivedID := tableDataAssistID(tableID)
+	indexObjects := map[uint32]dictionaryObject{
+		currentID: {ID: currentID, ParentID: int32(tableID), Type: "TABOBJ", Subtype: "INDEX"},
+	}
+	indexes := map[uint32]indexDef{
+		derivedID: {ID: derivedID, Flag: 1, KeyNum: 0, RootFile: 0, RootPage: 3392},
+		currentID: {ID: currentID, Flag: 1, KeyNum: 0, RootFile: 0, RootPage: 3168},
+	}
+
+	got := tableStorageByID(tables, indexObjects, indexes, nil)[tableID]
+	if got.ID != currentID || got.RootPage != 3168 {
+		t.Fatalf("selected storage = id %d root %d, want non-HUGE current storage %d root 3168", got.ID, got.RootPage, currentID)
 	}
 }
 

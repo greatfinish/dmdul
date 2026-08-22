@@ -192,6 +192,10 @@ func (obj dictionaryObject) isHugeInternalTable() bool {
 	return obj.isHugeObject() && isHugeInternalTableName(obj.Name)
 }
 
+func (obj dictionaryObject) isSystemManagedInternalTable() bool {
+	return obj.isHugeInternalTable() || isVectorInternalTableName(obj.Name)
+}
+
 func (obj dictionaryObject) isHugeMainCandidate() bool {
 	return obj.isHugeObject() && !obj.isHugeInternalTable()
 }
@@ -230,6 +234,21 @@ func isHugeInternalTableName(name string) bool {
 	return false
 }
 
+func isVectorInternalTableName(name string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	for _, prefix := range []string{"HNSW_GRAPH$", "HNSW_ELEMENT$", "IVFFLAT_CENTERS$", "IVFFLAT_VECTORS$"} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isVectorGeneratedTriggerName(name string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(name))
+	return strings.HasPrefix(upper, "TRIG_HNSW$") || strings.HasPrefix(upper, "TRIG_IVFFLAT$")
+}
+
 func linkHugeTableObjects(tables map[uint32]dictionaryObject) {
 	byOwnerName := make(map[string]uint32, len(tables))
 	for id, table := range tables {
@@ -254,6 +273,14 @@ func linkHugeTableObjects(tables map[uint32]dictionaryObject) {
 func removeHugeInternalTables(tables map[uint32]dictionaryObject) {
 	for id, table := range tables {
 		if table.isHugeInternalTable() {
+			delete(tables, id)
+		}
+	}
+}
+
+func removeSystemManagedInternalTables(tables map[uint32]dictionaryObject) {
+	for id, table := range tables {
+		if table.isSystemManagedInternalTable() {
 			delete(tables, id)
 		}
 	}
@@ -414,7 +441,7 @@ func ExportDDL(opts DDLExportOptions) (*DDLExportResult, error) {
 		}
 	}
 	linkHugeTableObjects(tables)
-	removeHugeInternalTables(tables)
+	removeSystemManagedInternalTables(tables)
 	applyDictionaryUserOverrides(opts.Dictionary, users)
 	dictionaryTables := applyDictionaryTableOverrides(opts.Dictionary, tables, tablespaces)
 
@@ -1358,14 +1385,21 @@ func tableStorageByID(tables map[uint32]dictionaryObject, indexObjects map[uint3
 		if idx.Flag&1 == 0 || idx.KeyNum != 0 {
 			continue
 		}
-		result[tableID] = idx
+		// SYSOBJECTS/SYSINDEXES can retain older table-data storage objects after
+		// TRUNCATE or a storage rebuild. DM9 also no longer guarantees that the
+		// active storage id equals 0x02000000|table_id. Object ids are allocated
+		// monotonically, so the greatest candidate id is the current storage;
+		// older candidates remain available through assist ids for recover mode.
+		if current, exists := result[tableID]; !exists || idx.ID > current.ID {
+			result[tableID] = idx
+		}
 	}
 	// HUGE main and transaction auxiliary tables can have SYSINDEXES storage
 	// rows without a matching TABOBJ/INDEX object. Their table-data storage id
 	// follows the regular 0x02000000|table_id rule, so retain that exact catalog
 	// row instead of guessing a root or scanning a data file.
 	for tableID, table := range tables {
-		if !table.isHugeObject() {
+		if !table.isHugeTable() {
 			continue
 		}
 		if idx, ok := indexes[tableDataAssistID(tableID)]; ok && idx.Flag&1 != 0 && idx.KeyNum == 0 {
@@ -1414,12 +1448,21 @@ func countDDLIndexes(tables map[uint32]dictionaryObject, indexObjects map[uint32
 			continue
 		}
 		idx, ok := indexes[indexID]
-		if !ok || idx.Flag&1 != 0 || idx.KeyNum == 0 || idx.Type != "BT" {
+		if !ok || idx.Flag&1 != 0 || idx.KeyNum == 0 || !isRenderableUserIndexType(idx.Type) {
 			continue
 		}
 		count++
 	}
 	return count
+}
+
+func isRenderableUserIndexType(indexType string) bool {
+	switch strings.ToUpper(strings.TrimSpace(indexType)) {
+	case "BT", "HS", "IF":
+		return true
+	default:
+		return false
+	}
 }
 
 func countExportedPartitionedTables(partitionsByTable map[uint32][]PartitionInfo, columnsByTable map[uint32][]columnDef) int {
@@ -2192,27 +2235,40 @@ func renderIndexes(out *strings.Builder, tables map[uint32]dictionaryObject, col
 			continue
 		}
 		idx, ok := indexes[indexID]
-		if !ok || idx.Flag&1 != 0 || idx.KeyNum == 0 || idx.Type != "BT" {
+		if !ok || idx.Flag&1 != 0 || idx.KeyNum == 0 || !isRenderableUserIndexType(idx.Type) {
 			continue
 		}
 		cols := ddlColumns(columnsFromIndex(indexID, uint32(obj.ParentID), indexes, columnsByTableColID), true)
 		if cols == "" {
 			continue
 		}
+		if sql, ok := renderCreateIndexSQL(obj, table, idx, cols, tablespaces); ok {
+			out.WriteString(sql)
+			out.WriteByte('\n')
+		}
+	}
+	out.WriteString("\n")
+}
+
+func renderCreateIndexSQL(obj dictionaryObject, table dictionaryObject, idx indexDef, columns string, tablespaces map[uint32]string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(idx.Type)) {
+	case "BT":
 		unique := ""
 		if idx.IsUnique == "Y" {
 			unique = "UNIQUE "
 		}
-		out.WriteString(fmt.Sprintf("CREATE %sINDEX %s ON %s.%s (%s)%s;\n",
-			unique,
-			quoteIdent(obj.Name),
-			quoteIdent(table.Owner),
-			quoteIdent(table.Name),
-			cols,
-			storageClause(uint32(idx.GroupID), tablespaces, defaultStorageOrg),
-		))
+		return fmt.Sprintf("CREATE %sINDEX %s ON %s.%s (%s)%s;",
+			unique, quoteIdent(obj.Name), quoteIdent(table.Owner), quoteIdent(table.Name), columns,
+			storageClause(uint32(idx.GroupID), tablespaces, defaultStorageOrg)), true
+	case "HS":
+		return fmt.Sprintf("CREATE VECTOR INDEX %s ON %s.%s (%s) ORGANIZATION NEIGHBOR GRAPH;",
+			quoteIdent(obj.Name), quoteIdent(table.Owner), quoteIdent(table.Name), columns), true
+	case "IF":
+		return fmt.Sprintf("CREATE VECTOR INDEX %s ON %s.%s (%s) ORGANIZATION NEIGHBOR PARTITIONS;",
+			quoteIdent(obj.Name), quoteIdent(table.Owner), quoteIdent(table.Name), columns), true
+	default:
+		return "", false
 	}
-	out.WriteString("\n")
 }
 
 func renderConstraints(out *strings.Builder, objects map[uint32]dictionaryObject, tables map[uint32]dictionaryObject, columnsByTableColID map[tableColKey]columnDef, constraintObjects map[uint32]dictionaryObject, indexes map[uint32]indexDef, constraints []constraintDef, matcher ownerMatcher, tableMatcher tableNameMatcher) {
@@ -2457,6 +2513,8 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 	}
 	numberTypes := map[string]bool{"NUMBER": true, "NUMERIC": true, "DEC": true, "DECIMAL": true}
 	switch {
+	case upper == "VECTOR":
+		return formatVectorColumnType(dt, length, scale)
 	case isYearMonthIntervalDataType(upper) || isDayTimeIntervalDataType(upper):
 		formatted, _ := formatIntervalColumnType(upper, scale)
 		return formatted
@@ -2497,4 +2555,33 @@ func formatColumnType(dataType string, length uint32, scale int16) string {
 		}
 		return dt
 	}
+}
+
+func formatVectorColumnType(dataType string, dimension uint32, scale int16) string {
+	if dimension == 0 {
+		return dataType
+	}
+	flags := uint16(scale)
+	element := ""
+	switch flags & 0x0F00 {
+	case 0x0100:
+		element = "FLOAT32"
+	case 0x0200:
+		element = "FLOAT64"
+	case 0x0300:
+		element = "INT8"
+	case 0x0400:
+		element = "BINARY"
+	}
+	parts := []string{strconv.FormatUint(uint64(dimension), 10)}
+	if element != "" {
+		parts = append(parts, element)
+	}
+	if flags&0x1000 != 0 {
+		if element == "" {
+			parts = append(parts, "FLOAT32")
+		}
+		parts = append(parts, "SPARSE")
+	}
+	return dataType + "(" + strings.Join(parts, ", ") + ")"
 }

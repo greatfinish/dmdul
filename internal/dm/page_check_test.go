@@ -169,6 +169,54 @@ func TestProtected32KDataPageUsesReservedTailAndRestoresSectorBytes(t *testing.T
 	}
 }
 
+func TestProtected32KDataPageRestoresRowHeaderAcrossSectorBoundary(t *testing.T) {
+	const (
+		pageSize = 32768
+		rowCount = 3
+		nSlot    = rowCount + 2
+		rowLen   = 7
+	)
+	page := make([]byte, pageSize)
+	binary.LittleEndian.PutUint32(page[dmPageKindOff:], dmPageKindRowData)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], nSlot)
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], rowCount)
+	rowOffsets := []int{0x100, 0x300, 0x3FFE}
+	for row, offset := range rowOffsets {
+		putTestRow(page, offset, rowLen, byte('A'+row))
+	}
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], 0x4100)
+
+	tailLen := pageTailReservedLen(pageSize)
+	slotStart := pageSize - tailLen - nSlot*2
+	binary.LittleEndian.PutUint16(page[slotStart:], 0x5A)
+	for row, offset := range rowOffsets {
+		binary.LittleEndian.PutUint16(page[slotStart+2+row*2:], uint16(offset))
+	}
+	binary.LittleEndian.PutUint16(page[slotStart+(nSlot-1)*2:], 0x52)
+
+	wantBoundaryRow := append([]byte(nil), page[rowOffsets[2]:rowOffsets[2]+rowLen]...)
+	tailStart := pageSize - tailLen
+	for sector := 1; sector < pageSize/systemSectorSize; sector++ {
+		target := sector*systemSectorSize - 4
+		copy(page[tailStart+(sector-1)*4:], page[target:target+4])
+		binary.LittleEndian.PutUint32(page[target:], 0xDEADBEEF)
+	}
+
+	if rows := locateRowsInDataPage(page, pageSize, rowCount); len(rows) != rowCount-1 {
+		t.Fatalf("protected page rows before restore=%d, want %d", len(rows), rowCount-1)
+	}
+	if got := pageSlotTrailerLenForPage(page); got != tailLen {
+		t.Fatalf("protected page trailer length=%d, want %d", got, tailLen)
+	}
+	restoreUserDataPageProtectionBytes(page, pageSize)
+	if got := page[rowOffsets[2] : rowOffsets[2]+rowLen]; !bytes.Equal(got, wantBoundaryRow) {
+		t.Fatalf("boundary row=%X, want %X", got, wantBoundaryRow)
+	}
+	if rows := locateRowsInDataPage(page, pageSize, rowCount); len(rows) != rowCount {
+		t.Fatalf("protected page rows after restore=%d, want %d", len(rows), rowCount)
+	}
+}
+
 func TestInferHashTrailerWhenShiftedSlotsStillScoreWell(t *testing.T) {
 	const (
 		pageSize = 32768

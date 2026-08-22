@@ -441,7 +441,7 @@ func scanDictionaryRoutines(objects map[uint32]dictionaryObject, texts map[uint3
 			})
 		case "PKG":
 			specSQL := routineTextSQL(texts[obj.ID], 0)
-			if raw, _ := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, "PACKAGE"); len(raw) > len(specSQL) {
+			if raw, rawType := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, "PACKAGE"); rawType == "PACKAGE" && preferRawRoutineText(specSQL, raw, "PACKAGE") {
 				specSQL = raw
 			}
 			routines = append(routines, DictionaryRoutine{
@@ -454,7 +454,7 @@ func scanDictionaryRoutines(objects map[uint32]dictionaryObject, texts map[uint3
 				SQL:        specSQL,
 			})
 			bodySQL := routineTextSQL(texts[obj.ID], 1)
-			if raw, _ := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, "PACKAGE BODY"); len(raw) > len(bodySQL) {
+			if raw, rawType := bestRawRoutineText(rawTexts, obj.Owner, obj.Name, "PACKAGE BODY"); rawType == "PACKAGE BODY" && preferRawRoutineText(bodySQL, raw, "PACKAGE BODY") {
 				bodySQL = raw
 			}
 			if bodySQL != "" {
@@ -483,6 +483,20 @@ func routineTypeFromSQL(sql string) string {
 	return objectType
 }
 
+func preferRawRoutineText(current string, raw string, expectedType string) bool {
+	if strings.TrimSpace(raw) == "" {
+		return false
+	}
+	expectedType = normalizeRoutineObjectType(expectedType)
+	if normalizeRoutineObjectType(routineTypeFromSQL(raw)) != expectedType {
+		return false
+	}
+	if normalizeRoutineObjectType(routineTypeFromSQL(current)) != expectedType {
+		return true
+	}
+	return len(raw) > len(current)
+}
+
 func bestRawRoutineText(rawTexts map[string]string, owner string, name string, preferredTypes ...string) (string, string) {
 	for _, objectType := range preferredTypes {
 		objectType = normalizeRoutineObjectType(objectType)
@@ -504,7 +518,7 @@ func bestRawRoutineText(rawTexts map[string]string, owner string, name string, p
 func scanDictionaryTriggers(objects map[uint32]dictionaryObject, texts map[uint32]map[uint32]string, rawTexts map[string]string, matcher ownerMatcher) []DictionaryTrigger {
 	var triggers []DictionaryTrigger
 	for _, obj := range objects {
-		if obj.Type != "SCHOBJ" || obj.Subtype != "TRIG" || obj.Valid == "N" || !matcher.allowed(obj.Owner) {
+		if obj.Type != "SCHOBJ" || obj.Subtype != "TRIG" || obj.Valid == "N" || !matcher.allowed(obj.Owner) || isVectorGeneratedTriggerName(obj.Name) {
 			continue
 		}
 		sql := triggerTextSQL(texts[obj.ID])
@@ -514,6 +528,9 @@ func scanDictionaryTriggers(objects map[uint32]dictionaryObject, texts map[uint3
 		tableOwner, tableName := triggerTargetFromParent(objects, obj)
 		if tableOwner == "" || tableName == "" {
 			tableOwner, tableName = parseTriggerTargetTable(sql)
+		}
+		if isVectorInternalTableName(tableName) {
+			continue
 		}
 		triggers = append(triggers, DictionaryTrigger{
 			ID:         obj.ID,

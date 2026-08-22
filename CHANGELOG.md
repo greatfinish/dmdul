@@ -12,6 +12,49 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.9.0 - DM9 Compatibility
+
+### Added
+
+- 新增 DM9 VECTOR 行值与 DDL：支持 FLOAT32、FLOAT64、INT8、BINARY 和稀疏 FLOAT32，
+  并恢复 HNSW/IVFFLAT 用户索引的基本组织类型。
+- `unload user` 覆盖用户拥有的全部模式；额外模式的表使用包含模式名的防冲突输出文件名。
+- 新增 DM9 兼容性实测文档，记录 UOS、32 KiB、UTF-8 冷快照的对象矩阵、三通道回灌
+  证据和已知边界。
+
+### Fixed
+
+- 修复 32 KiB 数据页中记录头跨 4 KiB 保护边界时每个受影响边界漏一行；LOB 和 Long Row
+  页也按页类型恢复保护字节。
+- NOBRANCH page plan 解析 root 中的全部分支描述并合并 leaf/next 链，不再只读取第一支。
+- DM9 普通表标志位不再被旧 HUGE 启发式误判；只有 `$AUX` 等明确证据存在时才进入 HUGE
+  数据路径。
+- 过滤 HNSW/IVFFLAT 自动生成的内部表和触发器，避免作为用户对象导出。
+- DMP 主键改为内联 `CREATE TABLE`，与官方 `dexp` 元数据布局一致，确保外键应用前引用
+  主键已经存在。
+- SQL 超长语句告警采用 DM9 实测的 2499 字节可移植 stdin 下限；超过限制时提示改用
+  dmfldr/DMP，避免 `disql` 返回 0 但静默跳过记录。
+- 页检查先恢复可证明存在的保护尾区再做结构校验，消除干净 DM9 SYSTEM 页误报。
+- 修复 GB18030/EUC-KR 短内联 `TEXT/CLOB` subtype `0x03` 未识别导致整行解析失败。
+- dmfldr 控制文件统一按实际 UTF-8 输出声明 `CHARACTER_CODE`，不再把源数据库字符集误当
+  成输入文本编码。
+- 包规格与包体按 SQL 对象类型优先匹配；16/32 KiB 字典页中较长包体不再覆盖包规格。
+
+### Tests
+
+- UOS DM9 `03151060506-20260417-322930-20218` 冷快照完成 20 表、93 字段、程序对象、
+  三类分区、LOB、Long Row、HUGE 和五种 VECTOR 的离线恢复；11335 行、0 失败、45 个
+  计划页全直读、0 fallback、SYSTEM 预检 0 坏页。
+- dmfldr 回灌后普通表、HUGE、分区、LOB/JSON 和向量差异均为 0。
+- DMP 的 `SHOW/CTRL_INFO=4` 通过；新建 DM9 实例导入返回码 0、无警告、11335 行齐全、
+  0 个无效对象，除已知 TIME 小数秒限制外 10006 条规范化标量/向量记录与源库一致。
+- 新增 8/16/32 KiB × GB18030/UTF-8/EUC-KR 的 3×3 冷快照矩阵；每组 3027 行、0 失败、
+  0 坏页、0 fallback，dmfldr 清空回装一致。8 KiB/GB18030、16 KiB/EUC-KR 和
+  32 KiB/UTF-8 的 OWNER DMP 真导入均返回 0、无警告、无无效对象。
+- 实测确认该 DM9 build 拒绝 `PAGE_SIZE=64`；64 仅作为 `EXTENT_SIZE` 页数纳入验证。
+
+------
+
 ## v0.8.0 - HUGE Column-Store Recovery
 
 ### Added

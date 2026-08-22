@@ -2130,6 +2130,8 @@ func (s *interactiveSession) unloadObject(args []string, stdout io.Writer) error
 		prefix = "DATABASE"
 	} else if !s.hasOwner(ownerToken) {
 		return fmt.Errorf("user/owner %s not found in dictionary", args[0])
+	} else {
+		ownerFilter = strings.Join(s.schemaNamesForUser(ownerToken), ",")
 	}
 	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
 		prefix = sanitizedFilePrefix(customPrefix)
@@ -2175,6 +2177,7 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 	if !s.hasOwner(owner) {
 		return fmt.Errorf("user/owner %s not found in dictionary", args[0])
 	}
+	ownerFilter := strings.Join(s.schemaNamesForUser(owner), ",")
 	prefix := sanitizedFilePrefix(owner)
 	if customPrefix, ok := optionalToPrefix(args[1:]); ok {
 		prefix = sanitizedFilePrefix(customPrefix)
@@ -2186,11 +2189,11 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 		SystemPath:     s.systemPath,
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
-		TableOutputPath: func(_ string, table string, _ uint32) string {
-			tablePrefix := sanitizedFilePrefix(prefix + "_" + table)
+		TableOutputPath: func(tableOwner string, table string, _ uint32) string {
+			tablePrefix := userTableOutputPrefix(prefix, owner, tableOwner, table)
 			return s.outputPath(tablePrefix + "_ddl.sql")
 		},
-		OwnerFilter: owner,
+		OwnerFilter: ownerFilter,
 		TableFilter: "all",
 		Charset:     s.charset,
 		TablesOnly:  true,
@@ -2205,11 +2208,11 @@ func (s *interactiveSession) unloadUser(args []string, stdout io.Writer) error {
 		ControlPath:    s.controlPath,
 		ControlDULPath: s.effectiveControlDULPath(),
 		DataDir:        s.effectiveDataDir(),
-		TableOutputPath: func(_ string, table string, _ uint32) string {
-			tablePrefix := sanitizedFilePrefix(prefix + "_" + table)
+		TableOutputPath: func(tableOwner string, table string, _ uint32) string {
+			tablePrefix := userTableOutputPrefix(prefix, owner, tableOwner, table)
 			return s.outputPath(tablePrefix + "_data." + dataExt)
 		},
-		OwnerFilter:      owner,
+		OwnerFilter:      ownerFilter,
 		TableFilter:      "all",
 		ExcludeTables:    "",
 		Charset:          s.charset,
@@ -2453,11 +2456,8 @@ func (s *interactiveSession) unloadDMPUser(args []string, stdout io.Writer) erro
 			return fmt.Errorf("user %s not found in dictionary", value)
 		}
 		normalizedUsers = appendUniqueFold(normalizedUsers, owner)
-		schemaFilters = appendUniqueFold(schemaFilters, owner)
-		for _, schema := range s.dictionary.Schemas {
-			if strings.EqualFold(schema.Owner, owner) {
-				schemaFilters = appendUniqueFold(schemaFilters, schema.Name)
-			}
+		for _, schema := range s.schemaNamesForUser(owner) {
+			schemaFilters = appendUniqueFold(schemaFilters, schema)
 		}
 	}
 	prefix := sanitizedFilePrefix(strings.Join(normalizedUsers, "_"))
@@ -2471,6 +2471,26 @@ func (s *interactiveSession) unloadDMPUser(args []string, stdout io.Writer) erro
 		mode: dm.DMPModeOwner, ownerFilter: strings.Join(schemaFilters, ","),
 		tableFilter: "all", prefix: prefix,
 	}, stdout)
+}
+
+func (s *interactiveSession) schemaNamesForUser(user string) []string {
+	result := []string{normalizeIdentifierInput(user)}
+	if s.dictionary == nil {
+		return result
+	}
+	for _, schema := range s.dictionary.Schemas {
+		if strings.EqualFold(schema.Owner, user) {
+			result = appendUniqueFold(result, schema.Name)
+		}
+	}
+	return result
+}
+
+func userTableOutputPrefix(prefix string, user string, schema string, table string) string {
+	if strings.EqualFold(user, schema) {
+		return sanitizedFilePrefix(prefix + "_" + table)
+	}
+	return sanitizedFilePrefix(prefix + "_" + schema + "_" + table)
 }
 
 func (s *interactiveSession) unloadSchema(args []string, stdout io.Writer) error {
@@ -2681,7 +2701,7 @@ func printDataExportWarnings(stdout io.Writer, result *dm.DataExportResult) {
 		fmt.Fprintf(stdout, "warning: TIME fractional seconds are not representable in DM DMP and were cleared in %d row(s)\n", result.TimeFractionLoss)
 	}
 	if result.OversizedSQLStatements > 0 {
-		fmt.Fprintf(stdout, "warning: %d INSERT statement(s) exceed disql's 160 KiB input buffer (tables: %s); disql aborts them with \"input too long\", so import this SQL with a JDBC/ODBC client or re-export with data_format dmp\n",
+		fmt.Fprintf(stdout, "warning: %d INSERT statement(s) exceed disql's portable 2499-byte stdin line limit (tables: %s); DM9 reports DISQL-10053 and skips them, so import this SQL with a JDBC/ODBC client or re-export with data_format fldr/dmp\n",
 			result.OversizedSQLStatements, strings.Join(result.OversizedSQLTables, ", "))
 	}
 	for _, source := range result.RecoverySources {

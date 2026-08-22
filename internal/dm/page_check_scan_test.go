@@ -47,6 +47,24 @@ func TestCheckRowPageStructureAcceptsHealthyPage(t *testing.T) {
 	}
 }
 
+func TestCheckRowPageStructureAcceptsReusableSlotWords(t *testing.T) {
+	page := make([]byte, 8192)
+	putTestDMPageHeader(page, 12, 0, 48, dmPageKindRowData, 33555845)
+	binary.BigEndian.PutUint16(page[dataRowAreaStart:], 8)
+	binary.LittleEndian.PutUint32(page[dataRowAreaStart+3:], 1001)
+	binary.LittleEndian.PutUint16(page[dataPageSlotCountOff:], 3)
+	binary.LittleEndian.PutUint16(page[dataPageFreeEndOff:], dataRowAreaStart+8)
+	binary.LittleEndian.PutUint16(page[dataPageRecordCountOff:], 1)
+	start := len(page) - pageSlotTrailerLen - 3*2
+	binary.LittleEndian.PutUint16(page[start:], 0x5A)
+	binary.LittleEndian.PutUint16(page[start+2:], dataRowAreaStart)
+	binary.LittleEndian.PutUint16(page[start+4:], 0x1FFF)
+
+	if detail, ok := checkRowPageStructure(page, 8192); !ok {
+		t.Fatalf("page with one live row and one reusable slot rejected: %s", detail)
+	}
+}
+
 func TestClassifyPageCorruptionDetectsInjectedDamage(t *testing.T) {
 	key := dataFileKey{groupID: 12, fileID: 0}
 	tests := []struct {

@@ -247,6 +247,15 @@ func restoreUserDataPageProtectionBytes(page []byte, pageSize uint32) {
 	if _, _, ok := detectDMPageHash(page); ok {
 		return
 	}
+	// LOB and Long Row pages have no ordinary slot directory from which to
+	// infer the protection trailer. Their page kind is authoritative and their
+	// final reserved area contains one four-byte backup for every 4 KiB sector
+	// boundary. Without restoring it, large CLOB/BLOB/VARCHAR values acquire
+	// protection words every 4096 bytes and fail text/binary round trips.
+	if kind := dataPageKind(page); kind == dmPageKindLOBData || kind == dmPageKindLongRowData {
+		restorePayloadPageProtectionBytes(page, pageSize)
+		return
+	}
 	trailerLen, ok := inferDMPageProtectionTrailerLen(page)
 	if !ok || trailerLen != pageTailReservedLen(pageSize) {
 		return
@@ -257,6 +266,25 @@ func restoreUserDataPageProtectionBytes(page []byte, pageSize uint32) {
 		src := tailStart + (sector-1)*4
 		dst := sector*systemSectorSize - 4
 		if src+4 > int(pageSize) || dst+4 > int(pageSize) {
+			return
+		}
+		copy(page[dst:dst+4], page[src:src+4])
+	}
+}
+
+func restorePayloadPageProtectionBytes(page []byte, pageSize uint32) {
+	sectors := int(pageSize) / systemSectorSize
+	if sectors <= 1 || len(page) < int(pageSize) {
+		return
+	}
+	tailStart := int(pageSize) - pageTailReservedLen(pageSize)
+	if tailStart < 0 {
+		return
+	}
+	for sector := 1; sector < sectors; sector++ {
+		src := tailStart + (sector-1)*4
+		dst := sector*systemSectorSize - 4
+		if src+4 > len(page) || dst+4 > len(page) {
 			return
 		}
 		copy(page[dst:dst+4], page[src:src+4])

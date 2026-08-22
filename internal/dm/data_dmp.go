@@ -78,6 +78,20 @@ func renderDMPForDataRowWithMeta(info dataTableInfo, row []byte, decoder textDec
 
 func dmpFieldForDataColumn(col columnDef, value any, charset dmpCharsetHeader) (DMPField, bool, error) {
 	typ := normalizeDataType(col.DataType)
+	if isVectorDataType(typ) {
+		vector, ok := value.(dmVectorValue)
+		if !ok {
+			return DMPField{}, false, fmt.Errorf("VECTOR value has type %T", value)
+		}
+		raw, err := encodeDMPText(vector.text, charset)
+		if err != nil {
+			return DMPField{}, false, err
+		}
+		if len(raw) > int(^uint16(0))-1 {
+			return DMPLongField(raw), false, nil
+		}
+		return DMPShortField(raw), false, nil
+	}
 	if isJSONDataType(typ) {
 		materialized, err := materializeDataValue(value)
 		if err != nil {

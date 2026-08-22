@@ -127,12 +127,22 @@ func inferDMPageProtectionTrailerLen(page []byte) (int, bool) {
 	}
 	base := evaluateDMPageSlotLayout(page, pageSlotTrailerLen, nSlot, nRec, freeEnd)
 	protected := evaluateDMPageSlotLayout(page, protectedLen, nSlot, nRec, freeEnd)
-	if !protected.clean || protected.rows == 0 {
+	sectors := len(page) / systemSectorSize
+	protectedRecoverable := protected.rows > 0 && protected.invalid <= sectors-1 && protected.rows+protected.invalid == int(nRec)
+	if !protected.clean && !protectedRecoverable {
 		return 0, false
 	}
 	baseDelta := absInt(base.rows - int(nRec))
 	protectedDelta := absInt(protected.rows - int(nRec))
 	if protected.rows == int(nRec) && (!base.clean || base.rows != int(nRec)) {
+		return protectedLen, true
+	}
+	// A row header can itself straddle a protected 4 KiB boundary. Before the
+	// backup bytes are restored that one row is undecodable, so requiring a
+	// completely clean protected layout creates a circular failure and silently
+	// drops one row per affected boundary. The number of such rows is bounded by
+	// the number of sector boundaries and the remaining rows still match nRec.
+	if protectedRecoverable && (base.rows != int(nRec) || base.invalid > protected.invalid) {
 		return protectedLen, true
 	}
 	if protectedDelta <= baseDelta && protected.score >= base.score+32 {

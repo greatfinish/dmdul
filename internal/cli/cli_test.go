@@ -795,6 +795,44 @@ func TestInteractiveUnloadUserUsesDefaultOutputSubdirectory(t *testing.T) {
 	})
 }
 
+func TestInteractiveUnloadUserIncludesEverySchemaOwnedByUser(t *testing.T) {
+	cwd, dataDir, outDir := setupUnloadDatabaseFixture(t)
+	dictDir := filepath.Join(dataDir, dm.DefaultDictionaryDirName)
+	dict, _, err := dm.LoadDictionaryFiles(dictDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dict.Tables = append(dict.Tables, dm.DictionaryTable{
+		ID: 1003, Owner: "APP_EXTRA", Name: "WITH_ROWS", ColumnCount: 1,
+		Tablespace: "MAIN", GroupID: 4, Storage: "CLUSTERBTR",
+	})
+	dict.Columns = append(dict.Columns, dm.DictionaryColumn{
+		TableID: 1003, TableOwner: "APP_EXTRA", TableName: "WITH_ROWS",
+		ColID: 1, Name: "ID", DataType: "INT", Nullable: "N",
+	})
+	if _, err := dm.WriteDictionaryFiles(dictDir, dict); err != nil {
+		t.Fatal(err)
+	}
+
+	runInDir(t, cwd, func() {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		input := "set output_dir " + outDir + ";\nunload user APP;\nexit;\n"
+		if err := RunInteractive(strings.NewReader(input), &stdout, &stderr); err != nil {
+			t.Fatalf("RunInteractive returned error: %v", err)
+		}
+		for _, name := range []string{"APP_WITH_ROWS_ddl.sql", "APP_APP_EXTRA_WITH_ROWS_ddl.sql"} {
+			if _, err := os.Stat(filepath.Join(outDir, name)); err != nil {
+				t.Fatalf("owned-schema output %s should exist: %v\n%s", name, err, stdout.String())
+			}
+		}
+		extraDDL := readTestFile(t, filepath.Join(outDir, "APP_APP_EXTRA_WITH_ROWS_ddl.sql"))
+		if !strings.Contains(extraDDL, "CREATE TABLE APP_EXTRA.WITH_ROWS") {
+			t.Fatalf("owned schema table was not exported: %q", extraDDL)
+		}
+	})
+}
+
 func TestInteractiveUnloadObjectExportsOwnerDictionary(t *testing.T) {
 	cwd, _, outDir := setupUnloadDatabaseFixture(t)
 	runInDir(t, cwd, func() {
