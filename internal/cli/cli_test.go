@@ -358,26 +358,26 @@ func TestInteractiveOutputDirDefaultsToDedicatedSubdirectory(t *testing.T) {
 	if got := session.outputPath("HR_TEST_data.sql"); got != want {
 		t.Fatalf("default outputPath = %q", got)
 	}
-	session.dataDir = `D:\temp\oldpro`
+	session.dataDir = filepath.Join(t.TempDir(), "oldpro")
 	session.dataDirSet = true
 	if got := session.outputPath("HR_TEST_data.sql"); got != want {
 		t.Fatalf("data_dir must not change default outputPath, got %q", got)
 	}
-	if got := session.effectiveControlDULPath(); got != `D:\temp\oldpro\control.dul` {
+	if got := session.effectiveControlDULPath(); got != filepath.Join(session.dataDir, "control.dul") {
 		t.Fatalf("control.dul path = %q", got)
 	}
-	if got := session.effectiveDictionaryDir(); got != `D:\temp\oldpro\dmdul_dict` {
+	if got := session.effectiveDictionaryDir(); got != filepath.Join(session.dataDir, "dmdul_dict") {
 		t.Fatalf("dictionary path = %q", got)
 	}
-	if got := session.effectiveLogPath(); got != `D:\temp\oldpro\dul.log` {
+	if got := session.effectiveLogPath(); got != filepath.Join(session.dataDir, "dul.log") {
 		t.Fatalf("log path = %q", got)
 	}
-	session.outputDir = `D:\out`
+	session.outputDir = filepath.Join(t.TempDir(), "out")
 	session.outputDirSet = true
-	if got := session.outputPath("HR_TEST_data.sql"); got != `D:\out\HR_TEST_data.sql` {
+	if got := session.outputPath("HR_TEST_data.sql"); got != filepath.Join(session.outputDir, "HR_TEST_data.sql") {
 		t.Fatalf("explicit output_dir outputPath = %q", got)
 	}
-	if got := session.effectiveDictionaryDir(); got != `D:\temp\oldpro\dmdul_dict` {
+	if got := session.effectiveDictionaryDir(); got != filepath.Join(session.dataDir, "dmdul_dict") {
 		t.Fatalf("output_dir must not move dictionary path, got %q", got)
 	}
 }

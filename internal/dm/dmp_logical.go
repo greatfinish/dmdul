@@ -338,6 +338,12 @@ func writeDMPMetadataRecord(file *os.File, charset dmpCharsetHeader, record DMPM
 	if err := writeDMPUint16(file, 0xFFFF); err != nil {
 		return err
 	}
+	if record.RecordType == dmpRecordColumnGrant {
+		if record.Grant == nil || record.Grant.ColumnName == "" {
+			return fmt.Errorf("column grant metadata has no resolved column name")
+		}
+		return writeDMPObjectGrant(file, charset, record.Grant, false)
+	}
 	if record.RecordType == dmpRecordObjectGrant || record.RecordType == dmpRecordSchemaGrant {
 		return writeDMPObjectGrant(file, charset, record.Grant, record.RecordType == dmpRecordSchemaGrant)
 	}
@@ -378,6 +384,15 @@ func writeDMPObjectGrant(file *os.File, charset dmpCharsetHeader, grant *DMPObje
 	}
 	for _, value := range []string{grant.Grantor, grant.Grantee, grant.Privilege, grant.Owner, grant.ObjectName} {
 		encoded, err := encodeDMPText(value, charset)
+		if err != nil {
+			return err
+		}
+		if err := writeDMPString32(file, encoded); err != nil {
+			return err
+		}
+	}
+	if grant.ColumnName != "" {
+		encoded, err := encodeDMPText(grant.ColumnName, charset)
 		if err != nil {
 			return err
 		}

@@ -205,7 +205,9 @@ func inferTablespaceNameFromDataFile(path string, groupID uint32) string {
 	if name := defaultTablespaceNames()[groupID]; name != "" {
 		return name
 	}
-	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	// Control files may originate on a different OS from the recovery host.
+	portablePath := strings.ReplaceAll(path, "\\", "/")
+	base := strings.TrimSuffix(filepath.Base(portablePath), filepath.Ext(portablePath))
 	base = strings.ToUpper(strings.TrimSpace(base))
 	if base == "" {
 		return ""

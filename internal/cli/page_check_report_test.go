@@ -28,6 +28,7 @@ func TestExecuteCheckWritesImpactReports(t *testing.T) {
 	}
 	// Keep page 0 healthy so header discovery identifies group/file; corrupt
 	// page 1's self-id to produce one deterministic HEADER_INVALID result.
+	binary.LittleEndian.PutUint32(raw[0x84:], pageSize)
 	binary.LittleEndian.PutUint32(raw[pageSize+4:], 999)
 	if err := os.WriteFile(filepath.Join(dataDir, "MAIN.DBF"), raw, 0644); err != nil {
 		t.Fatal(err)
@@ -126,6 +127,7 @@ func TestExecuteCheckDoesNotAutoLoadLeftoverDictionary(t *testing.T) {
 		binary.LittleEndian.PutUint16(page[0x26:], 0x62)
 		binary.LittleEndian.PutUint32(page[0x3A:], 1042)
 	}
+	binary.LittleEndian.PutUint32(raw[0x84:], pageSize)
 	binary.LittleEndian.PutUint32(raw[pageSize+4:], 999)
 	if err := os.WriteFile(filepath.Join(dataDir, "MAIN.DBF"), raw, 0644); err != nil {
 		t.Fatal(err)

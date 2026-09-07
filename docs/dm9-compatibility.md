@@ -57,8 +57,29 @@ NOBRANCH 堆表、Long Row、行外 LOB、基础类型、RANGE/LIST/HASH 分区�
 fail to init db.
 ```
 
-因此“64”在本次矩阵中是 `EXTENT_SIZE=64` 页，不是 64 KiB 数据页。4 KiB 虽受 DM9
-初始化工具支持，但尚未纳入本轮 dmdul 兼容验证。
+因此“64”在本次矩阵中是 `EXTENT_SIZE=64` 页，不是 64 KiB 数据页。原 v0.9.0 矩阵未含
+4 KiB；下面的 v0.10.0 补充实验不能混同为原版本已经验证。
+
+### 2026-09-06 补充矩阵（v0.10.0）
+
+同一 build，CASE_SENSITIVE=0，每组为 3 行 INT/VARCHAR/DECIMAL/DATE 小表，含 NULL。
+SQL/fldr/DMP 均执行导出，DMP 由 dimp 导回额外模式并做双向 MINUS。4 KiB 的三字符集
+另外写入中文/韩文值后重做 DMP 往返。这个小表矩阵不等于原 3027 行完整对象集已全部复跑。
+
+| 页大小 | 字符集 | PAGE_CHECK | 结果 |
+| --- | --- | --- | --- |
+| 4 KiB | UTF-8 | 0、1、3 | bootstrap + SYSTEM/全库检查 + DMP 往返 PASS |
+| 4 KiB | GB18030 | 3 | 中文数据往返 PASS |
+| 4 KiB | EUC-KR | 3 | 韩文数据往返 PASS |
+| 8/16/32 KiB | UTF-8 | 2，SM3 | bootstrap + SYSTEM/全库检查 + DMP 往返 PASS |
+| 4 KiB | UTF-8 | 2，SM3/SHA256 | dminit 因页空间不足拒绝，保留为负样本 |
+
+SM3 实验发现分 sector HASH 布局，详见 [页校验实验](page-check.md)。检查读取原始页，
+所有成功矩阵坏页数为 0，DMP 比对 missing/extra 均为 0；模式 0 的“0 坏页”不包含摘要校验。
+
+安装机上另一个日期命名的 ISO 解出的服务器仍报告同一完整 build 编号，因此不能计作
+“第二个 build 验证”。此项等待不同 build 的安装包。脚本及日志位置见
+[本轮实测记录](compatibility-hardening-20260906.md)。
 
 ## 本次代码适配
 

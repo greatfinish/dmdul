@@ -21,6 +21,8 @@ type dictionaryObjectPrivilegeDef struct {
 	PrivID    int32
 	Privilege string
 	Grantable string
+	ColumnID  int32
+	GrantorID uint32
 	Location  ddlLocation
 }
 
@@ -652,14 +654,14 @@ func parseDDLObjectPrivilegeRow(page []byte, slotOff int, pageNo uint32, slotNo 
 			continue
 		}
 		rowLen := binary.LittleEndian.Uint16(page[base+1:])
-		if rowLen != 44 {
+		if rowLen != 44 || page[base]&0x80 != 0 {
 			continue
 		}
 		colID := int32(binary.LittleEndian.Uint32(page[base+12:]))
 		privID := int32(binary.LittleEndian.Uint32(page[base+16:]))
 		grantor := int32(binary.LittleEndian.Uint32(page[base+20:]))
 		grantable := page[base+24]
-		if colID != -1 || privID == -1 || grantor == -1 {
+		if colID < -1 || colID > 65535 || privID == -1 || grantor == -1 {
 			continue
 		}
 		if grantable != 'Y' && grantable != 'N' {
@@ -681,6 +683,8 @@ func parseDDLObjectPrivilegeRow(page []byte, slotOff int, pageNo uint32, slotNo 
 			PrivID:    privID,
 			Privilege: privilege,
 			Grantable: string([]byte{grantable}),
+			ColumnID:  colID,
+			GrantorID: uint32(grantor),
 			Location:  ddlLocation{PageNo: pageNo, SlotNo: slotNo, SlotOffset: rawSlotOff, RowOffset: rowAbs},
 		}, true
 	}
@@ -697,6 +701,8 @@ func objectPrivilegeName(privID int32) string {
 		return "DELETE"
 	case 8195:
 		return "UPDATE"
+	case 8196:
+		return "REFERENCES"
 	default:
 		return ""
 	}
@@ -822,6 +828,12 @@ func sortDictionaryTabPrivileges(privileges []DictionaryTabPrivilege) {
 		}
 		if privileges[i].Privilege != privileges[j].Privilege {
 			return privileges[i].Privilege < privileges[j].Privilege
+		}
+		if privileges[i].ColumnName != privileges[j].ColumnName {
+			return privileges[i].ColumnName < privileges[j].ColumnName
+		}
+		if privileges[i].Grantor != privileges[j].Grantor {
+			return privileges[i].Grantor < privileges[j].Grantor
 		}
 		return privileges[i].Grantable < privileges[j].Grantable
 	})

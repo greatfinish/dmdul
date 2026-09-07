@@ -16,32 +16,34 @@ import (
 const DefaultDictionaryDirName = "dmdul_dict"
 
 type DictionaryFilesResult struct {
-	Dir               string
-	MetaPath          string
-	UsersPath         string
-	SchemasPath       string
-	TablesPath        string
-	ColumnsPath       string
-	ViewsPath         string
-	SequencesPath     string
-	RoutinesPath      string
-	TriggersPath      string
-	SynonymsPath      string
-	TabPrivilegesPath string
-	PartitionsPath    string
-	PartitionKeysPath string
-	UserCount         int
-	SchemaCount       int
-	TableCount        int
-	ColumnCount       int
-	ViewCount         int
-	SequenceCount     int
-	RoutineCount      int
-	TriggerCount      int
-	SynonymCount      int
-	TabPrivilegeCount int
-	PartitionCount    int
-	PartitionKeyCount int
+	Dir                  string
+	MetaPath             string
+	UsersPath            string
+	SchemasPath          string
+	TablesPath           string
+	ColumnsPath          string
+	ViewsPath            string
+	SequencesPath        string
+	RoutinesPath         string
+	TriggersPath         string
+	SynonymsPath         string
+	TabPrivilegesPath    string
+	SystemPrivilegesPath string
+	PartitionsPath       string
+	PartitionKeysPath    string
+	UserCount            int
+	SchemaCount          int
+	TableCount           int
+	ColumnCount          int
+	ViewCount            int
+	SequenceCount        int
+	RoutineCount         int
+	TriggerCount         int
+	SynonymCount         int
+	TabPrivilegeCount    int
+	SystemPrivilegeCount int
+	PartitionCount       int
+	PartitionKeyCount    int
 }
 
 func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesResult, error) {
@@ -89,6 +91,9 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	if err := writeDictionaryTabPrivileges(result.TabPrivilegesPath, dict.TabPrivileges); err != nil {
 		return nil, err
 	}
+	if err := writeDictionarySystemPrivileges(result.SystemPrivilegesPath, dict.SystemPrivileges); err != nil {
+		return nil, err
+	}
 	if err := writeDictionaryPartitions(result.PartitionsPath, dict.Partitions); err != nil {
 		return nil, err
 	}
@@ -105,6 +110,7 @@ func WriteDictionaryFiles(dir string, dict *DictionaryInfo) (*DictionaryFilesRes
 	result.TriggerCount = len(dict.Triggers)
 	result.SynonymCount = len(dict.Synonyms)
 	result.TabPrivilegeCount = len(dict.TabPrivileges)
+	result.SystemPrivilegeCount = len(dict.SystemPrivileges)
 	result.PartitionCount = len(dict.Partitions)
 	result.PartitionKeyCount = len(dict.PartitionKeys)
 	return result, nil
@@ -369,6 +375,10 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	if err != nil && os.IsNotExist(err) {
 		tabPrivileges = nil
 	}
+	systemPrivileges, err := readDictionarySystemPrivileges(result.SystemPrivilegesPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, nil, err
+	}
 	partitions, err := readDictionaryPartitions(result.PartitionsPath)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, nil, err
@@ -424,6 +434,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 		Triggers:            triggers,
 		Synonyms:            synonyms,
 		TabPrivileges:       tabPrivileges,
+		SystemPrivileges:    systemPrivileges,
 		Partitions:          partitions,
 		PartitionKeys:       partitionKeys,
 	}
@@ -437,6 +448,7 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 	result.TriggerCount = len(triggers)
 	result.SynonymCount = len(synonyms)
 	result.TabPrivilegeCount = len(tabPrivileges)
+	result.SystemPrivilegeCount = len(systemPrivileges)
 	result.PartitionCount = len(partitions)
 	result.PartitionKeyCount = len(partitionKeys)
 	return dict, result, nil
@@ -444,20 +456,21 @@ func LoadDictionaryFiles(dir string) (*DictionaryInfo, *DictionaryFilesResult, e
 
 func dictionaryFilesResultForDir(dir string) *DictionaryFilesResult {
 	return &DictionaryFilesResult{
-		Dir:               dir,
-		MetaPath:          filepath.Join(dir, "meta.tsv"),
-		UsersPath:         filepath.Join(dir, "users.tsv"),
-		SchemasPath:       filepath.Join(dir, "schemas.tsv"),
-		TablesPath:        filepath.Join(dir, "tables.tsv"),
-		ColumnsPath:       filepath.Join(dir, "columns.tsv"),
-		ViewsPath:         filepath.Join(dir, "views.tsv"),
-		SequencesPath:     filepath.Join(dir, "sequences.tsv"),
-		RoutinesPath:      filepath.Join(dir, "routines.tsv"),
-		TriggersPath:      filepath.Join(dir, "triggers.tsv"),
-		SynonymsPath:      filepath.Join(dir, "synonyms.tsv"),
-		TabPrivilegesPath: filepath.Join(dir, "tab_privs.tsv"),
-		PartitionsPath:    filepath.Join(dir, "partitions.tsv"),
-		PartitionKeysPath: filepath.Join(dir, "partition_keys.tsv"),
+		Dir:                  dir,
+		MetaPath:             filepath.Join(dir, "meta.tsv"),
+		UsersPath:            filepath.Join(dir, "users.tsv"),
+		SchemasPath:          filepath.Join(dir, "schemas.tsv"),
+		TablesPath:           filepath.Join(dir, "tables.tsv"),
+		ColumnsPath:          filepath.Join(dir, "columns.tsv"),
+		ViewsPath:            filepath.Join(dir, "views.tsv"),
+		SequencesPath:        filepath.Join(dir, "sequences.tsv"),
+		RoutinesPath:         filepath.Join(dir, "routines.tsv"),
+		TriggersPath:         filepath.Join(dir, "triggers.tsv"),
+		SynonymsPath:         filepath.Join(dir, "synonyms.tsv"),
+		TabPrivilegesPath:    filepath.Join(dir, "tab_privs.tsv"),
+		SystemPrivilegesPath: filepath.Join(dir, "sys_privs.tsv"),
+		PartitionsPath:       filepath.Join(dir, "partitions.tsv"),
+		PartitionKeysPath:    filepath.Join(dir, "partition_keys.tsv"),
 	}
 }
 
@@ -495,6 +508,7 @@ func writeDictionaryMeta(path string, dict *DictionaryInfo, schemaCount int) err
 		{"trigger_count", strconv.Itoa(len(dict.Triggers))},
 		{"synonym_count", strconv.Itoa(len(dict.Synonyms))},
 		{"tab_privilege_count", strconv.Itoa(len(dict.TabPrivileges))},
+		{"system_privilege_count", strconv.Itoa(len(dict.SystemPrivileges))},
 		{"partition_count", strconv.Itoa(len(dict.Partitions))},
 		{"partition_key_count", strconv.Itoa(len(dict.PartitionKeys))},
 	}
@@ -669,6 +683,10 @@ func writeDictionarySynonyms(path string, synonyms []DictionarySynonym) error {
 func writeDictionaryTabPrivileges(path string, privileges []DictionaryTabPrivilege) error {
 	rows := make([][]string, 0, len(privileges))
 	for _, priv := range privileges {
+		columnID := ""
+		if priv.ColumnID != nil {
+			columnID = strconv.Itoa(int(*priv.ColumnID))
+		}
 		rows = append(rows, []string{
 			priv.Grantee,
 			priv.Owner,
@@ -676,9 +694,10 @@ func writeDictionaryTabPrivileges(path string, privileges []DictionaryTabPrivile
 			priv.ObjectType,
 			priv.Privilege,
 			priv.Grantable,
+			columnID, priv.ColumnName, priv.Grantor,
 		})
 	}
-	return writeTSV(path, []string{"grantee", "owner", "object_name", "object_type", "privilege", "grantable"}, rows)
+	return writeTSV(path, []string{"grantee", "owner", "object_name", "object_type", "privilege", "grantable", "column_id", "column_name", "grantor"}, rows)
 }
 
 func writeDictionaryPartitions(path string, partitions []DictionaryPartition) error {
@@ -1057,6 +1076,21 @@ func readDictionaryTabPrivileges(path string) ([]DictionaryTabPrivilege, error) 
 			Privilege:  rec[4],
 			Grantable:  rec[5],
 		})
+		priv := &privileges[len(privileges)-1]
+		if len(rec) > 6 && rec[6] != "" {
+			id, err := strconv.ParseUint(rec[6], 10, 16)
+			if err != nil {
+				return nil, fmt.Errorf("invalid tab_privs column_id %q: %w", rec[6], err)
+			}
+			colID := uint16(id)
+			priv.ColumnID = &colID
+		}
+		if len(rec) > 7 {
+			priv.ColumnName = rec[7]
+		}
+		if len(rec) > 8 {
+			priv.Grantor = rec[8]
+		}
 	}
 	return privileges, nil
 }

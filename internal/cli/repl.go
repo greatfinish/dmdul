@@ -152,6 +152,13 @@ func (s *interactiveSession) execute(command string, stdout io.Writer) (bool, er
 		return false, s.executeUnload(fields[1:], stdout)
 	case "recover":
 		return false, s.executeRecover(fields[1:], stdout)
+	case "scan":
+		return false, s.executeStorageScan(fields[1:], stdout)
+	case "storage_scan":
+		if len(fields) != 1 {
+			return false, fmt.Errorf("usage: storage_scan")
+		}
+		return false, s.executeStorageScan([]string{"storage"}, stdout)
 	case "check":
 		return false, s.executeCheck(fields[1:], stdout)
 	case "describe", "desc":
@@ -200,6 +207,10 @@ func printInteractiveHelp(stdout io.Writer) {
 	fmt.Fprintln(stdout, "      Export all recovered objects; DMP mode writes one native FULL file.")
 	fmt.Fprintln(stdout, "  recover table <owner.table_name>;")
 	fmt.Fprintln(stdout, "      Scan residual pages by storage/assist id for TRUNCATE/DROP table recovery.")
+	fmt.Fprintln(stdout, "  scan storage;")
+	fmt.Fprintln(stdout, "      Inventory DBF storage IDs and raw samples without SYSTEM.DBF or a dictionary.")
+	fmt.Fprintln(stdout, "  recover storage <group>.<storage_id> using <columns.tsv> as <owner.table> [residual];")
+	fmt.Fprintln(stdout, "      Recover with explicit column definitions and charset; attribution is operator-supplied.")
 	fmt.Fprintln(stdout, "  check pages [<dbf-name>[,<dbf-name>...]] [control];")
 	fmt.Fprintln(stdout, "      Scan data files for corrupt pages (checksum + header + structure). Read-only.")
 	fmt.Fprintln(stdout, "      Files are located in data_dir; add 'control' to follow dm.ctl absolute paths.")
@@ -221,6 +232,9 @@ func printInteractiveHelp(stdout io.Writer) {
 func (s *interactiveSession) executeRecover(args []string, stdout io.Writer) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: recover table <owner.table_name>")
+	}
+	if strings.EqualFold(args[0], "storage") {
+		return s.executeStorageRecovery(args[1:], stdout)
 	}
 	if err := s.ensureDictionaryLoaded(); err != nil {
 		return err
@@ -254,7 +268,10 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 	if strings.TrimSpace(s.systemPath) == "" && !s.dataDirSet {
 		return fmt.Errorf("check requires set system or set data_dir first")
 	}
-	rest := args[1:]
+	var rest []string
+	if len(args) > 0 {
+		rest = args[1:]
+	}
 	followControl := false
 	if n := len(rest); n > 0 && strings.EqualFold(rest[n-1], "control") {
 		followControl = true
@@ -265,8 +282,8 @@ func (s *interactiveSession) executeCheck(args []string, stdout io.Writer) error
 		fileFilter = splitIdentifierList(rest[0])
 	}
 	pageSize := s.metadata.PageSize
-	if pageSize == 0 {
-		pageSize = dm.DefaultPageSize
+	if s.metadata.PageSizeSource == "DM default" {
+		pageSize = 0
 	}
 	if err := s.ensureOutputDir(); err != nil {
 		return err
@@ -372,6 +389,9 @@ func (s *interactiveSession) printPageCheckResult(result *dm.PageCheckResult, st
 	}
 	fmt.Fprintf(stdout, "files checked: %d\n", result.FilesChecked)
 	fmt.Fprintf(stdout, "pages checked: %d (empty: %d)\n", result.PagesChecked, result.PagesEmpty)
+	if result.ChecksumNotApplicable > 0 {
+		fmt.Fprintf(stdout, "checksum not applicable: %d (file/bootstrap metadata; identity checks retained)\n", result.ChecksumNotApplicable)
+	}
 	fmt.Fprintf(stdout, "bad pages total: %d\n", result.BadPagesTotal)
 	if result.BadPagesTotal > 0 {
 		fmt.Fprintf(stdout, "  header invalid: %d\n", result.Corruption[dm.PageCorruptionHeader])
@@ -1372,6 +1392,7 @@ func (s *interactiveSession) bootstrap(stdout io.Writer) error {
 	fmt.Fprintf(stdout, "triggers loaded: %d\n", dict.TriggerCount)
 	fmt.Fprintf(stdout, "synonyms loaded: %d\n", dict.SynonymCount)
 	fmt.Fprintf(stdout, "tab privileges loaded: %d\n", dict.TabPrivilegeCount)
+	fmt.Fprintf(stdout, "system privileges loaded: %d (sys_privs.tsv)\n", len(dict.SystemPrivileges))
 	fmt.Fprintf(stdout, "partitions loaded: %d\n", dict.PartitionCount)
 	fmt.Fprintf(stdout, "partition keys loaded: %d\n", dict.PartitionKeyCount)
 	if systemPrecheckWarning {
@@ -2601,6 +2622,7 @@ func (s *interactiveSession) unloadLogicalDMP(request logicalDMPUnloadRequest, s
 	fmt.Fprintf(stdout, "triggers exported: %d\n", metadataCounts.Triggers)
 	fmt.Fprintf(stdout, "synonyms exported: %d\n", metadataCounts.Synonyms)
 	fmt.Fprintf(stdout, "tab privileges exported: %d\n", metadataCounts.Privileges)
+	fmt.Fprintf(stdout, "system privileges exported: %d\n", metadataCounts.SystemPrivileges)
 	fmt.Fprintf(stdout, "rows exported: %d\n", data.RowsExported)
 	fmt.Fprintf(stdout, "rows failed: %d\n", data.RowsFailed)
 	s.printDataExportDiagnostics(stdout, data)

@@ -102,6 +102,9 @@ func InspectDatabaseMetadata(systemPath string, controlPath string, iniPath stri
 			meta.ExtentSize, meta.ExtentSizeSource = extentSize, source
 		}
 		meta.PageSize, meta.PageSizeSource = detectSystemPageSize(header, size)
+		if meta.PageSize == 0 {
+			meta.PageSize, meta.PageSizeSource, _ = probeFilePageSize(systemPath)
+		}
 		meta.PageCount, meta.PageCountSource = detectSystemPageCount(header, size, meta.PageSize)
 		if charset, ok := detectSystemCharsetFromFile(systemPath, meta.PageSize); ok {
 			meta.Charset = charset.DisplayName
@@ -169,7 +172,15 @@ func InspectDatabaseHeaderMetadataFromReader(systemPath string, reader io.Reader
 	if extentSize, source := detectSystemExtentSize(header); extentSize != 0 {
 		meta.ExtentSize, meta.ExtentSizeSource = extentSize, source
 	}
+	// Lightweight ASM discovery reads only the header and control flags.
+	// Opening the dictionary stream performs the full conflict-aware probe.
 	meta.PageSize, meta.PageSizeSource = detectSystemPageSize(header, size)
+	if meta.PageSize == 0 {
+		meta.PageSize, meta.PageSizeSource, err = detectPageSizeFromReader(reader, size, header)
+		if err != nil {
+			return meta, err
+		}
+	}
 	meta.PageCount, meta.PageCountSource = detectSystemPageCount(header, size, meta.PageSize)
 	if charset, ok := detectSystemCharsetFromReader(reader, meta.PageSize); ok {
 		meta.Charset = charset.DisplayName

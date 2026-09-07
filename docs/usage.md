@@ -336,6 +336,19 @@ DMDUL> load dictionary;
 DMDUL> recover table USERS1.T_TEST to users1_t_test_drop_recover;
 ```
 
+## 无完整系统字典的救援
+
+无完整系统字典时，v0.10.0 新增的救援入口不要求先 bootstrap（v0.9.0 尚无此命令）：
+
+```text
+DMDUL> scan storage;
+DMDUL> set charset utf-8;
+DMDUL> recover storage 4.33555471 using D:\recovery\columns.tsv as RECOVERED.T;
+```
+
+它不会自动恢复表名，也不会把人工归属写成真实字典。列定义格式、残留模式、输出保护及
+事务边界见 [无完整系统字典的救援](storage-rescue.md)。
+
 ## 导出对象字典
 
 `unload object` 只生成对象定义，不扫描和导出用户表数据：

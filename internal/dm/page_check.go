@@ -1,7 +1,6 @@
 package dm
 
 import (
-	"bytes"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -11,6 +10,8 @@ import (
 	"hash"
 	"hash/crc32"
 	"strings"
+
+	"github.com/tjfoc/gmsm/sm3"
 )
 
 const (
@@ -55,36 +56,17 @@ func verifyDMPageHash(page []byte, hashName string) (bool, error) {
 	if hashOffset <= dmPageChecksumOffset+dmPageChecksumSize {
 		return false, fmt.Errorf("page too short for PAGE_CHECK hash %s", canonicalName)
 	}
-	_, _ = h.Write(page[:hashOffset])
-	return bytes.Equal(page[hashOffset:hashOffset+h.Size()], h.Sum(nil)), nil
+	return verifyDMWholePageHash(page, h) || verifyDMSectorHashes(page, h, false), nil
 }
 
 func detectDMPageHash(page []byte) (string, int, bool) {
-	if len(page) < dmPageChecksumOffset+dmPageChecksumSize+dmPageCheckTailSize ||
-		binary.LittleEndian.Uint32(page[dmPageChecksumOffset:]) != 0 {
-		return "", 0, false
-	}
-	// SHA256 is the most common configured page hash and is checked first.
-	for _, name := range []string{"SHA256", "SHA1", "MD5", "SHA224", "SHA384", "SHA512"} {
-		h, canonical, err := newDMPageHash(name)
-		if err != nil {
-			continue
-		}
-		offset := len(page) - h.Size() - dmPageCheckTailSize
-		if offset <= dmPageChecksumOffset+dmPageChecksumSize {
-			continue
-		}
-		_, _ = h.Write(page[:offset])
-		if bytes.Equal(page[offset:offset+h.Size()], h.Sum(nil)) {
-			return canonical, h.Size(), true
-		}
-	}
-	return "", 0, false
+	layout, ok := detectDMPageHashLayout(page, false)
+	return layout.name, layout.digestSize, ok
 }
 
 func pageSlotTrailerLenForPage(page []byte) int {
-	if _, digestSize, ok := detectDMPageHash(page); ok {
-		return pageSlotTrailerLen + digestSize
+	if layout, ok := detectDMPageHashLayout(page, true); ok {
+		return layout.trailerLen(len(page))
 	}
 	if trailerLen, ok := inferDMPageProtectionTrailerLen(page); ok {
 		return trailerLen
@@ -265,6 +247,8 @@ func scoreDMPageSlotLayout(page []byte, start int, nSlot uint16, freeEnd uint16)
 func newDMPageHash(name string) (hash.Hash, string, error) {
 	canonical := strings.ToUpper(strings.ReplaceAll(strings.TrimSpace(name), "-", ""))
 	switch canonical {
+	case "SM3", "OPENSSL_SM3":
+		return sm3.New(), "SM3", nil
 	case "MD5":
 		return md5.New(), "MD5", nil
 	case "SHA1":

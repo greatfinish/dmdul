@@ -302,6 +302,7 @@ func writePageCheckSummary(out io.Writer, result *dm.PageCheckResult, context pa
 	fmt.Fprintf(out, "| 数据文件 | %d |\n", result.FilesChecked)
 	fmt.Fprintf(out, "| 扫描页 | %d |\n", result.PagesChecked)
 	fmt.Fprintf(out, "| 空页 | %d |\n", result.PagesEmpty)
+	fmt.Fprintf(out, "| 不适用行页校验的文件/引导元数据页 | %d |\n", result.ChecksumNotApplicable)
 	fmt.Fprintf(out, "| 非空页 | %d |\n", nonEmpty)
 	fmt.Fprintf(out, "| 坏页 | %d |\n", result.BadPagesTotal)
 	fmt.Fprintf(out, "| 坏页字节 | %s (%d bytes) |\n", pageCheckHumanBytes(badBytes), badBytes)

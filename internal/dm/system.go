@@ -91,7 +91,10 @@ func ScanSystem(path string, targetNames []string) (*SystemInfo, error) {
 		Size: stat.Size(),
 	}
 	info.ExtentSize, info.ExtentSizeSource = detectSystemExtentSize(header)
-	info.PageSize, info.PageSizeSource = detectSystemPageSize(header, stat.Size())
+	info.PageSize, info.PageSizeSource, err = detectPageSizeFromReader(file, stat.Size(), header)
+	if err != nil {
+		return nil, err
+	}
 	info.PageCount, info.PageCountSource = detectSystemPageCount(header, stat.Size(), info.PageSize)
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -166,21 +169,18 @@ func detectSystemExtentSize(header []byte) (uint32, string) {
 func detectSystemPageSize(header []byte, fileSize int64) (uint32, string) {
 	if len(header) >= systemPageSizeOffset+4 {
 		value := binary.LittleEndian.Uint32(header[systemPageSizeOffset:])
-		if validPageSize(value) && fileSize%int64(value) == 0 {
+		if validPageSize(value) && fileSize >= int64(value) {
 			return value, "u32 @ 0x84"
 		}
 	}
 
-	for _, candidate := range []uint32{8192, 4096, 16384, 32768} {
-		if fileSize%int64(candidate) == 0 {
-			return candidate, "inferred from file size"
-		}
-	}
-
-	return 8192, "fallback"
+	return 0, "unknown: page header unavailable; multi-page probe required"
 }
 
 func detectSystemPageCount(header []byte, fileSize int64, pageSize uint32) (uint32, string) {
+	if pageSize == 0 || fileSize < 0 {
+		return 0, "unknown"
+	}
 	if len(header) >= systemPageCountOffset+4 {
 		value := binary.LittleEndian.Uint32(header[systemPageCountOffset:])
 		if value > 0 && uint64(value)*uint64(pageSize) == uint64(fileSize) {
@@ -192,7 +192,7 @@ func detectSystemPageCount(header []byte, fileSize int64, pageSize uint32) (uint
 
 func validPageSize(value uint32) bool {
 	switch value {
-	case 4096, 8192, 16384, 32768, 65536:
+	case 4096, 8192, 16384, 32768:
 		return true
 	default:
 		return false
@@ -203,9 +203,8 @@ func restorePageProtectionBytes(page []byte, pageSize uint32) {
 	if len(page) < int(pageSize) {
 		return
 	}
-	// PAGE_CHECK=2 stores its digest immediately before the final eight-byte
-	// trailer. Those bytes are not sector-boundary backups.
-	if _, _, ok := detectDMPageHash(page); ok {
+	if layout, ok := detectDMPageHashLayout(page, true); ok {
+		restoreDMHashSectorBytes(page, layout)
 		return
 	}
 	if _, ok := inferDMPageHashSizeFromSlots(page); ok {
@@ -244,7 +243,8 @@ func restoreUserDataPageProtectionBytes(page []byte, pageSize uint32) {
 	if len(page) < int(pageSize) || int(pageSize)%systemSectorSize != 0 {
 		return
 	}
-	if _, _, ok := detectDMPageHash(page); ok {
+	if layout, ok := detectDMPageHashLayout(page, true); ok {
+		restoreDMHashSectorBytes(page, layout)
 		return
 	}
 	// LOB and Long Row pages have no ordinary slot directory from which to

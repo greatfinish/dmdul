@@ -1,0 +1,78 @@
+name: Go Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        go: ['1.22.x', 'stable']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache-dependency-path: go.sum
+      - run: go vet ./...
+      - run: go test -count=1 -timeout=10m ./...
+      - run: go build -trimpath ./cmd/dmdul
+
+  race:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+      - run: go test -race -count=1 -timeout=10m ./...
+        env:
+          CGO_ENABLED: '1'
+
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [FuzzPageGeometry, FuzzDataPageSlots, FuzzDataRowMetadata, FuzzDMPContainer, FuzzDMASMMetadata]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+      - run: go test ./internal/dm -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime=30s -parallel=2
+
+  vulnerabilities:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable
+      - run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+      - run: govulncheck -show verbose ./...

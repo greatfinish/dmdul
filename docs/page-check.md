@@ -1,4 +1,4 @@
-# DM8 PAGE_CHECK 页校验实验
+# DM8/DM9 PAGE_CHECK 页校验实验
 
 本文记录 2026-07-15 在独立 DM8 实例上对 `PAGE_CHECK=0/1/2/3` 的页级差分结果。实验使用相同
 的 8 KiB 页、表结构和三条数据，并在 `CHECKPOINT(100)` 和正常关闭后读取同一 `MAIN.DBF` page 16。
@@ -39,7 +39,7 @@ PAGE_CHECK_ID     = 2304
 CYT_NAME          = SHA256
 ```
 
-HASH 不写入 `0x18`。其位置和输入范围由摘要长度决定：
+该早期整页 HASH 样本不写入 `0x18`。其位置和输入范围由摘要长度决定：
 
 ```text
 hash_offset = page_size - digest_size - 8
@@ -65,11 +65,12 @@ slot_start = page_size - digest_size - 8 - n_slot * 2
 
 - CRC32/IEEE；
 - CRC32C/Castagnoli；
-- MD5、SHA1、SHA224、SHA256、SHA384、SHA512 页 HASH；
+- MD5、SHA1、SHA224、SHA256、SHA384、SHA512、SM3 页 HASH；
 - 校验值不匹配和单字节损坏测试。
 
-Go 标准库没有当前项目可直接使用的 SM3 实现，因此 `SM3/OPENSSL_SM3` 会明确返回“不支持”，不会
-误用其他算法。对于摘要损坏或 SM3 无法重算的页面，DMDUL 仍会根据 slot 目录结构在
+v0.10.0 通过 `github.com/tjfoc/gmsm/sm3` 支持 `SM3/OPENSSL_SM3`，包括标准已知答案测试、
+损坏输入和 DM9 实机样本。未知算法在扫描开始前报错，不会静默跳过校验。对于摘要损坏的页面，
+DMDUL 仍会根据 slot 目录结构在
 `16/20/28/32/48/64` 字节候选中保守推断摘要长度，以便救援模式继续定位 slot；该推断不等于校验
 通过。页校验失败不应自动丢弃救援数据，后续接入导出日志时应分别记录“校验失败”和“仍尝试恢复”。
 
@@ -77,6 +78,48 @@ Go 标准库没有当前项目可直接使用的 SM3 实现，因此 `SM3/OPENSS
 标准两阶段 bootstrap 都恢复 `1063` 个对象，随后对 `SYSDBA.PC_T` 生成一个计划页、直接读取一个页、
 无 fallback，三条数据全部导出且字段值与在线插入值一致。这既验证了 HASH 尾部处理，也验证了
 模式 0 不会被结构推断误判成 HASH 页。
+
+## DM9 分 sector HASH 与备份字节
+
+2026-09-06 在 DM9 `03151060506-20260417-322930-20218` 上补测 SM3 时发现，
+8/16/32 KiB HASH 页还有另一种布局：每 4 KiB sector 分别存摘要，中间 sector 被覆盖的
+原始字节集中备份在页尾。不能将整页 HASH 公式套用到所有 build。
+
+```text
+sector_count = page_size / 4096
+digest_size = 32                         # SM3 / SHA256
+backup_start = page_size - 8 - sector_count * digest_size
+slot_start = backup_start - n_slot * 2
+
+中间 sector: HASH(page[sector_start : sector_end - digest_size])
+最后 sector: HASH(page[sector_start : page_size - digest_size - 8])
+```
+
+8 KiB SM3 的具体证据：
+
+| 范围 | 含义 |
+| --- | --- |
+| `0xFE0..0xFFF` | 第一 sector 的 SM3 摘要，输入为 `page[0:0xFE0]` |
+| `0x1FB8..0x1FD7` | 第一 sector 被覆盖的 32 字节原值 |
+| `0x1FD8..0x1FF7` | 最后一 sector 摘要，输入为 `page[0x1000:0x1FD8]` |
+| 最后 8 字节 | 固定尾部，不纳入上述摘要 |
+
+`SYSTEM.DBF` page 304 的一条字典行头从 `0xFE6` 开始，只有恢复备份字节后才能正确读取。
+对应内置字典页已保存为 `internal/dm/testdata/dm9_sm3_system_page304.bin`，不含用户业务数据。
+
+实现先在**原始磁盘字节**上校验全部 sector，再在副本中恢复边界字节用于行解析；还原后的
+页面不能当作原始 checksum 证据。重复还原必须幂等。8/16/32 KiB 的合成损坏测试和实机
+bootstrap/检查/DMP 导回覆盖这条路径。4 KiB + SM3/SHA256 在此 build 初始化阶段即因
+剩余页空间不足被拒绝，不能记录为解析器支持。
+
+## 校验覆盖说明
+
+文件头及 SYSTEM 前部特定元数据页没有普通数据页的 PAGE_CHECK 布局。检查仍核对其身份，
+并单独累计 `checksum not applicable`，不把它们统计成“摘要已验证”。模式 0 同样不提供摘要证据。
+完整检查读取原始页；仅在进入结构解析时还原保护字节，避免“先还原再校验”造成误报。
+
+默认文件集合包含 SYSTEM、ROLL、TEMP 和用户 DBF，不沿用数据卸载仅选用户表空间的过滤条件。
+`check pages SYSTEM.DBF;` 必须实际读到该文件；文件过滤没有匹配项时返回错误，不输出零文件的成功报告。
 
 ## check pages 影响报告
 

@@ -51,14 +51,16 @@ type hugeAuxRow struct {
 }
 
 type hugeColumnSection struct {
-	colID   uint16
-	section uint32
-	fileID  int32
-	offset  int64
-	count   uint32
-	nlen    uint32
-	cprFlag string
-	encFlag string
+	colID      uint16
+	section    uint32
+	fileID     int32
+	offset     int64
+	count      uint32
+	nlen       uint32
+	nulls      uint32
+	nullsKnown bool
+	cprFlag    string
+	encFlag    string
 }
 
 type hugeDeleteRange struct {
@@ -85,6 +87,7 @@ type hugeColumnSectionReader struct {
 	variablePos   uint32
 	row           uint32
 	nextOffsetPos uint32
+	presentBits   []byte
 }
 
 func selectedHugeAuxTableIDs(tables map[uint32]dictionaryObject, ownerMatcher ownerMatcher, tableMatcher tableNameMatcher, excludeMatcher tableNameMatcher) map[uint32]bool {
@@ -304,7 +307,7 @@ func exportHugeTableData(ctx hugeDataExportContext, info dataTableInfo, output *
 	for _, sectionID := range sectionIDs {
 		columnSections := bySection[sectionID]
 		sectionCount := uint32(0)
-		var offsetTableBytes uint64
+		var sectionIndexBytes uint64
 		for _, column := range info.columns {
 			section, ok := columnSections[column.ColID]
 			if !ok {
@@ -320,10 +323,12 @@ func exportHugeTableData(ctx hugeDataExportContext, info dataTableInfo, output *
 				return stats, err
 			}
 			if variable {
-				offsetTableBytes += (uint64(section.count) + 1) * 4
-				if offsetTableBytes > maxHugeOffsetTableBytes {
-					return stats, fmt.Errorf("section %d offset tables exceed safe in-memory limit %d bytes", sectionID, maxHugeOffsetTableBytes)
-				}
+				sectionIndexBytes += (uint64(section.count) + 1) * 4
+			} else if isNullableColumn(column) {
+				sectionIndexBytes += (uint64(section.count) + 7) / 8
+			}
+			if sectionIndexBytes > maxHugeOffsetTableBytes {
+				return stats, fmt.Errorf("section %d offset tables and NULL bitmaps exceed safe in-memory limit %d bytes", sectionID, maxHugeOffsetTableBytes)
 			}
 		}
 	}
@@ -535,14 +540,19 @@ func loadHugeColumnSections(ctx hugeDataExportContext, tableID uint32) ([]hugeCo
 		if err != nil {
 			return err
 		}
+		nulls, err := hugeIntValue(row.values, columns, "N_NULL")
+		if err != nil {
+			return err
+		}
 		cpr, _ := hugeStringValue(row.values, columns, "CPR_FLAG")
 		enc, _ := hugeStringValue(row.values, columns, "ENC_FLAG")
-		if colID < 0 || colID > 65535 || sectionID < 0 || sectionID > int64(^uint32(0)) || fileID < -1 || fileID > int64(^uint32(0)>>1) || offset < 0 || count < 0 || nlen < 0 {
+		if colID < 0 || colID > 65535 || sectionID < 0 || sectionID > int64(^uint32(0)) || fileID < -1 || fileID > int64(^uint32(0)>>1) || offset < 0 || count < 0 || count > int64(^uint32(0)) || nlen < 0 || nlen > int64(^uint32(0)) || nulls < 0 || nulls > count {
 			return fmt.Errorf("invalid $AUX row colid=%d section=%d file=%d offset=%d count=%d n_len=%d", colID, sectionID, fileID, offset, count, nlen)
 		}
 		sections = append(sections, hugeColumnSection{
 			colID: uint16(colID), section: uint32(sectionID), fileID: int32(fileID),
 			offset: offset, count: uint32(count), nlen: uint32(nlen),
+			nulls: uint32(nulls), nullsKnown: true,
 			cprFlag: strings.ToUpper(strings.TrimSpace(cpr)), encFlag: strings.ToUpper(strings.TrimSpace(enc)),
 		})
 		return nil
@@ -930,6 +940,10 @@ func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSec
 		meta.nlen = headerLength
 		reader.meta.nlen = headerLength
 	}
+	if typeID := binary.LittleEndian.Uint16(header[24:]); typeID != 0 && typeID != hugeFixedTypeID(column) && !variable {
+		file.Close()
+		return nil, "", fmt.Errorf("HFS column %s type mismatch: header=%d dictionary=%s", column.Name, typeID, column.DataType)
+	}
 	if headerLength < uint32(hugeHFSSectionHeaderSize) || meta.offset+int64(headerLength) > fileInfo.Size() {
 		file.Close()
 		return nil, "", fmt.Errorf("HFS section exceeds file bounds in %s@%d: length=%d file_size=%d", path, meta.offset, headerLength, fileInfo.Size())
@@ -944,9 +958,17 @@ func openHugeColumnSection(tableDir string, column columnDef, meta hugeColumnSec
 	}
 	reader.fixedWidth = fixedWidth
 	dataLength := int64(meta.count) * int64(reader.fixedWidth)
-	if dataLength > int64(meta.nlen)-hugeHFSSectionHeaderSize {
+	bitmapLength := int64(0)
+	if isNullableColumn(column) {
+		bitmapLength = (int64(meta.count) + 7) / 8
+	}
+	if dataLength > int64(meta.nlen)-hugeHFSSectionHeaderSize-bitmapLength {
 		file.Close()
 		return nil, "", fmt.Errorf("fixed HUGE column %s exceeds section length: data=%d section=%d", column.Name, dataLength, meta.nlen)
+	}
+	if err := reader.initFixedNulls(bitmapLength); err != nil {
+		file.Close()
+		return nil, "", err
 	}
 	reader.fixedReader = bufio.NewReaderSize(io.NewSectionReader(file, meta.offset+hugeHFSSectionHeaderSize, dataLength), hugeColumnReadBufferSize)
 	return reader, path, nil
@@ -968,19 +990,25 @@ func hugeColumnSectionLayout(column columnDef, meta hugeColumnSection) (fixedWid
 		return 0, true, nil
 	case "INT", "INTEGER", "PLS_INTEGER":
 		fixedWidth = 4
+	case "SMALLINT":
+		fixedWidth = 4
+	case "BIGINT", "DOUBLE", "DOUBLE PRECISION":
+		fixedWidth = 8
+	case "DATE":
+		fixedWidth = 13
 	default:
 		return 0, false, fmt.Errorf("column %s type %s has no verified HUGE HFS decoder", column.Name, column.DataType)
-	}
-	if isNullableColumn(column) {
-		return 0, false, fmt.Errorf("nullable fixed column %s requires unverified HUGE NULL metadata", column.Name)
 	}
 	return fixedWidth, false, nil
 }
 
 func (reader *hugeColumnSectionReader) initVariable() error {
 	count := uint64(reader.meta.count) + 1
-	if count > uint64(^uint(0)>>1)/4 {
+	if count > uint64(^uint(0)>>1)/4 || count*4 > maxHugeOffsetTableBytes {
 		return fmt.Errorf("offset table is too large")
+	}
+	if uint64(reader.meta.nlen) < uint64(hugeHFSSectionHeaderSize)+count*4 {
+		return fmt.Errorf("offset table exceeds section length")
 	}
 	raw := make([]byte, int(count)*4)
 	if _, err := reader.file.ReadAt(raw, reader.meta.offset+hugeHFSSectionHeaderSize); err != nil {
@@ -1016,15 +1044,12 @@ func (reader *hugeColumnSectionReader) next() (any, error) {
 		if _, err := io.ReadFull(reader.fixedReader, raw); err != nil {
 			return nil, err
 		}
+		index := reader.row
 		reader.row++
-		value, end, err := parseFixedDataValuePresent(reader.column, raw, 0)
-		if err != nil {
-			return nil, err
+		if len(reader.presentBits) > 0 && reader.presentBits[index/8]&(0x80>>(index%8)) == 0 {
+			return nil, nil
 		}
-		if end != len(raw) {
-			return nil, fmt.Errorf("fixed decoder consumed %d/%d bytes", end, len(raw))
-		}
-		return value, nil
+		return decodeHugeFixedValue(reader.column, raw)
 	}
 
 	index := reader.row

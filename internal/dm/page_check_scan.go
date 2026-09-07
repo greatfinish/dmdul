@@ -175,43 +175,45 @@ type DictIssue struct {
 
 // PageCheckFileResult summarises one data file.
 type PageCheckFileResult struct {
-	Path            string
-	GroupID         uint32
-	FileID          int16
-	Tablespace      string
-	PagesChecked    int
-	PagesEmpty      int
-	BadPages        int
-	Corruption      map[PageCorruptionKind]int
-	SizeInvalid     bool
-	SizeDetail      string
-	Bad             []BadPage
-	ReportTruncated bool
+	Path                  string
+	GroupID               uint32
+	FileID                int16
+	Tablespace            string
+	PagesChecked          int
+	PagesEmpty            int
+	ChecksumNotApplicable int
+	BadPages              int
+	Corruption            map[PageCorruptionKind]int
+	SizeInvalid           bool
+	SizeDetail            string
+	Bad                   []BadPage
+	ReportTruncated       bool
 }
 
 // PageCheckResult is the whole-scan report.
 type PageCheckResult struct {
-	PageSize             uint32
-	PageCheckMode        uint32
-	PageHashName         string
-	DictionaryUsed       bool
-	DictionarySource     string
-	Files                []PageCheckFileResult
-	FilesChecked         int
-	PagesChecked         int
-	PagesEmpty           int
-	BadPagesTotal        int
-	Corruption           map[PageCorruptionKind]int
-	AttributedBadPages   int
-	UnattributedBadPages int
-	UnattributedReasons  map[string]int
-	AffectedObjects      []PageAffectedObject
-	AffectedTables       int
-	TotalTables          int
-	AffectedTableBytes   uint64
-	TotalTableBytes      uint64
-	ChainIssues          []ChainIssue
-	DictIssues           []DictIssue
+	PageSize              uint32
+	PageCheckMode         uint32
+	PageHashName          string
+	DictionaryUsed        bool
+	DictionarySource      string
+	Files                 []PageCheckFileResult
+	FilesChecked          int
+	PagesChecked          int
+	PagesEmpty            int
+	ChecksumNotApplicable int
+	BadPagesTotal         int
+	Corruption            map[PageCorruptionKind]int
+	AttributedBadPages    int
+	UnattributedBadPages  int
+	UnattributedReasons   map[string]int
+	AffectedObjects       []PageAffectedObject
+	AffectedTables        int
+	TotalTables           int
+	AffectedTableBytes    uint64
+	TotalTableBytes       uint64
+	ChainIssues           []ChainIssue
+	DictIssues            []DictIssue
 }
 
 const defaultMaxReportedBadPages = 4096
@@ -219,11 +221,11 @@ const defaultMaxReportedBadPages = 4096
 // CheckPages scans every resolved data file for corrupt pages. It never
 // modifies the input files.
 func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
-	pageSize := opts.PageSize
-	if pageSize == 0 {
-		pageSize = 8192
+	if err := validatePageCheckOptions(opts); err != nil {
+		return nil, err
 	}
-	if !validPageSize(pageSize) {
+	pageSize := opts.PageSize
+	if pageSize != 0 && !validPageSize(pageSize) {
 		return nil, fmt.Errorf("invalid page size %d", pageSize)
 	}
 	maxReported := opts.MaxReported
@@ -251,6 +253,24 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 		return nil, fmt.Errorf("no DBF files found in data_dir for check")
 	}
 	filter := newFileBaseFilter(opts.FileFilter)
+	if pageSize == 0 {
+		for _, file := range files {
+			if !filter.allows(file.path) {
+				continue
+			}
+			candidate, _, probeErr := probeFilePageSize(file.path)
+			if probeErr != nil {
+				return nil, fmt.Errorf("probe %s: %w", file.path, probeErr)
+			}
+			if pageSize != 0 && pageSize != candidate {
+				return nil, fmt.Errorf("mixed page sizes in check file set: %d and %d", pageSize, candidate)
+			}
+			pageSize = candidate
+		}
+		if pageSize == 0 {
+			return nil, fmt.Errorf("no matching files for page size probe")
+		}
+	}
 
 	result := &PageCheckResult{
 		PageSize:      pageSize,
@@ -287,10 +307,14 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 		result.FilesChecked++
 		result.PagesChecked += fileResult.PagesChecked
 		result.PagesEmpty += fileResult.PagesEmpty
+		result.ChecksumNotApplicable += fileResult.ChecksumNotApplicable
 		result.BadPagesTotal += fileResult.BadPages
 		for kind, count := range fileResult.Corruption {
 			result.Corruption[kind] += count
 		}
+	}
+	if result.FilesChecked == 0 {
+		return nil, fmt.Errorf("no DBF files match check filter %q", strings.Join(opts.FileFilter, ","))
 	}
 	impact.apply(result)
 
@@ -306,9 +330,20 @@ func CheckPages(opts PageCheckOptions) (*PageCheckResult, error) {
 // before attempting catalog recovery; callers can still stream every bad page
 // through PageCheckOptions.OnBadPage.
 func CheckPhysicalPageSource(source OfflineDataSource, opts PageCheckOptions) (*PageCheckResult, error) {
+	if err := validatePageCheckOptions(opts); err != nil {
+		return nil, err
+	}
 	pageSize := opts.PageSize
 	if pageSize == 0 {
-		pageSize = 8192
+		var err error
+		if source.Reader != nil {
+			pageSize, _, err = ProbePageSize(source.Reader, source.Reader.Size())
+		} else {
+			pageSize, _, err = probeFilePageSize(source.Path)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	if !validPageSize(pageSize) {
 		return nil, fmt.Errorf("invalid page size %d", pageSize)
@@ -344,15 +379,16 @@ func CheckPhysicalPageSource(source OfflineDataSource, opts PageCheckOptions) (*
 		return nil, err
 	}
 	result := &PageCheckResult{
-		PageSize:      pageSize,
-		PageCheckMode: opts.PageCheckMode,
-		PageHashName:  opts.PageHashName,
-		Files:         []PageCheckFileResult{fileResult},
-		FilesChecked:  1,
-		PagesChecked:  fileResult.PagesChecked,
-		PagesEmpty:    fileResult.PagesEmpty,
-		BadPagesTotal: fileResult.BadPages,
-		Corruption:    make(map[PageCorruptionKind]int),
+		PageSize:              pageSize,
+		PageCheckMode:         opts.PageCheckMode,
+		PageHashName:          opts.PageHashName,
+		Files:                 []PageCheckFileResult{fileResult},
+		FilesChecked:          1,
+		PagesChecked:          fileResult.PagesChecked,
+		PagesEmpty:            fileResult.PagesEmpty,
+		ChecksumNotApplicable: fileResult.ChecksumNotApplicable,
+		BadPagesTotal:         fileResult.BadPages,
+		Corruption:            make(map[PageCorruptionKind]int),
 	}
 	for kind, count := range fileResult.Corruption {
 		result.Corruption[kind] = count
@@ -363,15 +399,20 @@ func CheckPhysicalPageSource(source OfflineDataSource, opts PageCheckOptions) (*
 
 func checkOneDataFile(file dataFileRef, pageSize uint32, opts PageCheckOptions, maxReported int, attribution *pageAttribution, onBadPage func(BadPage) error) (PageCheckFileResult, error) {
 	res := newPageCheckFileResult(file)
-	size, sizeErr := fileSizeBytes(file.path)
+	reader, sizeErr := os.Open(file.path)
 	if sizeErr != nil {
 		res.SizeInvalid = true
 		res.SizeDetail = sizeErr.Error()
 		return res, nil
 	}
-	return checkOnePageSource(res, size, pageSize, opts, maxReported, attribution, onBadPage,
+	defer reader.Close()
+	info, err := reader.Stat()
+	if err != nil {
+		return res, err
+	}
+	return checkOnePageSource(res, info.Size(), pageSize, opts, maxReported, attribution, onBadPage,
 		func(visit func(page []byte, pageNo uint32) error) (int, error) {
-			return forEachDataFilePage(file.path, pageSize, visit)
+			return forEachRawReaderPage(reader, info.Size(), pageSize, visit)
 		})
 }
 
@@ -384,7 +425,7 @@ func checkOneDataReader(file dataFileRef, reader SizedReaderAt, pageSize uint32,
 	}
 	return checkOnePageSource(res, reader.Size(), pageSize, opts, maxReported, attribution, onBadPage,
 		func(visit func(page []byte, pageNo uint32) error) (int, error) {
-			return forEachSizedReaderPage(reader, pageSize, visit)
+			return forEachRawReaderPage(reader, reader.Size(), pageSize, visit)
 		})
 }
 
@@ -416,6 +457,9 @@ func checkOnePageSource(res PageCheckFileResult, size int64, pageSize uint32, op
 		if isEmptyDMPage(page) {
 			res.PagesEmpty++
 			return nil
+		}
+		if opts.PageCheckMode != 0 && isFileMetadataCheckPage(page, key, pageNo) {
+			res.ChecksumNotApplicable++
 		}
 		kind, detail, ok := classifyPageCorruption(page, key, pageNo, pageSize, opts)
 		if ok {
@@ -516,7 +560,7 @@ func classifyPageCorruption(page []byte, key dataFileKey, pageNo uint32, pageSiz
 		return "", "", true
 	}
 
-	if opts.PageCheckMode != 0 {
+	if opts.PageCheckMode != 0 && !isFileMetadataCheckPage(page, key, pageNo) {
 		ok, err := verifyDMPageCheck(page, opts.PageCheckMode, opts.PageHashName)
 		if err == nil && !ok {
 			return PageCorruptionChecksum, fmt.Sprintf("PAGE_CHECK=%d checksum mismatch", opts.PageCheckMode), false
@@ -541,6 +585,33 @@ func classifyPageCorruption(page []byte, key dataFileKey, pageNo uint32, pageSiz
 		}
 	}
 	return "", "", true
+}
+
+func validatePageCheckOptions(opts PageCheckOptions) error {
+	if opts.PageCheckMode > 3 {
+		return fmt.Errorf("unsupported PAGE_CHECK mode %d", opts.PageCheckMode)
+	}
+	if opts.PageCheckMode == 2 {
+		_, _, err := newDMPageHash(opts.PageHashName)
+		return err
+	}
+	return nil
+}
+
+// File/bootstrap metadata has its own layout, not the row-page PAGE_CHECK
+// payload. Retain identity/structure checks and report checksum coverage.
+func isFileMetadataCheckPage(page []byte, key dataFileKey, pageNo uint32) bool {
+	kind := dataPageKind(page)
+	if pageNo == 0 && kind == 0x13 {
+		return true
+	}
+	if key.groupID == 0 && pageNo < 8 {
+		switch kind {
+		case 0x13, 0x63, 0x64, 0x65, 0xFFFF00FF:
+			return true
+		}
+	}
+	return false
 }
 
 // isFillDMPage reports whether the page is an unformatted fill page (every byte
@@ -575,7 +646,7 @@ const dmMinSlotOffset = 0x40
 // rec_total_len test. Returns (detail, ok). Boundary-key slots (0x52/0x5A) are
 // legitimate markers and are not decoded as rows.
 func checkRowPageStructure(page []byte, pageSize uint32) (string, bool) {
-	if len(page) < int(pageSize) {
+	if !validPageSize(pageSize) || uint64(len(page)) < uint64(pageSize) {
 		return "page shorter than page size", false
 	}
 	nSlot := binary.LittleEndian.Uint16(page[dataPageSlotCountOff:])
@@ -656,7 +727,9 @@ func checkRowPageStructure(page []byte, pageSize uint32) (string, bool) {
 	// row offsets. They are legitimate when the remaining decodable live rows
 	// exactly satisfy nRec. A damaged live slot, by contrast, leaves the page
 	// short of nRec and is still reported with its physical detail.
-	if liveRows != int(nRec) {
+	// In checkpointed DELETE captures nRec still includes the deleted slot.
+	// Counts can only be used as physical bounds, not a visibility decision.
+	if liveRows != int(nRec) && !(firstInvalid == "" && liveRows <= int(nRec) && int(nRec) <= len(spans)) {
 		if firstInvalid != "" {
 			return fmt.Sprintf("%s; decoded live rows=%d expected=%d", firstInvalid, liveRows, nRec), false
 		}
@@ -710,7 +783,26 @@ func (r *PageCheckResult) SortedBadPages() []BadPage {
 func resolveDataFilesInDir(dataDir string, controlDULPath string) []dataFileRef {
 	tablespaceNames := defaultTablespaceNames()
 	mergeControlDULTablespaceNames(tablespaceNames, controlDULPath)
-	refs := scanDataFilesByPageHeader(dataDir, tablespaceNames, make(map[dataFileKey]bool))
+	var refs []dataFileRef
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || entry.Type()&os.ModeSymlink != 0 || !strings.EqualFold(filepath.Ext(entry.Name()), ".DBF") {
+			continue
+		}
+		path := filepath.Join(dataDir, entry.Name())
+		key, ok := dataFileKeyFromPageHeader(path)
+		if !ok {
+			continue
+		}
+		name := tablespaceNames[key.groupID]
+		if name == "" {
+			name = inferTablespaceNameFromDataFile(path, key.groupID)
+		}
+		refs = append(refs, dataFileRef{key: key, path: path, tablespaceName: name})
+	}
 	sortDataFileRefs(refs)
 	return refs
 }

@@ -23,7 +23,15 @@
 - 无需启动 DMASMSVR 或执行 `asmcmd cp`，直接读取非镜像与镜像 DMASM 元数据、
   AU 映射、副本数组和条带数据。
 
-**v0.9.0 主题：DM9 Compatibility**
+**v0.10.0 主题：Recovery Hardening**
+
+本版新增：页大小冲突检测、无字典 `scan storage` / 人工列定义恢复、DM9 4 KiB /
+大小写不敏感矩阵、SM3 与分 sector HASH、真实系统/列级权限、HUGE 可空定长列，以及
+Windows/Linux 质量门禁、parser fuzz 和源码拆分。事务 Undo 目前只增加证据追踪，
+**尚未实现 committed-only**。见 [本轮实测记录](docs/compatibility-hardening-20260906.md)、
+[无字典救援](docs/storage-rescue.md) 和 [后续路线图](docs/roadmap.md)。
+使用这些新增能力请升级到 v0.10.0；旧版 v0.9.0 二进制不包含本次改动。
+本版的实测范围、导回比对与质量检查见 [发布验证记录](docs/release-v0.10.0-validation.md)。
 
 ![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go)
 ![License](https://img.shields.io/github/license/greatfinish/dmdul)
@@ -122,7 +130,7 @@ SYSTEM.DBF / user tablespace DBFs          raw devices / *-flat.vmdk
 行记录从低地址方向增长，槽目录通常从高地址方向增长；`dmdul` 读取页头和槽目录后，
 会结合 `PAGE_CHECK` 模式计算槽目录起点，按记录偏移定位行数据，并解析行长、删除标志、
 NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页时，还会从页尾保留区恢复
-4 KiB 扇区边界前被替换的原始字节；普通用户数据页保持磁盘原始字节。
+4 KiB 扇区边界前被替换的原始字节；普通用户数据页仅在结构证明保护尾区存在时还原。
 
 深入阅读：[DM8 普通行页格式研究](docs/row-page-format.md) ·
 [DM8 PAGE_CHECK 页校验实验](docs/page-check.md)
@@ -160,8 +168,8 @@ NULL 元数据、列值及可选事务控制尾。读取 `SYSTEM.DBF` 字典页�
 - **HUGE 列存储恢复**：识别 HUGE 主表及 `$AUX/$RAUX/$DAUX/$UAUX`，恢复
   `CREATE HUGE TABLE`、`SECTION`、`FILESIZE`、`WITH DELTA` 和目标混合表空间；数据卸载
   以 `$AUX` 定位 HFS 列 section，再合并 RAUX 尾部行、DAUX 删除和 UAUX 更新。已验证
-  非空 `INT` 与可空/非空 `VARCHAR/CHAR`、SQL 回灌和 DMP/dimp 回灌；压缩、加密及未验证
-  定长类型会明确拒绝。详见 [DM8 HUGE 列存储表离线恢复](docs/huge-tables.md)。
+  `VARCHAR/CHAR`、SQL 回灌和 DMP/dimp 回灌；v0.10.0 补充可空/非空 `INT/BIGINT/SMALLINT/DOUBLE`
+  和已验证的 AD `DATE`。压缩、加密及未知布局会明确拒绝，详见 [HUGE 支持范围](docs/huge-tables.md)。
 - **精确数据页定位**：为选中表及分区按 `storage root -> internal page refs -> leaf chain`
   生成 page plan；计划完整时仅用 `ReadAt` 读取计划页，失败时依次回退到同 group
   `storage_id` 扫描和段范围读取，只有 `recover table` 才执行全文件残留页扫描。
@@ -253,7 +261,7 @@ DM8 仍是覆盖 build 数量最多的主验证矩阵。DM9 已在
 | 用户、角色与授权 | ✅ 支持 | `CREATE USER`、角色授权、对象授权 |
 | 表、字段、索引、约束、注释 | ✅ 支持 | 普通表、堆表、树表、临时表及相关 DDL |
 | 分区表 | ✅ 支持 | RANGE / LIST / HASH DDL 与数据导出；分区键和 HIGH_VALUE 可持久化 |
-| HUGE 列存储表 | 🧪 初步支持 | HFS section + RAUX/DAUX/UAUX 合并；已验证 INT、VARCHAR、CHAR 与 SQL/DMP 回灌，压缩/加密 section 明确拒绝 |
+| HUGE 列存储表 | 🧪 初步支持 | HFS section + RAUX/DAUX/UAUX 合并；可空定长列和更多类型，压缩/加密 section 明确拒绝 |
 | 视图、序列、过程、函数、包 | ✅ 支持 | `CREATE OR REPLACE` 源码恢复 |
 | 触发器与同义词 | ✅ 支持 | 表触发器、模式同义词及授权 |
 | 数据导出 | ✅ 支持 | SQL/dmfldr 表级、用户级、整库级；DMP 另支持模式级 |
@@ -1278,12 +1286,13 @@ dul.log
 - 跨字符集 DMP 不应只修改文件头，应按目标字符集重新生成。
 - 行外 LOB 和 Long Row 已有流式恢复路径，但损坏页、断链和多版本残留仍在持续验证。
 - HUGE 表恢复必须同时提供同一快照的普通 DBF 和完整 HFS 根目录。当前只验证单一 HFS path
-  下未压缩、未加密 section 的 `INT/VARCHAR/CHAR`；多 HFS path、压缩/加密 section、
-  可空定长列、更多标量类型、HFS section 校验和及 DMASM 裸盘 HFS 文件仍待补充。
+  下未压缩、未加密 section。v0.10.0 已补 NULL 位图、`INT/BIGINT/SMALLINT/DOUBLE` 和已验证
+  AD DATE；多 HFS path、压缩/加密、其余标量、HFS 校验和及 DMASM HFS 文件仍待补充。
 - 迁移行、链式行以及更多版本的复杂物理行格式仍需扩大样例覆盖。
 - DM9 VECTOR 索引目前只恢复 HNSW/IVFFLAT 组织类型，高级构建参数需要导入后复核。
 - 当前 DM9 build 的 `dminit` 仅支持 4/8/16/32 KiB 页；64 是可选簇页数，不是 64 KiB
-  数据页。dmdul 已验证 8/16/32 KiB，4 KiB 尚待补充。
+  数据页。v0.10.0 已补 4 KiB + CASE_SENSITIVE=0；此 build 的 4 KiB + SM3/SHA256 初始化
+  被拒绝，第二个不同 build 尚未取得。各矩阵的对象规模见实测文档，不能外推全面兼容。
 - 普通 `unload` 已是 slot-only，但 slot-only 不等于 committed-only；未提交 INSERT / DELETE
   的最终可见性仍需离线事务状态和完整 Undo PRE IMAGE 链才能准确判断。
 - 不保证恢复结果与故障前数据库在事务一致性层面完全一致。
@@ -1316,7 +1325,8 @@ dul.log
 | v0.7.3 | bootstrap 自动 SYSTEM 物理预检、全量坏页报告、对象影响归属与残留字典隔离 |
 | v0.8.0 | HUGE/HFS 列存储字典与 DDL 恢复、section 流式读取及 RAUX/DAUX/UAUX 合并卸载 |
 | v0.9.0 | DM9 Standard Bootstrap、VECTOR、32 KiB 页、三种字符集与 SQL/dmfldr/DMP 回灌验证 |
-| v0.9.x | DMASM REDO、超 65535-AU 单文件、4 KiB 页、更多 DM8/DM9 build 与条带组合验证 |
+| v0.10.0 | 无字典救援、页大小加固、SM3、系统/列权限、HUGE NULL 定长列、DM9 4 KiB/大小写不敏感矩阵、自动化测试 |
+| 后续版本 | 完整 Undo、DMASM REDO、超 65535-AU 单文件、HUGE 压缩及更多 DM8/DM9 build 验证 |
 | v1.0.0 | 固化文件格式兼容矩阵、恢复报告和稳定发布流程 |
 
 ------

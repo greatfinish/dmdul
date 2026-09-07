@@ -1,0 +1,464 @@
+package dm
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+type dataOutputFile struct {
+	path      string
+	file      *os.File
+	writer    *bufio.Writer
+	dmpWriter *DMPDataWriter
+}
+
+type dataDMPOutputConfig struct {
+	charset       dmpCharsetHeader
+	extentSize    uint32
+	pageSize      uint32
+	caseSensitive *bool
+}
+
+type dataOutputRouter struct {
+	format           string
+	split            bool
+	mainPath         string
+	mainTable        dataTableInfo
+	main             *dataOutputFile
+	pathsByTable     map[uint32]string
+	filesByTable     map[uint32]*dataOutputFile
+	initializedByID  map[uint32]bool
+	lastUsedByID     map[uint32]uint64
+	useClock         uint64
+	tableOutputsByID map[uint32]DataTableOutput
+	dmpConfig        dataDMPOutputConfig
+	dmpWritersByID   map[uint32]*DMPDataWriter
+
+	oversizedSQLRows     int
+	oversizedSQLTableIDs map[uint32]string
+}
+
+// disqlMaxStatementBytes is the conservative stdin line limit shared by SQL
+// exports. DM9 build 2026-05-25 accepts 2499 bytes and reports DISQL-10053 for
+// longer lines; some DM8 builds accept statements up to 160 KiB. The portable
+// threshold must use the lower value because dmdul cannot infer the eventual
+// import client's build. dmfldr and DMP/dimp do not have this line limit.
+const disqlMaxStatementBytes = 2499
+
+func newDataOutputRouter(opts DataExportOptions, outputFormat string, selectedTables map[uint32]dataTableInfo, dmpConfigs ...dataDMPOutputConfig) (*dataOutputRouter, error) {
+	router := &dataOutputRouter{
+		format:           outputFormat,
+		split:            opts.TableOutputPath != nil,
+		mainPath:         opts.OutputPath,
+		pathsByTable:     make(map[uint32]string),
+		filesByTable:     make(map[uint32]*dataOutputFile),
+		initializedByID:  make(map[uint32]bool),
+		lastUsedByID:     make(map[uint32]uint64),
+		tableOutputsByID: make(map[uint32]DataTableOutput),
+		dmpWritersByID:   make(map[uint32]*DMPDataWriter),
+	}
+	if len(dmpConfigs) > 0 {
+		router.dmpConfig = dmpConfigs[0]
+	}
+
+	if !router.split {
+		if table, ok := singleSelectedDataTable(selectedTables); ok {
+			router.mainTable = table
+		}
+		if outputFormat == "fldr" || outputFormat == "dmp" {
+			_ = os.Remove(opts.OutputPath)
+			return router, nil
+		}
+		file, err := openDataOutputFile(opts.OutputPath, outputFormat, router.mainTable)
+		if err != nil {
+			return nil, err
+		}
+		router.main = file
+		return router, nil
+	}
+
+	pathOwners := make(map[string]uint32)
+	for _, tableID := range sortedDataTableIDs(selectedTables) {
+		table := selectedTables[tableID]
+		path := strings.TrimSpace(opts.TableOutputPath(table.table.Owner, table.table.Name, tableID))
+		if path == "" {
+			return nil, fmt.Errorf("empty data output path for %s.%s", table.table.Owner, table.table.Name)
+		}
+		pathKey := strings.ToUpper(filepath.Clean(path))
+		if priorID, exists := pathOwners[pathKey]; exists && priorID != tableID {
+			return nil, fmt.Errorf("duplicate data output path %s", path)
+		}
+		pathOwners[pathKey] = tableID
+		router.pathsByTable[tableID] = path
+		if outputFormat == "fldr" || outputFormat == "dmp" {
+			_ = os.Remove(path)
+			continue
+		}
+		file, err := openDataOutputFile(path, outputFormat, table)
+		if err != nil {
+			_ = router.close()
+			return nil, err
+		}
+		if err := closeDataOutputFile(file); err != nil {
+			_ = router.close()
+			return nil, err
+		}
+		router.initializedByID[tableID] = true
+		router.tableOutputsByID[tableID] = DataTableOutput{
+			TableID: tableID, Owner: table.table.Owner, Name: table.table.Name, OutputPath: path,
+		}
+	}
+	return router, nil
+}
+
+func sortedDataTableIDs(tables map[uint32]dataTableInfo) []uint32 {
+	ids := make([]uint32, 0, len(tables))
+	for id := range tables {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		left, right := tables[ids[i]].table, tables[ids[j]].table
+		if left.Owner != right.Owner {
+			return left.Owner < right.Owner
+		}
+		if left.Name != right.Name {
+			return left.Name < right.Name
+		}
+		return ids[i] < ids[j]
+	})
+	return ids
+}
+
+func openDataOutputFile(path string, outputFormat string, table dataTableInfo) (*dataOutputFile, error) {
+	if dir := filepath.Dir(path); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("create data output directory: %w", err)
+		}
+	}
+	out, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("create data output: %w", err)
+	}
+	target := &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}
+	if outputFormat == "fldr" {
+		// The data file carries rows only; the companion control file tells
+		// dmfldr how to read them, so it is written alongside on creation.
+		if err := WriteFldrControlFile(fldrControlFilePath(path), path,
+			table.table.Owner, table.table.Name, table.columns); err != nil {
+			_ = out.Close()
+			return nil, err
+		}
+		return target, nil
+	}
+	fmt.Fprintln(target.writer, "-- Generated by dmdul export-data. Review before running.")
+	fmt.Fprintln(target.writer, "-- Current decoder targets ordinary in-row heap/cluster/IOT rows.")
+	fmt.Fprintln(target.writer)
+	return target, nil
+}
+
+func openExistingDataOutputFile(path string, outputFormat string) (*dataOutputFile, error) {
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open data output for append: %w", err)
+	}
+	return &dataOutputFile{path: path, file: out, writer: bufio.NewWriter(out)}, nil
+}
+
+func (r *dataOutputRouter) targetForTable(table dataTableInfo) (*dataOutputFile, error) {
+	if r.format == "dmp" {
+		return r.dmpTargetForTable(table)
+	}
+	if !r.split {
+		if r.main != nil {
+			return r.main, nil
+		}
+		file, err := openDataOutputFile(r.mainPath, r.format, r.mainTable)
+		if err != nil {
+			return nil, err
+		}
+		r.main = file
+		return file, nil
+	}
+	if file := r.filesByTable[table.table.ID]; file != nil {
+		r.touch(table.table.ID)
+		return file, nil
+	}
+	if len(r.filesByTable) >= maxOpenSplitDataFiles {
+		if err := r.evictLeastRecentlyUsed(); err != nil {
+			return nil, err
+		}
+	}
+	path := r.pathsByTable[table.table.ID]
+	var file *dataOutputFile
+	var err error
+	if r.initializedByID[table.table.ID] {
+		file, err = openExistingDataOutputFile(path, r.format)
+	} else {
+		file, err = openDataOutputFile(path, r.format, table)
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.filesByTable[table.table.ID] = file
+	r.initializedByID[table.table.ID] = true
+	r.touch(table.table.ID)
+	r.tableOutputsByID[table.table.ID] = DataTableOutput{
+		TableID: table.table.ID, Owner: table.table.Owner, Name: table.table.Name, OutputPath: path,
+	}
+	return file, nil
+}
+
+func (r *dataOutputRouter) dmpTargetForTable(table dataTableInfo) (*dataOutputFile, error) {
+	if !r.split {
+		if r.main != nil {
+			return r.main, nil
+		}
+		file, err := r.newDMPOutputFile(r.mainPath, table)
+		if err != nil {
+			return nil, err
+		}
+		r.main = file
+		return file, nil
+	}
+	if file := r.filesByTable[table.table.ID]; file != nil {
+		r.touch(table.table.ID)
+		return file, nil
+	}
+	if len(r.filesByTable) >= maxOpenSplitDataFiles {
+		if err := r.evictLeastRecentlyUsed(); err != nil {
+			return nil, err
+		}
+	}
+	path := r.pathsByTable[table.table.ID]
+	writer := r.dmpWritersByID[table.table.ID]
+	if writer == nil {
+		file, err := r.newDMPOutputFile(path, table)
+		if err != nil {
+			return nil, err
+		}
+		writer = file.dmpWriter
+	} else if err := writer.resume(); err != nil {
+		return nil, err
+	}
+	file := &dataOutputFile{path: path, dmpWriter: writer}
+	r.filesByTable[table.table.ID] = file
+	r.touch(table.table.ID)
+	return file, nil
+}
+
+func (r *dataOutputRouter) newDMPOutputFile(path string, table dataTableInfo) (*dataOutputFile, error) {
+	writer, err := NewDMPDataWriter(DMPDataOptions{
+		OutputPath:    path,
+		Charset:       r.dmpConfig.charset.Name,
+		ExtentSize:    r.dmpConfig.extentSize,
+		PageSize:      r.dmpConfig.pageSize,
+		CaseSensitive: r.dmpConfig.caseSensitive,
+		Schema:        table.table.Owner,
+		Table:         table.table.Name,
+		TableID:       table.table.ID,
+		ColumnCount:   uint16(len(table.columns)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if r.split {
+		r.dmpWritersByID[table.table.ID] = writer
+	}
+	r.initializedByID[table.table.ID] = true
+	r.tableOutputsByID[table.table.ID] = DataTableOutput{
+		TableID: table.table.ID, Owner: table.table.Owner, Name: table.table.Name, OutputPath: path,
+	}
+	return &dataOutputFile{path: path, dmpWriter: writer}, nil
+}
+
+func (r *dataOutputRouter) touch(tableID uint32) {
+	r.useClock++
+	r.lastUsedByID[tableID] = r.useClock
+}
+
+func (r *dataOutputRouter) evictLeastRecentlyUsed() error {
+	var oldestID uint32
+	var oldestUse uint64
+	found := false
+	for tableID := range r.filesByTable {
+		used := r.lastUsedByID[tableID]
+		if !found || used < oldestUse {
+			oldestID = tableID
+			oldestUse = used
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	if r.format == "dmp" {
+		if err := r.filesByTable[oldestID].dmpWriter.suspend(); err != nil {
+			return err
+		}
+	} else {
+		if err := closeDataOutputFile(r.filesByTable[oldestID]); err != nil {
+			return err
+		}
+	}
+	delete(r.filesByTable, oldestID)
+	delete(r.lastUsedByID, oldestID)
+	return nil
+}
+
+func (r *dataOutputRouter) writeRow(table dataTableInfo, line string, record []string, dmpRows ...[]DMPField) error {
+	target, err := r.targetForTable(table)
+	if err != nil {
+		return err
+	}
+	if r.format == "fldr" {
+		dialect := table.fldrDialect.resolved()
+		if _, err := target.writer.WriteString(strings.Join(record, dialect.fieldSep) + dialect.rowTerm); err != nil {
+			return fmt.Errorf("write fldr row: %w", err)
+		}
+		return nil
+	}
+	if r.format == "dmp" {
+		if len(dmpRows) != 1 {
+			return fmt.Errorf("missing dmp fields for %s.%s", table.table.Owner, table.table.Name)
+		}
+		if err := target.dmpWriter.WriteRow(dmpRows[0]); err != nil {
+			_ = target.dmpWriter.Abort()
+			return fmt.Errorf("write dmp row: %w", err)
+		}
+		return nil
+	}
+	if len(line) > disqlMaxStatementBytes {
+		r.oversizedSQLRows++
+		if r.oversizedSQLTableIDs == nil {
+			r.oversizedSQLTableIDs = make(map[uint32]string)
+		}
+		r.oversizedSQLTableIDs[table.table.ID] = table.table.Owner + "." + table.table.Name
+	}
+	if _, err := fmt.Fprintln(target.writer, line); err != nil {
+		return fmt.Errorf("write sql row: %w", err)
+	}
+	return nil
+}
+
+// writeDMPSegments appends a worker-pre-encoded row to the table's DMP
+// writer, mirroring writeRow's dmp error handling.
+func (r *dataOutputRouter) writeDMPSegments(table dataTableInfo, segments []dmpRowSegment) error {
+	target, err := r.targetForTable(table)
+	if err != nil {
+		return err
+	}
+	if err := target.dmpWriter.WriteEncodedRow(segments); err != nil {
+		_ = target.dmpWriter.Abort()
+		return fmt.Errorf("write dmp row: %w", err)
+	}
+	return nil
+}
+
+func (r *dataOutputRouter) writeFailure(table dataTableInfo, message string) error {
+	if r.format == "fldr" || r.format == "dmp" {
+		return nil
+	}
+	target, err := r.targetForTable(table)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(target.writer, message); err != nil {
+		return fmt.Errorf("write failed-row comment: %w", err)
+	}
+	return nil
+}
+
+func sortedOversizedSQLTables(byID map[uint32]string) []string {
+	if len(byID) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(byID))
+	for _, name := range byID {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (r *dataOutputRouter) tableOutputs() []DataTableOutput {
+	outputs := make([]DataTableOutput, 0, len(r.tableOutputsByID))
+	for _, output := range r.tableOutputsByID {
+		outputs = append(outputs, output)
+	}
+	sort.Slice(outputs, func(i, j int) bool {
+		if outputs[i].Owner != outputs[j].Owner {
+			return outputs[i].Owner < outputs[j].Owner
+		}
+		if outputs[i].Name != outputs[j].Name {
+			return outputs[i].Name < outputs[j].Name
+		}
+		return outputs[i].TableID < outputs[j].TableID
+	})
+	return outputs
+}
+
+func (r *dataOutputRouter) close() error {
+	var firstErr error
+	if r.format == "dmp" {
+		if r.split {
+			for _, tableID := range sortedDMPWriterIDs(r.dmpWritersByID) {
+				if _, err := r.dmpWritersByID[tableID].Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		} else if r.main != nil && r.main.dmpWriter != nil {
+			if _, err := r.main.dmpWriter.Close(); err != nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+	if r.split {
+		for _, tableID := range sortedDataOutputFileIDs(r.filesByTable) {
+			if err := closeDataOutputFile(r.filesByTable[tableID]); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	} else {
+		if err := closeDataOutputFile(r.main); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func sortedDMPWriterIDs(writers map[uint32]*DMPDataWriter) []uint32 {
+	ids := make([]uint32, 0, len(writers))
+	for id := range writers {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}
+
+func closeDataOutputFile(target *dataOutputFile) error {
+	if target == nil {
+		return nil
+	}
+	var firstErr error
+	if err := target.writer.Flush(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if err := target.file.Close(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	return firstErr
+}
+
+func sortedDataOutputFileIDs(files map[uint32]*dataOutputFile) []uint32 {
+	ids := make([]uint32, 0, len(files))
+	for id := range files {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
+}

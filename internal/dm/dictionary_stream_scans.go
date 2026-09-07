@@ -3,7 +3,6 @@ package dm
 import (
 	"encoding/binary"
 	"sort"
-	"strings"
 )
 
 func (s *systemPageStream) dictionaryObjects(decoder textDecoder) (map[uint32]dictionaryObject, error) {
@@ -97,7 +96,7 @@ func (s *systemPageStream) partitionKeysByTable(decoder textDecoder, tables map[
 	return result, err
 }
 
-func (s *systemPageStream) tabPrivileges(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, matcher ownerMatcher, tableMatcher tableNameMatcher) ([]DictionaryTabPrivilege, error) {
+func (s *systemPageStream) tabPrivileges(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, columns map[uint32][]columnDef, matcher ownerMatcher, tableMatcher tableNameMatcher) ([]DictionaryTabPrivilege, error) {
 	granteeNames := make(map[uint32]string)
 	for id, user := range users {
 		granteeNames[id] = user.Name
@@ -127,7 +126,8 @@ func (s *systemPageStream) tabPrivileges(objects map[uint32]dictionaryObject, us
 			Grantee: grantee, Owner: target.Owner, ObjectName: target.Name,
 			ObjectType: dictionaryPrivilegeObjectType(target), Privilege: grant.Privilege, Grantable: grant.Grantable,
 		}
-		key := strings.Join([]string{item.Grantee, item.Owner, item.ObjectName, item.Privilege, item.Grantable}, "\x00")
+		enrichColumnPrivilege(&item, grant, columns, granteeNames)
+		key := dictionaryPrivilegeKey(item)
 		if !seen[key] {
 			seen[key] = true
 			privileges = append(privileges, item)

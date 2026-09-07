@@ -22,6 +22,7 @@ const (
 	dmpRecordRowMarker       uint16 = 14
 	dmpRecordConstraint      uint16 = 15
 	dmpRecordSchemaGrant     uint16 = 16
+	dmpRecordColumnGrant     uint16 = 17
 	dmpRecordPackage         uint16 = 18
 	dmpRecordObjectGrant     uint16 = 20
 	dmpRecordPackageBody     uint16 = 23
@@ -42,20 +43,21 @@ type DMPMetadataCatalog struct {
 }
 
 type DMPMetadataCounts struct {
-	Users          int
-	Roles          int
-	RoleGrants     int
-	Tables         int
-	Indexes        int
-	Constraints    int
-	Views          int
-	Sequences      int
-	Routines       int
-	Triggers       int
-	Synonyms       int
-	Privileges     int
-	TableComments  int
-	ColumnComments int
+	Users            int
+	Roles            int
+	RoleGrants       int
+	Tables           int
+	Indexes          int
+	Constraints      int
+	Views            int
+	Sequences        int
+	Routines         int
+	Triggers         int
+	Synonyms         int
+	Privileges       int
+	SystemPrivileges int
+	TableComments    int
+	ColumnComments   int
 }
 
 func (catalog *DMPMetadataCatalog) Counts() DMPMetadataCounts {
@@ -69,6 +71,8 @@ func (catalog *DMPMetadataCatalog) Counts() DMPMetadataCounts {
 			counts.Users++
 		case dmpRecordRole:
 			counts.Roles++
+		case dmpRecordSystemPrivilege:
+			counts.SystemPrivileges++
 		case dmpRecordRoleGrant, dmpRecordBuiltinGrant:
 			counts.RoleGrants++
 		case dmpRecordTable:
@@ -87,7 +91,7 @@ func (catalog *DMPMetadataCatalog) Counts() DMPMetadataCounts {
 			counts.Triggers++
 		case dmpRecordSynonym:
 			counts.Synonyms++
-		case dmpRecordSchemaGrant, dmpRecordObjectGrant:
+		case dmpRecordSchemaGrant, dmpRecordObjectGrant, dmpRecordColumnGrant:
 			counts.Privileges++
 		case dmpRecordTableComment:
 			counts.TableComments++
@@ -144,6 +148,7 @@ type DMPObjectGrant struct {
 	ObjectName string
 	ObjectType string
 	Grantable  string
+	ColumnName string
 }
 
 func buildDMPMetadataCatalog(
@@ -171,6 +176,7 @@ func buildDMPMetadataCatalog(
 	triggers []DictionaryTrigger,
 	synonyms []DictionarySynonym,
 	privileges []DictionaryTabPrivilege,
+	systemPrivileges []DictionarySystemPrivilege,
 	matcher ownerMatcher,
 	tableMatcher tableNameMatcher,
 	tablespaces map[uint32]string,
@@ -217,13 +223,12 @@ func buildDMPMetadataCatalog(
 			}
 			catalog.GlobalRecords = append(catalog.GlobalRecords,
 				DMPMetadataRecord{RecordType: dmpRecordUser, Name: user.Name, SQL: renderCreateUser(user, tablespaces)},
-				DMPMetadataRecord{RecordType: dmpRecordSystemPrivilege, Name: "CREATE SESSION", SQL: fmt.Sprintf("GRANT CREATE SESSION TO %s;", quoteIdent(user.Name))},
 				DMPMetadataRecord{RecordType: dmpRecordBuiltinGrant, Name: "PUBLIC", SQL: fmt.Sprintf("GRANT %s TO %s;", quoteIdent("PUBLIC"), quoteIdent(user.Name))},
 			)
 			grantSQL[strings.ToUpper(strings.TrimSpace(fmt.Sprintf("GRANT %s TO %s;", quoteIdent("PUBLIC"), quoteIdent(user.Name))))] = true
 			ensureSchema(user.Name)
 		}
-		roleIDs := exportedRoleIDs(roles, roleGrants, users, userIDs)
+		roleIDs := exportedRoleIDsForScope(roles, roleGrants, users, userIDs, matcher)
 		for _, roleID := range roleIDs {
 			role := roles[roleID]
 			if isBuiltInRoleName(role.Name) {
@@ -233,6 +238,13 @@ func buildDMPMetadataCatalog(
 				RecordType: dmpRecordRole, Name: role.Name,
 				SQL: fmt.Sprintf("CREATE ROLE %s;", quoteIdent(role.Name)),
 			})
+		}
+		for _, priv := range systemPrivileges {
+			if sql, ok := systemPrivilegeSQL(priv); ok {
+				catalog.GlobalRecords = append(catalog.GlobalRecords, DMPMetadataRecord{RecordType: dmpRecordSystemPrivilege, Name: priv.Privilege, SQL: sql})
+			} else {
+				return nil, fmt.Errorf("unresolved system privilege id=%d grantee=%s; inspect sys_privs.tsv before DMP export", priv.PrivilegeID, priv.Grantee)
+			}
 		}
 		for _, line := range renderRoleGrantLines(roleGrants, users, roles, userIDs, roleIDs) {
 			key := strings.ToUpper(strings.TrimSpace(line))
@@ -598,14 +610,22 @@ func dmpObjectGrantRecord(privilege DictionaryTabPrivilege) DMPMetadataRecord {
 			objectType = "PKG"
 		}
 	}
+	if privilege.ColumnID != nil || privilege.ColumnName != "" {
+		recordType = dmpRecordColumnGrant
+	}
+	grantor := privilege.Grantor
+	if grantor == "" {
+		grantor = "SYSDBA"
+	}
 	return DMPMetadataRecord{
 		RecordType: recordType,
 		Name:       privilege.ObjectName,
 		Grant: &DMPObjectGrant{
-			Grantor: "SYSDBA", Grantee: privilege.Grantee,
+			Grantor: grantor, Grantee: privilege.Grantee,
 			Privilege: strings.ToUpper(strings.TrimSpace(privilege.Privilege)),
 			Owner:     privilege.Owner, ObjectName: privilege.ObjectName,
 			ObjectType: objectType, Grantable: grantable,
+			ColumnName: privilege.ColumnName,
 		},
 	}
 }

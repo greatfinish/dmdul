@@ -241,10 +241,18 @@ SYSTEM 预检发现坏页时不会立即终止恢复。bootstrap 会继续尝试
 | SYSTEM 预检和字典恢复均正常，且只恢复少量明确表 | 检查 `dmdul_dict` 和 `describe` 结果后可以直接卸载 |
 | SYSTEM 预检出现告警，但字典仍可恢复 | 先审核字典，再执行全库或指定 DBF 的 `check pages` |
 | 字典进入 fallback、文件缺失或身份冲突 | 不直接开始整库卸载；先补齐文件并执行 `check pages` 收集物理证据 |
-| bootstrap 无法建立字典 | 可执行无归属的纯物理 `check pages`；修复或人工重建字典后再做对象归属 |
+| bootstrap 无法建立字典 | 先作无归属的 `check pages`；v0.10.0 新增 `scan storage` 和人工列定义恢复，也可修复字典后再做对象归属 |
 
 这里的顺序是硬性约束：从当前快照恢复对象归属时，必须先 `bootstrap` 或显式
 `load dictionary`，再执行第二阶段对象归属检查。纯物理扫描本身不受此限制。
+
+无字典救援不执行自动对象归属，也不加载目录中的旧字典。`scan storage;` 先产生
+`storage_scan.tsv` 和样例，之后按人工提供的列定义执行 `recover storage ...`。
+这一入口从 v0.10.0 起提供，详见 [无字典救援步骤及限制](storage-rescue.md)。
+
+如果页头损坏，bootstrap 会用多页身份、页类型及校验/结构证据探测页大小；候选不唯一或与
+页头冲突时停止。不要按文件能被 8 KiB 整除就手工假定页大小。4/8/16/32 KiB 是当前接受范围，
+64 KiB 不作为已支持页大小。
 
 字典落盘在 `dmdul_dict/`，是纯文本 TSV。后续会话可以直接：
 

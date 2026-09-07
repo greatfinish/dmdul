@@ -52,9 +52,9 @@ func openSystemPageStreamReader(path string, reader io.ReaderAt, fileSize int64)
 	if err != nil {
 		return nil, fmt.Errorf("read SYSTEM.DBF header: %w", err)
 	}
-	pageSize, _ := detectSystemPageSize(header, fileSize)
-	if pageSize == 0 {
-		return nil, fmt.Errorf("cannot detect SYSTEM.DBF page size")
+	pageSize, _, err := detectPageSizeFromReader(reader, fileSize, header)
+	if err != nil {
+		return nil, fmt.Errorf("cannot detect SYSTEM.DBF page size: %w", err)
 	}
 	pageCount, _ := detectSystemPageCount(header, fileSize, pageSize)
 	extentSize, extentSrc := detectSystemExtentSize(header)
@@ -200,6 +200,14 @@ func forEachSizedReaderPage(reader SizedReaderAt, pageSize uint32, visit func(pa
 }
 
 func forEachReaderPage(reader io.ReaderAt, size int64, pageSize uint32, visit func(page []byte, pageNo uint32) error) (int, error) {
+	return forEachRawReaderPage(reader, size, pageSize, func(page []byte, pageNo uint32) error {
+		restoreUserDataPageProtectionBytes(page, pageSize)
+		return visit(page, pageNo)
+	})
+}
+
+// Checksum consumers must see the bytes on disk, before protection recovery.
+func forEachRawReaderPage(reader io.ReaderAt, size int64, pageSize uint32, visit func(page []byte, pageNo uint32) error) (int, error) {
 	if pageSize == 0 {
 		return 0, fmt.Errorf("invalid page size 0")
 	}
@@ -213,7 +221,6 @@ func forEachReaderPage(reader io.ReaderAt, size int64, pageSize uint32, visit fu
 		if n != len(page) {
 			return pageNo, fmt.Errorf("short read %d/%d", n, len(page))
 		}
-		restoreUserDataPageProtectionBytes(page, pageSize)
 		if err := visit(page, uint32(pageNo)); err != nil {
 			return pageNo + 1, err
 		}

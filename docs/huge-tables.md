@@ -136,9 +136,8 @@ huge= SECTION(1024), FILESIZE(16 MiB), WITH DELTA, aux_ids= 1064/1065/1066/1067
 
 - `CPR_FLAG != N` 的压缩 section 会在写出第一行前明确报错；
 - `ENC_FLAG != N` 的加密 section 会明确报错；
-- 尚未验证 NULL bitmap 的可空定长列会明确报错；
-- 已验证的 HFS 定长类型目前只有非空 `INT`，其他数值、日期、时间和 INTERVAL
-  需要按物理样本逐类补充；
+- v0.10.0 支持尾部 NULL 位图及可空/非空 `INT/BIGINT/SMALLINT/DOUBLE` 和已验证的 AD DATE；
+  其他数值、时间、时区、INTERVAL 等仍需按 HFS 物理布局逐类补充；
 - 当前要求目标表在 `data_dir` 下只有一个匹配的 HFS 表目录；同一表跨多个 HFS path
   的 `FILE_ID -> path` 规则尚未解码；
 - 原始 DMASM 成员盘中的 HFS 文件尚未接入 ASM 逻辑 Reader，当前 DMASM 路径只覆盖 DBF；
@@ -147,7 +146,35 @@ huge= SECTION(1024), FILESIZE(16 MiB), WITH DELTA, aux_ids= 1064/1065/1066/1067
 
 为避免异常元数据或超大增量把进程内存耗尽，单次 `$UAUX` 加载最多保留 200 万个唯一
 更新且解码值合计不超过 256 MiB；单个 section 的全部变长列 offset 表合计不超过
-256 MiB。超过限制时工具会停止并报告原因，不会自动扩大内存上限。
+256 MiB（v0.10.0 将定长 NULL 位图也计入这个合计上限）。超过限制时工具会停止并报告原因，
+不会自动扩大内存上限。
 
 遇到上述边界时，不要手工删除错误继续导入。应保存 `SYSTEM.DBF`、普通 DBF、完整 HFS
 目录、`dmdul_dict` 和 `dul.log`，用最小样本补充格式证据后再扩展解析器。
+
+## 6. 定长列补充实验（v0.10.0）
+
+2026-09-06，x86-64 DM8 `03134284336-20250117-257733-20132` 的独立实例新增
+`HFS_PROBE`：2500 行、7 列、1024 行 section，两个完整 section 加 452 行 RAUX。
+SQL 导回普通对照表后双向 MINUS 均为 0；总行数 2500，NI 非 NULL 1667，NB 非 NULL 1875。
+
+| 类型 | HFS 未压缩定长宽度 | 当前解码 |
+| --- | ---: | --- |
+| INT | 4 | little-endian int32 |
+| BIGINT | 8 | little-endian int64 |
+| SMALLINT | 4 | int32 存储，再检查 int16 值域；不能套普通行的 2 字节布局 |
+| DOUBLE | 8 | little-endian IEEE-754 |
+| DATE | 13 | 年 u16、月、日；其余只接受已核实的零时间部分与 1000 标记，不外推 BC/时区 |
+
+可空定长列的 presence bitmap 位于 section 尾部：
+
+```text
+bitmap_bytes = ceil(COUNT / 8)
+bitmap_start = section_offset + N_LEN - bitmap_bytes
+present(row_index) = bitmap[row_index / 8] & (0x80 >> (row_index % 8))
+```
+
+位为 1 表示有值，0 表示 NULL。NULL 仍占定长数据位置，不能按零值判断 NULL。
+例如每第三行 NULL 的前 8 行位图是 `0xDB`；每第四行 NULL 是 `0xEE`。
+读取前检查 payload/位图不重叠，并将零位数量与 `$AUX.N_NULL` 对比；不一致则停止该表。
+单个位图最多 32 MiB。`$AUX.CHKSUM` 已取得样本，但算法尚未确认，此次不宣称支持 HFS 校验和。

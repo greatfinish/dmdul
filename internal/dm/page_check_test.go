@@ -61,7 +61,7 @@ func TestVerifyDMPageCheckRejectsUnknownModeAndHash(t *testing.T) {
 	if _, err := verifyDMPageCheck(page, 9, ""); err == nil {
 		t.Fatal("unknown PAGE_CHECK mode was accepted")
 	}
-	if _, err := verifyDMPageCheck(page, 2, "SM3"); err == nil {
+	if _, err := verifyDMPageCheck(page, 2, "UNSUPPORTED_HASH"); err == nil {
 		t.Fatal("unsupported hash was accepted")
 	}
 }

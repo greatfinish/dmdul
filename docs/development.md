@@ -39,6 +39,37 @@ go build -o .\bin\dmdul.exe .\cmd\dmdul
 
 ## 本地验证建议
 
+### 自动化质量检查
+
+`.github/workflows/quality.yml` 在 main 推送、PR 和手动触发时执行：
+
+- Windows/Linux：Go 1.22 与 stable 的 `go vet`、不使用缓存的测试、构建。
+- Linux：启用 CGO 的 race 检测。
+- Linux：五个 fuzz 入口各运行 30 秒、2 个 worker；普通单测也会运行种子样本。
+
+工作流只读取仓库，不发布二进制、不连接私有测试库、不需要数据库密码。它产生检查结果，
+不会自动设置 GitHub 分支保护；需要强制合并门禁时由维护者在仓库设置中要求这些检查通过。
+
+本地示例：
+
+```powershell
+go vet ./...
+go test -count=1 ./...
+go test ./internal/dm -run '^$' -fuzz '^FuzzDataRowMetadata$' -fuzztime=30s -parallel=2
+```
+
+Linux race：
+
+```bash
+CGO_ENABLED=1 go test -race -count=1 ./...
+```
+
+其余 fuzz 入口为 `FuzzPageGeometry`、`FuzzDataPageSlots`、`FuzzDMPContainer`、
+`FuzzDMASMMetadata`。每次只能选择一个入口；短时 fuzz 是冒烟检查，不代表所有格式已验证。
+失败后保留 Go 自动生成的最小复现输入，先排除真实业务数据和凭据再纳入版本管理。
+
+### 实例样例
+
 建议准备一个不提交到 Git 的样例目录，例如：
 
 ```text
@@ -100,8 +131,16 @@ Remove-Item Env:CGO_ENABLED, Env:GOOS, Env:GOARCH
 ```
 
 ```powershell
-Compress-Archive -Path .\bin\dmdul.exe -DestinationPath .\bin\dmdul_windows_amd64_$ver.zip -Force; tar -czf bin\dmdul_linux_amd64_$ver.tar.gz -C bin dmdul; Get-FileHash .\bin\dmdul_windows_amd64_$ver.zip, .\bin\dmdul_linux_amd64_$ver.tar.gz -Algorithm SHA256 | Format-List Hash, Path
+New-Item -ItemType Directory -Force .\bin\licenses | Out-Null
+Copy-Item -LiteralPath LICENSE, THIRD_PARTY_NOTICES.md -Destination .\bin -Force
+Copy-Item -LiteralPath .\docs\licenses\go-LICENSE.txt, .\docs\licenses\x-text-LICENSE.txt, .\docs\licenses\gmsm-LICENSE.txt -Destination .\bin\licenses -Force
+Compress-Archive -Path .\bin\dmdul.exe, .\bin\LICENSE, .\bin\THIRD_PARTY_NOTICES.md, .\bin\licenses -DestinationPath .\bin\dmdul_windows_amd64_$ver.zip -Force
+tar -czf bin\dmdul_linux_amd64_$ver.tar.gz -C bin dmdul LICENSE THIRD_PARTY_NOTICES.md licenses
+if ($LASTEXITCODE -ne 0) { throw "Linux packaging failed" }
+Get-FileHash .\bin\dmdul_windows_amd64_$ver.zip, .\bin\dmdul_linux_amd64_$ver.tar.gz -Algorithm SHA256 | Format-List Hash, Path
 ```
+
+发布包必须保留 `LICENSE`、`THIRD_PARTY_NOTICES.md` 和 `licenses/`，不要只打包可执行文件。
 
 Windows PowerShell 5.1 没有 `&&` 和三元运算符，串联用 `;`，条件串联用 `if ($?) { }`。
 
@@ -116,6 +155,38 @@ go build -o bin\dmdul.exe .\cmd\dmdul
 ```
 
 ## 测试覆盖方向
+
+### 代码职责
+
+`data.go` 保留导出编排；页计划算法在 `data_page_plan.go`，候选匹配与回退在
+`data_plan_candidates.go`，行布局在 `data_row.go`，标量在 `data_scalar.go`，
+LOB 在 `data_lob.go`，输出路由在 `data_writer.go`。VECTOR/JSON/SQL 值渲染有各自文件。
+`ddl.go` 保留导出编排与模型；字典行解析在 `ddl_catalog.go`，对象、分区和约束等渲染
+分别在 `ddl_objects.go`、`ddl_partition.go`、`ddl_schema_render.go`。
+
+本轮按 Go AST 移动声明并逐个验证等价，没有重新实现旧算法。后续变更应先补最小回归样本，
+再改所属模块；不要因为文件拆分完成就跳过跨模块测试。
+
+### 依赖与漏洞检查
+
+v0.10.0 将 `golang.org/x/text` 从 v0.5.0 升到 v0.22.0，保留 Go 1.22 最低编译要求。
+v0.23.0 的模块已要求 Go 1.23，不能只改版本号而不跑最低工具链。
+SM3 使用 `github.com/tjfoc/gmsm v1.4.1` 的 `sm3` 包，没有引入 CGO。
+
+```powershell
+go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+govulncheck -show verbose ./...
+```
+
+2026-09-06 本地 Go 1.26.1 的结果为 0 个可达调用链漏洞。报告仍列出旧标准库公告以及
+x/text 模块的 [GO-2026-5970](https://pkg.go.dev/vuln/GO-2026-5970)，后者涉及未被当前
+解码路径调用的 `unicode/norm`。因此不能写成“所有依赖无漏洞”。增加包或调用符号后必须
+重跑；CI 使用 stable Go 执行 govulncheck，发布也应使用受维护的最新补丁工具链。
+Go 1.22 只保留源码兼容性测试，不作为生产二进制推荐构建工具链。
+
+v0.10.0 发布复测使用 Go 1.27.1，Windows 完整测试/vet 通过；此次 govulncheck 结果为
+0 个可达符号漏洞、0 个已导入包漏洞，以及上述 1 个未被调用的 x/text 模块级公告。
+构建时使用 `-trimpath -s -w` 并注入 tag、提交号和 UTC 构建时间。
 
 当前重点测试方向：
 

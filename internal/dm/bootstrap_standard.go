@@ -331,7 +331,7 @@ func (c *standardBootstrapCatalog) dictionaryTexts() (map[uint32]map[uint32]stri
 	return result, used, err
 }
 
-func (c *standardBootstrapCatalog) tabPrivileges(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, matcher ownerMatcher, tableMatcher tableNameMatcher) ([]DictionaryTabPrivilege, bool, error) {
+func (c *standardBootstrapCatalog) tabPrivileges(objects map[uint32]dictionaryObject, users map[uint32]dictionaryObject, roles map[uint32]dictionaryObject, columns map[uint32][]columnDef, matcher ownerMatcher, tableMatcher tableNameMatcher) ([]DictionaryTabPrivilege, bool, error) {
 	granteeNames := make(map[uint32]string)
 	for id, user := range users {
 		granteeNames[id] = user.Name
@@ -363,7 +363,8 @@ func (c *standardBootstrapCatalog) tabPrivileges(objects map[uint32]dictionaryOb
 			Grantee: grantee, Owner: target.Owner, ObjectName: target.Name,
 			ObjectType: dictionaryPrivilegeObjectType(target), Privilege: grant.Privilege, Grantable: grant.Grantable,
 		}
-		key := strings.Join([]string{item.Grantee, item.Owner, item.ObjectName, item.Privilege, item.Grantable}, "\x00")
+		enrichColumnPrivilege(&item, grant, columns, granteeNames)
+		key := dictionaryPrivilegeKey(item)
 		if !seen[key] {
 			seen[key] = true
 			privileges = append(privileges, item)

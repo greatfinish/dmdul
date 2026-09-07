@@ -74,6 +74,7 @@ type DictionaryInfo struct {
 	Triggers            []DictionaryTrigger
 	Synonyms            []DictionarySynonym
 	TabPrivileges       []DictionaryTabPrivilege
+	SystemPrivileges    []DictionarySystemPrivilege
 	Partitions          []DictionaryPartition
 	PartitionKeys       []DictionaryPartitionKey
 }
@@ -234,6 +235,9 @@ type DictionaryTabPrivilege struct {
 	ObjectType string
 	Privilege  string
 	Grantable  string
+	Grantor    string
+	ColumnID   *uint16
+	ColumnName string
 }
 
 func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
@@ -448,17 +452,26 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 	var tabPrivilegeList []DictionaryTabPrivilege
 	usedStandardGrants := false
 	if !bootstrapFallback {
-		tabPrivilegeList, usedStandardGrants, err = catalog.tabPrivileges(objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+		tabPrivilegeList, usedStandardGrants, err = catalog.tabPrivileges(objects, userObjects, roleObjects, allColumnDefsByTable, ownerMatcher, newTableNameMatcher("all"))
 	}
 	if err != nil {
 		return nil, err
 	}
 	if !usedStandardGrants {
-		tabPrivilegeList, err = stream.tabPrivileges(objects, userObjects, roleObjects, ownerMatcher, newTableNameMatcher("all"))
+		tabPrivilegeList, err = stream.tabPrivileges(objects, userObjects, roleObjects, allColumnDefsByTable, ownerMatcher, newTableNameMatcher("all"))
 		if err != nil {
 			return nil, err
 		}
 		catalog.recordTableRows("SYSGRANTS", len(tabPrivilegeList), false, defaultIfEmpty(fallbackReason, "standard table plan is unavailable"))
+	}
+
+	privilegeCatalog := catalog
+	if bootstrapFallback {
+		privilegeCatalog = nil
+	}
+	systemPrivilegeList, err := scanSystemPrivileges(stream, privilegeCatalog, userObjects, roleObjects)
+	if err != nil {
+		return nil, err
 	}
 
 	tablespaces := loadTablespaceNames(opts.ControlPath, opts.ControlDULPath)
@@ -637,6 +650,7 @@ func LoadDictionary(opts DictionaryOptions) (*DictionaryInfo, error) {
 		Triggers:            triggerList,
 		Synonyms:            synonymList,
 		TabPrivileges:       tabPrivilegeList,
+		SystemPrivileges:    systemPrivilegeList,
 		Partitions:          partitionList,
 		PartitionKeys:       partitionKeyList,
 	}, nil

@@ -12,6 +12,65 @@ v主版本.次版本.修订版本
 
 ------
 
+## v0.10.0 - Recovery Hardening
+
+发布日期：2026-09-07。
+
+### Added
+
+- 新增 `scan storage;`（别名 `storage_scan;`），直接按 DBF 页身份和 storage_id 生成
+  `storage_scan.tsv`、`storage_samples.tsv`、`storage_errors.tsv`，不要求系统字典。
+- 新增 `recover storage <group>.<storage_id> using <columns.tsv> as <owner.table> [residual];`，
+  支持明确字符集、人工列定义、SQL/fldr/DMP、逐行来源证据，禁止覆盖已有恢复输出。
+- 无字典样例报告增加 19 字节事务尾和部分 `0x1D` Undo 公共头的有界指针追踪；检查页复用、
+  事务号、对象/行号、自偏移与 used-end。此功能不执行前镜像应用，不提供 committed-only。
+- GitHub Actions 增加 Windows/Linux、Go 1.22/stable 的测试/vet/构建，Linux race，以及
+  页大小、slot、行 metadata、DMP、DMASM 五组短时 fuzz；依赖 Actions 固定到 commit。
+- PAGE_CHECK=2 增加 SM3/OPENSSL_SM3，兼容 DM9 按 4 KiB sector 分别计算 HASH 的布局。
+- `tab_privs.tsv` 保留 column_id、column_name、grantor；SQL/DMP 恢复列级 UPDATE/REFERENCES，
+  不把无法解析的列权限提升为整表权限。
+- `sys_privs.tsv` 持久化真实 SYSGRANTS 系统权限与 ADMIN OPTION。SQL 保留未知编号告警，
+  DMP 遇未知编号明确停止；不再给所有用户凭空补 CREATE SESSION，FULL 包含自建孤立角色。
+- HUGE 增加 MSB-first 尾部 NULL 位图、N_NULL 交叉校验、BIGINT、HFS 四字节 SMALLINT、
+  DOUBLE 和已验证的 13 字节 AD DATE 布局。
+
+### Fixed
+
+- 页头损坏时不再按文件大小默认猜测 8 KiB；使用多页 group/file/page 身份、页类型、
+  checksum 或行结构证据探测 4/8/16/32 KiB，候选不唯一或与页头冲突时报错，拒绝 64 KiB。
+- `check pages` 缺少已识别页大小时从实际文件探测；拒绝混合几何文件集，不套用默认页大小。
+- 补行解析短输入及越界检查，并修复无参数 `check` 的切片越界。
+- DELETE 后 `n_rec` 仍含删除 slot 时按物理跨度边界校验，避免把事务阶段差异直接判成坏块。
+- Linux 恢复主机解析 Windows 来源文件名时，表空间名推断不再包含目录前缀。
+- `check pages` 先校验原始字节再还原页保护，修复 HASH 页误报；默认检查集合包含
+  SYSTEM/ROLL/TEMP，过滤零匹配报错，文件元数据页单列 checksum-not-applicable 计数。
+- DM9 sector HASH 页在还原覆盖字节后使用正确 slot 尾部，修复 SYSTEM 字典行跨摘要区损坏。
+
+### Changed
+
+- 按职责拆分 data/ddl 大文件，移动声明时执行 AST 等价检查，保留既有函数和调用接口。
+- `golang.org/x/text` 升至 v0.22.0，维持 Go 1.22；SM3 使用 tjfoc/gmsm v1.4.1。
+  增加 govulncheck CI；本地扫描无可达漏洞，但不宣称旧工具链或整个依赖模块无漏洞。
+- 重写路线图，区分已落地和仍需要物理样本验证的能力。
+- 发布包附带项目与第三方许可证；正式构建使用 Go 1.27.1、`-trimpath -s -w`。
+
+### Tests / Limits
+
+- 新增损坏页头、矛盾页大小、无字典恢复、残留行、手工列定义、禁止覆盖和 Undo 链的回归测试。
+- DM8 独立实例完成未提交/提交 INSERT、两次 UPDATE、DELETE、Rollback 的八阶段差分；
+  实机无字典扫描 42240 页，人工定义恢复 4 行、0 失败。该输出仍为物理状态，不是提交视图。
+- 提交前后 MAIN 页可完全相同，ROLL 页可能清零或复用；事务管理页和完整 PRE IMAGE 尚未
+  解码。DM9 已恢复连接，但新增 Undo 布局仍未完成独立验证，不应将该功能当作提交视图恢复。
+- DM9 同一 build 补 4 KiB、CASE_SENSITIVE=0、PAGE_CHECK 0/1/3，以及 8/16/32 KiB SM3；
+  三字符集的小表 DMP 导回双向 MINUS 为 0。4 KiB HASH 初始化拒绝作为负样本保留。
+- DM8 新增 2500 行 HUGE 定长/NULL 样本，SQL 导回双向 MINUS 为 0；列级权限和系统权限
+  OWNER DMP 经官方 dimp 验证。具体样本规模、未完成项见本轮实测文档。
+- 2026-09-07 发布复测：DM9 八组参数矩阵、DM8 HUGE/权限/无字典救援通过；SM3 复制件
+  单字节破坏准确定位唯一坏页。Windows Go 1.22/1.27、Linux race、五组 30 秒 fuzz 通过，
+  详见 [发布验证记录](docs/release-v0.10.0-validation.md)。
+
+------
+
 ## v0.9.0 - DM9 Compatibility
 
 ### Added
