@@ -174,7 +174,7 @@ func TestRawASMMirrorReadsDescriptorFromSecondRegion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Truncate(int64(diskAUs) * auSize); err != nil {
+	if err := truncateSparseTestFile(file, int64(diskAUs)*auSize); err != nil {
 		file.Close()
 		t.Fatal(err)
 	}
@@ -872,7 +872,7 @@ func createRawASMMirrorTestDisk(t *testing.T, path string, diskID uint16) *os.Fi
 	}
 	const diskAUs = uint32(16)
 	const auSize = int64(1024 * 1024)
-	if err := file.Truncate(int64(diskAUs) * auSize); err != nil {
+	if err := truncateSparseTestFile(file, int64(diskAUs)*auSize); err != nil {
 		t.Fatal(err)
 	}
 	header := make([]byte, 128)

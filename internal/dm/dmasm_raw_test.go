@@ -287,7 +287,7 @@ func createRawASMTestDisk(t *testing.T, path string) *os.File {
 		t.Fatal(err)
 	}
 	const lastAU = uint32(31)
-	if err := file.Truncate(rawASMReservedSize + int64(lastAU+1)*rawASMAUSize); err != nil {
+	if err := truncateSparseTestFile(file, rawASMReservedSize+int64(lastAU+1)*rawASMAUSize); err != nil {
 		t.Fatal(err)
 	}
 	header := make([]byte, 128)

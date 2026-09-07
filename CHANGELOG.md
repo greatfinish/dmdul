@@ -45,6 +45,8 @@ v主版本.次版本.修订版本
 - `check pages` 先校验原始字节再还原页保护，修复 HASH 页误报；默认检查集合包含
   SYSTEM/ROLL/TEMP，过滤零匹配报错，文件元数据页单列 checksum-not-applicable 计数。
 - DM9 sector HASH 页在还原覆盖字节后使用正确 slot 尾部，修复 SYSTEM 字典行跨摘要区损坏。
+- ASM 大镜像测试在 Windows 上先设置稀疏文件属性，避免约 32 GiB 逻辑镜像耗尽 CI 磁盘；
+  保留完整跨描述区读取断言，不跳过测试，不改变生产解析代码。
 
 ### Changed
 

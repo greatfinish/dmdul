@@ -20,6 +20,10 @@
 govulncheck 仍列出 x/text v0.22.0 的模块级公告 GO-2026-5970，当前路径未调用涉及的
 `unicode/norm`。这不是“所有依赖无漏洞”的承诺。详见 [开发说明](development.md)。
 
+首次远端 CI 暴露 Windows 测试夹具问题：约 32 GiB 的 ASM 逻辑镜像未标记为稀疏文件，
+`Truncate` 耗尽 runner 磁盘。测试已改为先设置 `FSCTL_SET_SPARSE`，并增加稀疏属性断言；
+跨描述区读取用例继续完整执行。这项修复只涉及测试，不改变生产解析代码。
+
 ## DM9 参数矩阵
 
 Build：`03151060506-20260417-322930-20218`。每组 3 行，覆盖 INT、VARCHAR、DECIMAL、DATE
